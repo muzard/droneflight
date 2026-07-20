@@ -47,3 +47,24 @@ def test_validate_bad_plan(tmp_path: Path) -> None:
     bad = tmp_path / "bad.plan"
     bad.write_text("{ not json")
     assert app(["validate", "--plan", str(bad)]) == 2
+
+
+def test_simfly_reports_avoidance(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    rc = app(["simfly", "--plan", str(plan), "--density", "10", "--seed", "1"])
+    out = capsys.readouterr().out
+    assert rc in (0, 1)
+    assert "avoidance OFF" in out
+    assert "avoidance ON" in out
+    assert "trunks" in out
+
+
+def test_nav_reports_drift(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    rc = app(["nav", "--plan", str(plan), "--vtrn-interval", "500"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "VIO only" in out
+    assert "VIO + VTRN" in out

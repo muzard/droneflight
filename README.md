@@ -11,7 +11,7 @@ Live runs target **PX4 SITL + Gazebo Harmonic** (see [RUNBOOK.md](RUNBOOK.md));
 the orchestration/policy logic is unit-tested against a fake autopilot so it is
 verifiable without hardware.
 
-## Status — F0 (bridge + policies + executor scaffold)
+## Status — F1 (bridge + policies + perception/avoidance + nav emulation)
 
 | Piece | State |
 |---|---|
@@ -19,20 +19,50 @@ verifiable without hardware.
 | Tether-safe speed policy (`speed_policy.py`) | ✅ slows through turns/reversals |
 | Covert sensor-mode policy (`sensors.py`) | ✅ passive-optical / thermal / active-lidar tradeoff |
 | Mission executor + failsafe (`executor.py`) | ✅ tested against a fake connector |
+| **Optical detection + avoidance** (`perception.py`, `avoidance.py`) | ✅ depth sensing + follow-the-gap steering |
+| **Closed-loop forest sim** (`reactive.py`) | ✅ flies the route through trees; avoidance ON vs OFF |
+| **GPS-denied nav emulation** (`nav.py`) | ✅ VIO drift + VTRN correction |
 | MAVSDK adapter (`mavsdk_connector.py`) | ⚠️ live path — runs against SITL, not unit-tested |
 | PX4 SITL + Gazebo tether model | ⏳ RUNBOOK + config; needs the Ubuntu sim host |
-| Onboard perception (VIO/VTRN/LIO, avoidance) | later — separate effort |
+| Real onboard perception (VIO/VTRN/LIO estimator) | later — separate effort |
 
 ## Usage
 
 ```bash
 droneflight validate --plan out/mission.plan          # offline: policies + sensor mode
 droneflight validate --plan out/mission.plan --night  # night: exercises the sensor tradeoff
-droneflight fly --plan out/mission.plan --url udp://:14540   # live: execute on PX4/SITL
+droneflight nav      --plan out/mission.plan          # GPS-denied drift: VIO vs VIO+VTRN
+droneflight simfly   --plan out/mission.plan --density 25          # forest flight: avoidance ON vs OFF
+droneflight simfly   --plan out/mission.plan --drift-rate 0.02 --vtrn-interval 150
+droneflight fly      --plan out/mission.plan --url udp://:14540    # live: execute on PX4/SITL
 ```
 
-`validate` is fully offline (no autopilot); `fly` needs a running PX4 (SITL or
-hardware) reachable at `--url`.
+`validate`, `nav`, and `simfly` are fully offline (kinematic, no autopilot);
+`fly` needs a running PX4 (SITL or hardware) reachable at `--url`.
+
+## Optical detection + avoidance (won't crash into trees)
+
+`perception.py` emulates the forward depth sensor (a passive stereo pair or a
+lidar slice) as rays returning the range to the nearest trunk; `avoidance.py` is
+a follow-the-gap / VFH-lite controller that steers to the freest bearing toward
+the goal and slows in clutter. `reactive.py` closes the loop: it flies a planned
+`.plan` through a scattered forest and checks it reaches the goal without a
+collision.
+
+What the closed-loop sim shows (deterministic, runs on any machine):
+
+- **With known position**, the avoidance layer reliably dodges obstacles the plan
+  didn't map: flying the waypoints *blindly* collides, the reactive layer reaches
+  the goal (down to very dense stands, where reactive flight is genuinely
+  marginal — matching the program's own honest limits).
+- **Under GPS-denied drift**, avoidance senses *real* trees in the body frame, so
+  it keeps dodging — but drift (tens of meters over km without correction, per
+  `nav.py`) wanders the *true* path out of the planned tube into dense forest.
+  So collision-free forest flight needs **both** reactive avoidance **and**
+  bounded navigation (VTRN), not either alone.
+
+This is a **kinematic** sim (2D horizontal, no physics engine) — a fast design
+tool. Fidelity comes later from PX4 SITL + Gazebo (RUNBOOK).
 
 ## The sensor tradeoff (why lidar is not the default)
 
