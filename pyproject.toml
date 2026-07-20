@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "droneflight"
+version = "0.1.0"
+description = "Online flight stack for the fiber-laying drone: executes the planner's .plan on PX4 (GPS-denied, low-altitude, tether-aware) with a covert sensor-mode policy."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# Core deps are permissive. MAVSDK (Apache-2.0) is the PX4/MAVLink interface.
+dependencies = [
+    "pydantic>=2.6",
+    "mavsdk>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
+    "build>=1.2",
+]
+
+[project.scripts]
+droneflight = "droneflight.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+droneflight = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "N", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B", "N802", "N803", "RUF059"]
+"src/droneflight/cli.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["mavsdk.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
+source = ["droneflight"]
+# The live MAVSDK adapter needs a real autopilot; it is exercised in the sim
+# harness (RUNBOOK.md), not unit tests.
+omit = ["*/mavsdk_connector.py"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise NotImplementedError"]

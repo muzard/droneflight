@@ -1,0 +1,18 @@
+# PX4 EKF2 parameters for GPS-denied flight on external vision.
+# Load via QGroundControl (Vehicle Setup > Parameters > Tools > Load from file)
+# or `param load gps_denied_ekf2.params` in the pxh shell, then reboot.
+# Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
+# These are a STARTING POINT — tune EV delay/noise to your VIO/VTRN pipeline.
+
+# Fuse external vision for horizontal position, velocity, and yaw (bitmask 0..15).
+1	1	EKF2_EV_CTRL	15	6
+# Disable all GPS fusion (0 = no GPS aiding).
+1	1	EKF2_GPS_CTRL	0	6
+# Height reference: 1 = external vision (fall back to 2 = baro if EV height is noisy).
+1	1	EKF2_HGT_REF	3	6
+# External-vision measurement delay (ms) — set to your pipeline's latency.
+1	1	EKF2_EV_DELAY	50	9
+# Allow arming without a GPS lock (GPS-denied ops).
+1	1	COM_ARM_WO_GPS	1	6
+# Low-altitude / nap-of-the-earth: keep the mission altitude modest (m, relative).
+1	1	MIS_TAKEOFF_ALT	5	9
