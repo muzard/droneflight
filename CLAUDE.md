@@ -116,6 +116,29 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   the fiber off the laydown route. This aircraft is designed to fly with no GCS,
   so `NAV_DLL_ACT` and RTL altitude must be deliberate design choices, not
   defaults. `configs/px4/sitl_bringup.params` neutralises them for testing.
+- 🔄 **Slice 2 IN PROGRESS — fly the terrain world.** `droneplanner gz-world`
+  emits a Gazebo world whose heightmap is the planned DTM (§2b of RUNBOOK).
+  Status: the altitude-frame fix is **confirmed in flight** — the drone tracked
+  the commanded relative-altitude profile precisely (30→27.4→20.1→11.0 m). But
+  every run so far has actually loaded PX4's **flat `default.sdf`**, so the
+  heightmap is **still unverified**: the drone flew its correct descending
+  profile into a flat floor at z=0 and the land detector latched (`dist_bottom`
+  tracked `alt` exactly — the tell that there is no relief beneath it).
+  **Next action:** launch with the world as arg 3 and check `gz model --list`
+  contains `terrain`. If it does not, the likely cause is the heightmap
+  **(2^n)+1 square-dimension constraint** — our DEM is 160×160 — fix by
+  resampling to 257×257 inside `gz-world`.
+- ⚠️ **Workflow: the VM syncs by `git pull`** from `github.com/muzard/{droneplanner,droneflight}`.
+  Both repos are cloned in the guest — droneflight is installed, droneplanner is
+  clone-only (it just delivers `demo_ao/` DEMs + Gazebo worlds; don't pip-install
+  its geospatial stack there). The `.plan` is gitignored and still needs `scp`.
+  **A stale VM has caused three false "bugs"** — pull after every push, and if
+  behaviour contradicts the code, check `git log --oneline -1` on both ends
+  before debugging. See RUNBOOK §1.6.
+- 🐛 **Known planner defect (unfixed):** the kinematic fillet pass emits
+  **duplicate waypoint clusters** (0.2–1.0 m apart) — 77 waypoints, only ~25
+  distinct. Wastes autopilot mission slots and makes logs noisy. Needs a
+  minimum-spacing filter on the emitted waypoints.
 - ⏭ **Next build items:** the **external-vision injection bridge** (stream
   `nav.py`/`correction.py` truth+error as `VISION_POSITION_ESTIMATE` into EKF2 →
   GPS-denied real in the loop) and the **v0 tether disturbance plugin**

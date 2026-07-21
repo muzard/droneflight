@@ -156,22 +156,64 @@ droneflight validate --plan /path/to/mission.plan      # offline path works
 groups | grep -q dialout && echo "dialout ok" || echo "no dialout (fine for SITL)"
 ```
 
-### 1.6 Getting the code and a `.plan` into the VM
+### 1.6 Getting the code and a `.plan` into the VM — **git**
 
-**Code — `git clone`.** Give the VM a **read-only deploy key** (tighter than an
-account key, and it survives detached `tmux`, unlike `ssh -A` agent forwarding):
+> ⚠️ **The single most common failure in this project is a stale VM.** Three
+> separate SITL "bugs" turned out to be the VM running an older `run_sitl.sh` or
+> world file. **`git pull` on the VM after every push**, and if behaviour
+> contradicts the code you are reading, verify the VM copy *first*
+> (`git log --oneline -1` on both ends).
+
+Repos: `github.com/muzard/droneplanner` and `github.com/muzard/droneflight`.
+
+**One-time VM setup.** Clone *both*: `droneflight` is the flight stack (installed);
+`droneplanner` is cloned **only to deliver sim assets** — do **not** `pip install`
+it in the guest, its geospatial stack is heavy and unnecessary there.
 
 ```bash
-ssh-keygen -t ed25519 -C "px4-vm" -f ~/.ssh/id_ed25519 -N ""   # in the VM
-cat ~/.ssh/id_ed25519.pub    # -> GitHub repo > Settings > Deploy keys > Add (read-only)
-git clone git@github.com:<you>/droneflight.git ~/droneflight
+cd ~
+git clone https://github.com/muzard/droneflight.git
+git clone https://github.com/muzard/droneplanner.git    # assets only, no install
+cd ~/droneflight && . ~/venv/bin/activate && pip install -e ".[dev]"
 ```
 
-*(`gh auth login` works too if you prefer the GitHub CLI.)* Only `droneflight`
-is needed in the guest — `droneplanner` stays on the Mac (§1.0).
+*If the clone prompts for credentials the repos are private* — add a **read-only
+deploy key** per repo (survives detached `tmux`, unlike `ssh -A`):
 
-**The `.plan` — not via git.** `out/` and `*.plan` are gitignored (it's a build
-artifact), so copy it across:
+```bash
+ssh-keygen -t ed25519 -C "px4-vm" -f ~/.ssh/id_ed25519 -N ""
+cat ~/.ssh/id_ed25519.pub   # -> GitHub repo > Settings > Deploy keys > Add (read-only)
+# then clone with git@github.com:muzard/<repo>.git
+```
+
+**Routine sync** — after every push from the Mac:
+
+```bash
+cd ~/droneflight  && git pull
+cd ~/droneplanner && git pull      # picks up regenerated worlds/DEMs
+```
+
+**What git carries vs what it does not:**
+
+| Artifact | Via git? |
+|---|---|
+| `droneflight` source, `sitl/run_sitl.sh` | ✅ |
+| `demo_ao/dtm.tif`, `demo_ao/worlds/*.sdf` | ✅ (tracked in droneplanner) |
+| **`.plan`** | ❌ gitignored build artifact — `scp` it |
+
+The world's DEM `<uri>` is an **absolute path** baked in at generation time
+(`--dem-path`), currently `/home/arttudrone/droneplanner/demo_ao/dtm.tif` so it
+resolves inside the VM's clone. If the VM layout changes, regenerate with
+`droneplanner gz-world --dem-path <new path>`.
+
+After pulling, install the world into PX4:
+
+```bash
+cp ~/droneplanner/demo_ao/worlds/planner_terrain.sdf \
+   ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
+```
+
+**The `.plan`** is a build artifact — copy it across:
 
 ```bash
 scp <mac>:/path/to/droneplanner/out/mission.plan  ~/plans/    # from the VM, or scp from the Mac
@@ -254,10 +296,19 @@ droneplanner plan     --mission demo_ao/mission.yaml --out out_demo/
 droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan \
                       --out demo_ao/worlds/planner_terrain.sdf
 
-# copy the .sdf AND the .tif it references to the VM, then:
+# copy the .sdf AND the .tif it references to the VM (§1.6), then:
 cp planner_terrain.sdf ~/PX4-Autopilot/Tools/simulation/gz/worlds/
-PX4_GZ_WORLD=planner_terrain ./sitl/run_sitl.sh ~/plans/mission.plan ~/PX4-Autopilot
+./sitl/run_sitl.sh ~/plans/mission.plan ~/PX4-Autopilot planner_terrain   # world = arg 3
 ```
+
+⚠️ **Pass the world as arg 3.** If it is omitted, PX4 silently loads its **flat**
+`default.sdf` and every terrain result is meaningless — the script prints a loud
+warning when no world is selected, and hard-fails if the named world is missing.
+Setting `PX4_GZ_WORLD=...` as a bare shell assignment does **not** work: it is not
+exported to the subshell. Confirm with the launch line
+`Starting gazebo with world: .../planner_terrain.sdf` and with `gz model --list`
+showing a `terrain` model. Also kill stray `gz sim`/`ruby` processes between runs
+— PX4 ignores the world selection if a simulator is already running.
 
 The world sets `<spherical_coordinates>` to the plan's home so the Gazebo origin
 and `PX4_HOME_*` agree, and offsets the heightmap so home lands on the origin.
