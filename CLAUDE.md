@@ -15,7 +15,8 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter |
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
-| `nav.py` | **the simulated error** — VIO drift + VTRN correction (GPS-denied) |
+| `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver) |
+| `correction.py` | **optical terrain-relative correction** — data-driven fixes over a spatially varying basemap; confidence floor + innovation gate + Kalman fuse |
 | `executor.py` + `connector.py` | connect→upload→arm→start→monitor, RTL on error (fake connector for tests) |
 | `mavsdk_connector.py` | live PX4 adapter (⚠️ needs SITL; excluded from coverage, not unit-tested) |
 | `config.py`, `cli.py` | config + `validate` / `nav` / `simfly` / `fly` commands |
@@ -25,7 +26,8 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 cd /Users/arttu/Claude/Projects/DroneAutomation/droneflight
 . /Users/arttu/Claude/Projects/DroneAutomation/.venv/bin/activate
 droneflight validate --plan ../droneplanner/out/mission.plan            # offline: policies + sensor mode
-droneflight nav      --plan .../mission.plan                            # VIO drift vs VIO+VTRN
+droneflight nav      --plan .../mission.plan                            # VIO vs idealised vs optical VTRN
+droneflight nav      --plan .../mission.plan --forest-frac 0.7 --stale-frac 0.3  # conflict-zone basemap
 droneflight simfly   --plan .../mission.plan --density 25               # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan .../mission.plan --drift-rate 0.02 --vtrn-interval 150
 droneflight fly      --plan .../mission.plan --url udp://:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
@@ -44,6 +46,16 @@ a live PX4.
 - **The simulated error (`nav.py`) is complete:** VIO drift accumulates
   *coherently* (~2% → tens of m over km, per Tech-Selection §2.1); VTRN fixes
   shrink it toward a bounded residual. Wired into `reactive.py` (drift + vtrn args).
+- **VTRN is now data-driven, not magic (`correction.py`):** the old fix was an
+  *idealised reset* (assumes a fix is available, accepted, and correct
+  everywhere). `correction.py` makes basemap fidelity a spatially varying input
+  (matchability + staleness + accuracy) and gates fixes on confidence + an
+  innovation test. Two findings (see [NAV-FIDELITY.md](NAV-FIDELITY.md)): **forest
+  starves fixes** (canopy = low texture — and forest is the drone's own cover, so
+  it's most lost where most concealed), and a **stale conflict-zone basemap** can
+  inject *confident-but-wrong* fixes — the innovation gate is the only defence,
+  and it weakens as drift grows. `nav.py`'s idealised path is kept as the
+  optimistic baseline for the A/B.
 
 ## The central finding (from the closed-loop sim)
 - With **known position**, reactive avoidance reliably dodges unmapped obstacles:
@@ -62,4 +74,10 @@ a live PX4.
   (RUNBOOK) on the Ubuntu VM.
 - No real onboard state estimator (VIO/VTRN/LIO) — `nav.py` emulates its *error*,
   it is not an estimator. That + the Gazebo tether plugin are the next big items.
+- `correction.py` is a **fidelity/error emulator, not a matcher** — no real
+  orthophoto/DSM, no feature extraction; the matchability/staleness fields are
+  synthetic. Real numbers need the §6.3 bench (replay nadir imagery over real
+  reference maps). Its top mitigation — feed a basemap **matchability/currency**
+  layer into the *planner* cost surface so routes don't dive into fix-deserts — is
+  unbuilt and lives on the droneplanner side (see its SHORTFALLS cross-cutting note).
 - `mavsdk_connector.py` live path is untested without an autopilot.

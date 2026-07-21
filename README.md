@@ -21,7 +21,8 @@ verifiable without hardware.
 | Mission executor + failsafe (`executor.py`) | ✅ tested against a fake connector |
 | **Optical detection + avoidance** (`perception.py`, `avoidance.py`) | ✅ depth sensing + follow-the-gap steering |
 | **Closed-loop forest sim** (`reactive.py`) | ✅ flies the route through trees; avoidance ON vs OFF |
-| **GPS-denied nav emulation** (`nav.py`) | ✅ VIO drift + VTRN correction |
+| **GPS-denied nav emulation** (`nav.py`) | ✅ VIO drift + VTRN correction (idealised + fidelity-limited) |
+| **Optical terrain-relative correction** (`correction.py`) | ✅ data-driven fixes over a spatially varying basemap; confidence + innovation gating |
 | MAVSDK adapter (`mavsdk_connector.py`) | ⚠️ live path — runs against SITL, not unit-tested |
 | PX4 SITL + Gazebo tether model | ⏳ RUNBOOK + config; needs the Ubuntu sim host |
 | Real onboard perception (VIO/VTRN/LIO estimator) | later — separate effort |
@@ -31,7 +32,8 @@ verifiable without hardware.
 ```bash
 droneflight validate --plan out/mission.plan          # offline: policies + sensor mode
 droneflight validate --plan out/mission.plan --night  # night: exercises the sensor tradeoff
-droneflight nav      --plan out/mission.plan          # GPS-denied drift: VIO vs VIO+VTRN
+droneflight nav      --plan out/mission.plan          # GPS-denied drift: VIO vs idealised vs optical VTRN
+droneflight nav      --plan out/mission.plan --forest-frac 0.7 --stale-frac 0.3  # conflict-zone basemap
 droneflight simfly   --plan out/mission.plan --density 25          # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan out/mission.plan --drift-rate 0.02 --vtrn-interval 150
 droneflight fly      --plan out/mission.plan --url udp://:14540    # live: execute on PX4/SITL
@@ -63,6 +65,35 @@ What the closed-loop sim shows (deterministic, runs on any machine):
 
 This is a **kinematic** sim (2D horizontal, no physics engine) — a fast design
 tool. Fidelity comes later from PX4 SITL + Gazebo (RUNBOOK).
+
+## Bounding drift from optical data — and where it can't (`correction.py`)
+
+Bounded navigation above means **VTRN**: matching the downward camera to a
+pre-loaded georeferenced basemap to reset drift (Technology-Selection §2.1 — "the
+single most important architectural decision in the whole system"). `nav.py`
+originally modelled that as an *idealised reset* — every 500 m, error teleports
+back to ~2 m. `correction.py` replaces that with a **data-driven** corrector: it
+attempts a match against a **spatially varying** reference (`ReferenceMap`),
+scores the match confidence, **gates** it against the propagated estimate to
+reject stale-map blunders, and fuses survivors with a scalar Kalman update
+(error *shrinks*, never teleports). Where the basemap is thin or stale it
+declines, and the stack falls back to dead-reckoning — the honest behaviour.
+
+Why this matters (`droneflight nav … --forest-frac F --stale-frac S`, ~3.6 km @ 2 %):
+
+| Correction model | Max error | Fix availability | Corridor |
+|---|---|---|---|
+| VIO only (no fixes) | ~71 m | — | ✗ |
+| Idealised VTRN (old reset) | ~12 m | (assumed 100 %) | ✓ |
+| Optical, 40 % forest / 10 % stale | ~8 m | 55 % | ✓ |
+| Optical, 70 % forest / 30 % stale (conflict zone) | ~16 m | **24 %** | **✗** |
+
+Two findings fall out, both sobering: **forest starves VTRN** (canopy is
+low-texture — and forest is where the drone *hides*, so it is most lost where it
+is most concealed), and a **stale conflict-zone basemap** can inject *confident,
+wrong* fixes that the innovation gate is the only thing standing between and
+corruption — a gate that weakens exactly as drift grows. See
+[NAV-FIDELITY.md](NAV-FIDELITY.md) for the full analysis, limits, and mitigations.
 
 ## The sensor tradeoff (why lidar is not the default)
 

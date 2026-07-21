@@ -15,7 +15,13 @@ from pathlib import Path
 from droneflight import __version__
 from droneflight.config import FlightConfig
 from droneflight.executor import fly_mission, prepare_items
-from droneflight.nav import DriftConfig, VtrnConfig, simulate_navigation
+from droneflight.nav import (
+    DriftConfig,
+    VtrnConfig,
+    route_reference,
+    simulate_corrected_navigation,
+    simulate_navigation,
+)
 from droneflight.plan_loader import PlanLoadError, load_qgc_plan
 from droneflight.sensors import SensorSelectionError, select_sensor_mode
 
@@ -63,9 +69,30 @@ def _nav(args: argparse.Namespace) -> int:
         f"max error {vio_only.max_error_m:.0f} m, endpoint {vio_only.endpoint_error_m:.0f} m"
     )
     print(
-        f"VIO + VTRN (fix every {args.vtrn_interval:.0f} m): "
+        f"VIO + VTRN (idealized, fix every {args.vtrn_interval:.0f} m): "
         f"max error {with_vtrn.max_error_m:.0f} m over {with_vtrn.fixes} fixes "
         f"— {'within' if with_vtrn.within_corridor else 'EXCEEDS'} corridor"
+    )
+
+    # Realistic, fidelity-limited optical correction over a spatially varying
+    # reference: fixes are only as good (and as available) as the basemap.
+    ref = route_reference(
+        mission, forest_frac=args.forest_frac, stale_frac=args.stale_frac, seed=args.fidelity_seed
+    )
+    opt = simulate_corrected_navigation(mission, drift, ref)
+    print(
+        f"VIO + VTRN (optical, {args.forest_frac * 100:.0f}% forest / "
+        f"{args.stale_frac * 100:.0f}% stale basemap):"
+    )
+    print(
+        f"    max error {opt.max_error_m:.0f} m, endpoint {opt.endpoint_error_m:.0f} m "
+        f"— {'within' if opt.within_corridor else 'EXCEEDS'} corridor"
+    )
+    print(
+        f"    fixes {opt.accepted}/{opt.attempts} accepted "
+        f"({opt.fix_availability * 100:.0f}% avail); "
+        f"declined: {opt.no_features} no-texture, {opt.low_confidence} low-conf, "
+        f"{opt.gated_out} gated-out; {opt.corrupt_accepted} stale blunders slipped through"
     )
     return 0
 
@@ -143,6 +170,19 @@ def app(argv: list[str] | None = None) -> int:
         "--drift-rate", type=float, default=0.02, help="VIO drift as fraction of distance."
     )
     n.add_argument("--vtrn-interval", type=float, default=500.0, help="Meters between VTRN fixes.")
+    n.add_argument(
+        "--forest-frac",
+        type=float,
+        default=0.4,
+        help="Fraction of route over low-texture forest canopy (few optical fixes).",
+    )
+    n.add_argument(
+        "--stale-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of route over a stale/changed basemap (blunder-prone fixes).",
+    )
+    n.add_argument("--fidelity-seed", type=int, default=1, help="Seed for the fidelity patches.")
     n.set_defaults(func=_nav)
 
     s = sub.add_parser("simfly", help="Closed-loop forest-flight sim (avoidance ON vs OFF).")

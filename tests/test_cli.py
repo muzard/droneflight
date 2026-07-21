@@ -67,4 +67,15 @@ def test_nav_reports_drift(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
     out = capsys.readouterr().out
     assert rc == 0
     assert "VIO only" in out
-    assert "VIO + VTRN" in out
+    assert "VIO + VTRN (idealized" in out
+    assert "VIO + VTRN (optical" in out
+    assert "avail" in out
+
+
+def test_nav_fidelity_flags(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    rc = app(["nav", "--plan", str(plan), "--forest-frac", "0.7", "--stale-frac", "0.3"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "70% forest / 30% stale basemap" in out
