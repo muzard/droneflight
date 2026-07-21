@@ -127,9 +127,12 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     exactly (30→27.4→20.1→11.0 m).
   - Heightmap loads: `terrain` appears in `gz model --list`. The (2^n)+1
     dimension constraint does **not** apply — 160×160 is fine.
-  - Vertical datum correct: at rest `z = -0.009 m`, `dist_bottom = 0.010`.
-    Gazebo does place a DEM's *minimum* at the model pose z.
-  - Terrain placement correct near home (`alt - dist_bottom` ≈ 0 as expected).
+  - ~~Vertical datum correct~~ **RETRACTED** — that was inferred from PX4's local
+    `z ≈ 0` at rest, which is circular (PX4 zeroes its origin at the spawn point).
+    The datum is **unverified**; ODE reports `AABB max z = 150.32` (DEM max
+    elevation) vs the 110.32 relief we pass as `<size>`, hinting the surface may
+    sit ~40 m high. Measure with `gz model -m terrain -p` + a gz height query,
+    never from PX4's local z.
   - Hover/control sound: 18 s climb at **0.2°** attitude error.
   - Physics timing clean: `sensor_combined` dt median 4.00 ms, p99 4.00,
     0 gaps >50 ms, cpuload 0.31 → **not** a lockstep/heightfield-cost problem.
@@ -140,15 +143,23 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   `default.sdf` flies fine), in *both* the hand-written and PX4-derived worlds.
   Not datum, placement, sensors, world config, or timing — all eliminated above.
 
-  **Next experiment (set up, not yet run):** `droneplanner gz-world --flat`
-  emits a structurally identical world with an effectively flat DEM (1 m ramp
-  over 4 km). Fly it:
-  - **stable** → the problem is terrain *slope/normals* (look at heightmap
-    sampling/`<size>` z semantics; note the ODE AABB reported z max = DEM max
-    elevation 150.32, not the 110.32 relief passed as `<size>`);
-  - **still tumbles** → the problem is the *heightmap collision itself*,
-    independent of shape (try `<collision>`-free visual-only terrain to confirm,
-    then a coarser DEM).
+  **Bisection RESULT (2026-07-21): a FLAT DEM tumbles too.** So it is not slope
+  or normals — relief only makes it fail sooner:
+
+  | World | Travel before tumble |
+  |---|---|
+  | `default.sdf` (plane collision) | full mission 38/38 ✅ |
+  | flat-DEM heightmap (`--flat`) | 557 m, then tumble (runaway climb to 124 m) |
+  | terrain heightmap | 22 m, then tumble |
+
+  **Next experiment (built, not yet run):** `droneplanner gz-world --no-collision`
+  emits visual-only terrain. Fly `planner_nocol`:
+  - **stable** → the heightmap's *collision* is the culprit (spurious contacts;
+    then chase the `<size>` z / AABB scale mismatch above, and try a coarser DEM);
+  - **still tumbles** → collision is innocent and the heightmap is destabilising
+    some other way — next suspects are the DEM's effect on the terrain/rangefinder
+    estimator feeding EKF2 (`dist_bottom` is clearly not behaving), or
+    `EKF2_HGT_REF`/terrain-estimator params.
 - ⚠️ **Workflow: the VM syncs by `git pull`** from `github.com/muzard/{droneplanner,droneflight}`.
   Both repos are cloned in the guest — droneflight is installed, droneplanner is
   clone-only (it just delivers `demo_ao/` DEMs + Gazebo worlds; don't pip-install
