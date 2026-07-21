@@ -287,7 +287,15 @@ by injecting `PX4_HOME_*` from `droneflight sitl-env`:
 # PX4 exposes MAVLink on udp://:14540 (what droneflight --url targets).
 ```
 
-## 2b. Fly over the planned terrain (not PX4's flat world)
+## 2b. Fly over the planned terrain (not PX4's flat world) — ⏸️ PARKED
+
+> **Parked 2026-07-21.** The terrain world loads and flies but the vehicle tumbles
+> on translation (see the open-bug section below). It is **not on the MVP critical
+> path**: the altitude-frame bug it was built to catch is already fixed and
+> regression-tested, and the external-vision bridge injects error rather than
+> sensing terrain, so it runs fine on the flat `default.sdf`. Resume here only
+> when terrain-following, tether physics, or low-altitude margins need in-the-loop
+> proof.
 
 PX4's default Gazebo world is **flat**, so a terrain-aware `.plan` flown in it
 proves nothing about nap-of-the-earth flight — and actively hides altitude-frame

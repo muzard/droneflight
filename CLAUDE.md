@@ -116,50 +116,53 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   the fiber off the laydown route. This aircraft is designed to fly with no GCS,
   so `NAV_DLL_ACT` and RTL altitude must be deliberate design choices, not
   defaults. `configs/px4/sitl_bringup.params` neutralises them for testing.
-- 🔄 **Slice 2 IN PROGRESS — fly the terrain world. ONE OPEN BUG.**
-  `droneplanner gz-world` injects the planned DTM as a heightmap into **PX4's own
-  `default.sdf`** (RUNBOOK §2b). The world loads, the vehicle spawns correctly,
-  climbs perfectly — then **tumbles the instant it translates** (`Attitude
-  failure (roll/pitch)`, roll → 180°, land-detector latches, mission stalls).
+- ⏸️ **Slice 2 PARKED (2026-07-21) — terrain world, not on the critical path.**
+  `droneplanner gz-world` injects the planned DTM into PX4's `default.sdf`
+  (RUNBOOK §2b). It **loads and flies**, but the vehicle **tumbles once it
+  translates**. Parked deliberately: it only adds *in-the-loop* confirmation of
+  terrain-following, and the prize it was chasing — the altitude-frame CFIT bug —
+  is already fixed and regression-tested. **The EV bridge does not need it.**
 
-  **Proven working (don't re-investigate — measured in ULogs):**
-  - Altitude-frame conversion — drone tracked the commanded relative profile
-    exactly (30→27.4→20.1→11.0 m).
-  - Heightmap loads: `terrain` appears in `gz model --list`. The (2^n)+1
-    dimension constraint does **not** apply — 160×160 is fine.
-  - ~~Vertical datum correct~~ **RETRACTED** — that was inferred from PX4's local
-    `z ≈ 0` at rest, which is circular (PX4 zeroes its origin at the spawn point).
-    The datum is **unverified**; ODE reports `AABB max z = 150.32` (DEM max
-    elevation) vs the 110.32 relief we pass as `<size>`, hinting the surface may
-    sit ~40 m high. Measure with `gz model -m terrain -p` + a gz height query,
-    never from PX4's local z.
-  - Hover/control sound: 18 s climb at **0.2°** attitude error.
-  - Physics timing clean: `sensor_combined` dt median 4.00 ms, p99 4.00,
-    0 gaps >50 ms, cpuload 0.31 → **not** a lockstep/heightfield-cost problem.
-  - World config now inherited from PX4 (magnetic_field, atmosphere, ode
-    250 Hz, zero `<plugin>` elements).
+  *Established by measurement (don't re-investigate — see RUNBOOK §2b table):*
+  heightmap loads (`terrain` in `gz model --list`, 160×160 is fine); terrain
+  placement correct near home; hover control sound (18 s climb at 0.2°); physics
+  timing clean (4.00 ms median step, 0 gaps >50 ms); world config now inherited
+  from PX4. Bisection: a **flat** DEM tumbles too (557 m) — so not slope/normals.
+  Datum is **unverified** (the earlier "confirmed" claim was circular — PX4 zeroes
+  local z at spawn); ODE reports `AABB max z = 150.32` (DEM max elevation) vs the
+  110.32 relief passed as `<size>`, which would put the surface ~40 m high and is
+  the most promising thread.
 
-  **Still unexplained:** tumble occurs only with a heightmap present (the flat
-  `default.sdf` flies fine), in *both* the hand-written and PX4-derived worlds.
-  Not datum, placement, sensors, world config, or timing — all eliminated above.
+  *Resume point:* fly `planner_nocol` (visual-only terrain + ground_plane, built
+  and pushed). Currently blocked on `ekf2 missing data` — first check whether the
+  sim is stepping at all (`listener sensor_combined -n 1`, and
+  `gz topic -e -t /world/planner_nocol/clock -n 3`).
 
-  **Bisection RESULT (2026-07-21): a FLAT DEM tumbles too.** So it is not slope
-  or normals — relief only makes it fail sooner:
+- 🎯 **Slice 3 NEXT — external-vision injection bridge (the MVP piece).**
+  Make GPS-denied real in the loop: EKF2 fused on **external vision** whose pose
+  is `ground truth + injected error` from `nav.py`/`correction.py`. This is where
+  the drift/fidelity work stops being an offline model and starts flying.
+  **Use the flat `default.sdf`** — terrain is parked and irrelevant here, because
+  the error is *injected*, not sensed from terrain.
 
-  | World | Travel before tumble |
-  |---|---|
-  | `default.sdf` (plane collision) | full mission 38/38 ✅ |
-  | flat-DEM heightmap (`--flat`) | 557 m, then tumble (runaway climb to 124 m) |
-  | terrain heightmap | 22 m, then tumble |
+  *Sketch (new module, e.g. `ev_bridge.py`):*
+  1. **Ground truth** — subscribe to Gazebo's model odometry for `x500_0`
+     (`gz topic`). ⚠️ Do **not** use PX4's own local position as truth: it is the
+     EKF output, so feeding it back is circular and will look artificially good.
+  2. **Corrupt it** — apply `DriftConfig` (coherent VIO drift) and, at
+     `CorrectionConfig.attempt_interval_m`, `OpticalCorrector.attempt()` against a
+     `ReferenceMap`. Reuse `correction.py` as-is; it already takes an error vector.
+  3. **Publish** — stream as MAVLink `VISION_POSITION_ESTIMATE`/`ODOMETRY` at
+     ~30–50 Hz (MAVSDK `mocap` plugin). Mind frames (NED) and set `EKF2_EV_DELAY`
+     to the real pipeline latency.
+  4. **Params** — load `configs/px4/gps_denied_ekf2.params` (`EKF2_EV_CTRL=15`,
+     `EKF2_GPS_CTRL=0`, `EKF2_HGT_REF=3`, `COM_ARM_WO_GPS=1`) plus
+     `sitl_bringup.params`.
 
-  **Next experiment (built, not yet run):** `droneplanner gz-world --no-collision`
-  emits visual-only terrain. Fly `planner_nocol`:
-  - **stable** → the heightmap's *collision* is the culprit (spurious contacts;
-    then chase the `<size>` z / AABB scale mismatch above, and try a coarser DEM);
-  - **still tumbles** → collision is innocent and the heightmap is destabilising
-    some other way — next suspects are the DEM's effect on the terrain/rangefinder
-    estimator feeding EKF2 (`dist_bottom` is clearly not behaving), or
-    `EKF2_HGT_REF`/terrain-estimator params.
+  *Acceptance:* mission completes GPS-denied; the **true** (Gazebo) track stays
+  within corridor tolerance with VTRN fixes enabled, and demonstrably wanders out
+  with them disabled — i.e. reproduce `nav.py`'s offline A/B against real flight.
+
 - ⚠️ **Workflow: the VM syncs by `git pull`** from `github.com/muzard/{droneplanner,droneflight}`.
   Both repos are cloned in the guest — droneflight is installed, droneplanner is
   clone-only (it just delivers `demo_ao/` DEMs + Gazebo worlds; don't pip-install
