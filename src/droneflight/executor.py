@@ -9,7 +9,9 @@ PX4; ``MavsdkConnector`` is the real adapter used against SITL/hardware.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 
 from droneflight.config import FlightConfig
@@ -19,6 +21,27 @@ from droneflight.sensors import SensorDecision, select_sensor_mode
 from droneflight.speed_policy import apply_speed_policy
 
 _log = logging.getLogger(__name__)
+
+
+async def _monitored_progress(
+    progress: AsyncIterator[tuple[int, int]], timeout_s: float
+) -> AsyncIterator[tuple[int, int]]:
+    """Yield mission progress, aborting if no update arrives within ``timeout_s``.
+
+    A live PX4 that stalls (never advancing an item) would otherwise hang the
+    monitor loop forever. This watchdog converts a stall into a ``ConnectorError``
+    so the executor's failsafe (RTL) fires — the safe outcome for a real flight.
+    """
+    ait = aiter(progress)
+    while True:
+        try:
+            async with asyncio.timeout(timeout_s):
+                item = await anext(ait)
+        except StopAsyncIteration:
+            return
+        except TimeoutError as exc:
+            raise ConnectorError(f"no mission progress within {timeout_s:.0f}s") from exc
+        yield item
 
 
 @dataclass(frozen=True)
@@ -62,7 +85,9 @@ async def fly_mission(
         await connector.upload_mission(items)
         await connector.arm()
         await connector.start_mission()
-        async for current, total in connector.mission_progress():
+        async for current, total in _monitored_progress(
+            connector.mission_progress(), config.progress_timeout_s
+        ):
             flown = current
             _log.info("mission progress: %d/%d", current, total)
     except (ConnectorError, TimeoutError) as exc:

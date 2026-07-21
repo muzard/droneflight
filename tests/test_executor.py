@@ -49,6 +49,18 @@ async def test_failure_during_flight_aborts_partway() -> None:
     assert result.rtl_triggered
 
 
+async def test_progress_stall_triggers_rtl() -> None:
+    # A live PX4 that stops advancing must not hang the monitor forever: the
+    # watchdog aborts and RTLs after progress_timeout_s.
+    conn = FakeConnector(stall_after=1)
+    result = await fly_mission(conn, _mission(4), FlightConfig(progress_timeout_s=0.05))
+    assert not result.completed
+    assert result.rtl_triggered
+    assert result.aborted_reason is not None
+    assert "no mission progress" in result.aborted_reason
+    assert result.items_flown == 1  # made one item, then stalled
+
+
 async def test_no_rtl_when_disabled() -> None:
     conn = FakeConnector(fail_at="upload_mission")
     result = await fly_mission(conn, _mission(3), FlightConfig(rtl_on_error=False))

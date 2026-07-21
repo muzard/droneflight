@@ -72,6 +72,23 @@ def test_nav_reports_drift(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
     assert "avail" in out
 
 
+def test_sitl_env_prints_plan_home(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    rc = app(["sitl-env", "--plan", str(plan)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # Home comes from the plan (46.95), not PX4's Zurich default.
+    assert "export PX4_HOME_LAT=46.95" in out
+    assert "export PX4_HOME_LON=15.00" in out
+
+
+def test_sitl_env_bad_plan(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.plan"
+    bad.write_text("{ not json")
+    assert app(["sitl-env", "--plan", str(bad)]) == 2
+
+
 def test_nav_fidelity_flags(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     plan = tmp_path / "m.plan"
     _write_plan(plan)

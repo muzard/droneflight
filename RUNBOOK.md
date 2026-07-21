@@ -26,28 +26,48 @@ cd PX4-Autopilot && bash ./Tools/setup/ubuntu.sh
 # MAVSDK server ships with the `mavsdk` pip package used here.
 ```
 
-## 2. Launch PX4 SITL + Gazebo
+## 2. Launch PX4 SITL + Gazebo **at the plan's home**
+
+PX4 SITL spawns at a default home (Zurich) unless told otherwise. A planned
+`.plan` is at the real AO, so you **must** set home from the plan or the uploaded
+mission flies hundreds of km away (or is rejected). `sitl/run_sitl.sh` does this
+by injecting `PX4_HOME_*` from `droneflight sitl-env`:
 
 ```bash
-cd PX4-Autopilot
-make px4_sitl gz_x500                 # x500 quad in Gazebo Harmonic
-# PX4 exposes MAVLink on udp://:14540 by default (what droneflight --url targets).
+./sitl/run_sitl.sh /path/to/mission.plan ~/PX4-Autopilot   # x500 quad, home = plan home
+# equivalently, by hand:
+#   eval "$(droneflight sitl-env --plan /path/to/mission.plan)"
+#   cd PX4-Autopilot && make px4_sitl gz_x500
+# PX4 exposes MAVLink on udp://:14540 (what droneflight --url targets).
 ```
 
-For **GPS-denied** flight, configure PX4 to fuse external vision instead of GPS
-(EKF2): see `configs/px4/gps_denied_ekf2.params` and load it via QGroundControl
-or `param load`. In SITL you can feed a simulated vision pose; on the aircraft
-this comes from the companion computer (VIO/VTRN).
+## 3. First flight — prove the pipe (GPS-enabled)
 
-## 3. Fly a planned mission
+Do the **first** run with PX4's default GPS-enabled EKF2. This isolates the
+executor/MAVSDK path (upload → arm → start → monitor → RTL) from the GPS-denied
+external-vision variable, so bring-up failures have one cause at a time.
 
 ```bash
-# In another terminal (VM or macOS host reaching the VM's UDP):
+# In a second shell (inside the VM, or a host that can reach the VM's UDP):
 droneflight fly --plan /path/to/mission.plan --url udp://:14540
 ```
 
-The executor uploads the mission (tether-safe speeds applied), arms, starts, and
-monitors progress, returning to launch on error.
+The executor applies tether-safe speeds, uploads, arms, starts, and monitors
+progress — and now **aborts to RTL if progress stalls** for `progress_timeout_s`
+(default 60 s), so a hung SITL fails safe instead of blocking. Expect to shake out
+mission-item encoding, altitude framing (plan is AGL/relative-to-home), and
+arming gates here first.
+
+## 3b. Then GPS-denied (external vision)
+
+Once the GPS-enabled flight is clean, switch to the mission's real regime: load
+`configs/px4/gps_denied_ekf2.params` (QGroundControl → Parameters → Load, or
+`param load` in the pxh shell, then reboot) so EKF2 fuses **external vision**
+instead of GPS. SITL then needs a vision pose fed in — that injection bridge
+(streaming `nav.py`/`correction.py`'s truth+error as `VISION_POSITION_ESTIMATE`)
+is the **next build item**; on the aircraft this pose comes from the companion
+computer (VIO/VTRN). Gate readiness on *local* position health, not global (the
+adapter already does).
 
 ## 4. Custom tether model (required build item)
 

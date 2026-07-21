@@ -8,6 +8,7 @@ dependency to one module.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
@@ -41,11 +42,17 @@ class FakeConnector:
     at a time. Configurable to fail at a chosen step to exercise the failsafe.
     """
 
-    def __init__(self, fail_at: str | None = None, arm_raises: bool = False) -> None:
+    def __init__(
+        self,
+        fail_at: str | None = None,
+        arm_raises: bool = False,
+        stall_after: int | None = None,
+    ) -> None:
         self.calls: list[str] = []
         self.uploaded: list[MissionItem] = []
         self._fail_at = fail_at
         self._arm_raises = arm_raises
+        self._stall_after = stall_after
 
     def _step(self, name: str) -> None:
         self.calls.append(name)
@@ -73,6 +80,8 @@ class FakeConnector:
         for i in range(total):
             if self._fail_at == f"progress:{i}":
                 raise ConnectorError(f"simulated failure during item {i}")
+            if self._stall_after is not None and i >= self._stall_after:
+                await asyncio.Event().wait()  # hang forever: exercises the watchdog
             yield i + 1, total
 
     async def return_to_launch(self) -> None:

@@ -17,9 +17,10 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
 | `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver) |
 | `correction.py` | **optical terrain-relative correction** — data-driven fixes over a spatially varying basemap; confidence floor + innovation gate + Kalman fuse |
-| `executor.py` + `connector.py` | connect→upload→arm→start→monitor, RTL on error (fake connector for tests) |
+| `executor.py` + `connector.py` | connect→upload→arm→start→monitor, RTL on error (+ progress-stall watchdog); fake connector for tests |
 | `mavsdk_connector.py` | live PX4 adapter (⚠️ needs SITL; excluded from coverage, not unit-tested) |
-| `config.py`, `cli.py` | config + `validate` / `nav` / `simfly` / `fly` commands |
+| `sitl_launch.py` | inject the plan's home into PX4 SITL (`PX4_HOME_*`) so a mission lands at the real AO, not Zurich |
+| `config.py`, `cli.py` | config + `validate` / `nav` / `simfly` / `sitl-env` / `fly` commands |
 
 ## Run / test
 ```bash
@@ -30,10 +31,11 @@ droneflight nav      --plan .../mission.plan                            # VIO vs
 droneflight nav      --plan .../mission.plan --forest-frac 0.7 --stale-frac 0.3  # conflict-zone basemap
 droneflight simfly   --plan .../mission.plan --density 25               # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan .../mission.plan --drift-rate 0.02 --vtrn-interval 150
+eval "$(droneflight sitl-env --plan .../mission.plan)"                  # PX4 SITL home = plan home
 droneflight fly      --plan .../mission.plan --url udp://:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 49 tests, ~95% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 68 tests, ~96% cov
 ```
-`validate`/`nav`/`simfly` are pure kinematic/offline (run anywhere); `fly` needs
+`validate`/`nav`/`simfly`/`sitl-env` are pure offline (run anywhere); `fly` needs
 a live PX4.
 
 ## Key facts (some from user feedback — don't regress)
@@ -81,3 +83,20 @@ a live PX4.
   layer into the *planner* cost surface so routes don't dive into fix-deserts — is
   unbuilt and lives on the droneplanner side (see its SHORTFALLS cross-cutting note).
 - `mavsdk_connector.py` live path is untested without an autopilot.
+
+## SITL bring-up plan (in progress — phased, per user)
+Goal: an MVP on the **Mac's Ubuntu VM** — PX4 SITL flies a planner `.plan`,
+GPS-denied via *injected* external-vision error (not real perception). Real
+VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run it.
+- ✅ **Slice 1 prep (done, testable on the Mac):** progress-stall watchdog
+  (hung SITL → RTL, not a hang); `sitl-env`/`sitl_launch.py` + `sitl/run_sitl.sh`
+  inject the plan's home so a mission lands at the AO, not Zurich; RUNBOOK
+  sequences the first flight **GPS-enabled first** (isolate the executor/MAVSDK
+  path), then GPS-denied.
+- ⏳ **Slice 1 (needs the VM — user's step):** stand up Ubuntu 24.04 arm64 VM
+  (PX4/ROS2 Jazzy/Gazebo Harmonic/MAVSDK), fly a `.plan` GPS-enabled, fix what
+  `mavsdk_connector.py` gets wrong (altitude frame, mission encoding, arming/RTL).
+- ⏭ **Next build items:** the **external-vision injection bridge** (stream
+  `nav.py`/`correction.py` truth+error as `VISION_POSITION_ESTIMATE` into EKF2 →
+  GPS-denied real in the loop) and the **v0 tether disturbance plugin**
+  (`sitl/`) to validate the speed policy against payout physics.

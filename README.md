@@ -36,6 +36,7 @@ droneflight nav      --plan out/mission.plan          # GPS-denied drift: VIO vs
 droneflight nav      --plan out/mission.plan --forest-frac 0.7 --stale-frac 0.3  # conflict-zone basemap
 droneflight simfly   --plan out/mission.plan --density 25          # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan out/mission.plan --drift-rate 0.02 --vtrn-interval 150
+eval "$(droneflight sitl-env --plan out/mission.plan)"            # set PX4 SITL home = plan home
 droneflight fly      --plan out/mission.plan --url udp://:14540    # live: execute on PX4/SITL
 ```
 

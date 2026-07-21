@@ -24,6 +24,7 @@ from droneflight.nav import (
 )
 from droneflight.plan_loader import PlanLoadError, load_qgc_plan
 from droneflight.sensors import SensorSelectionError, select_sensor_mode
+from droneflight.sitl_launch import format_env_exports, px4_home_env
 
 
 def _validate(args: argparse.Namespace) -> int:
@@ -135,6 +136,16 @@ def _simfly(args: argparse.Namespace) -> int:
     return 0 if (on.reached_goal and not on.collided) else 1
 
 
+def _sitl_env(args: argparse.Namespace) -> int:
+    try:
+        mission = load_qgc_plan(args.plan)
+    except PlanLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(format_env_exports(px4_home_env(mission)))
+    return 0
+
+
 def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live autopilot
     from droneflight.mavsdk_connector import MavsdkConnector
 
@@ -192,6 +203,12 @@ def app(argv: list[str] | None = None) -> int:
     s.add_argument("--vtrn-interval", type=float, default=0.0, help="Meters between VTRN fixes.")
     s.add_argument("--seed", type=int, default=1)
     s.set_defaults(func=_simfly)
+
+    se = sub.add_parser(
+        "sitl-env", help="Print PX4 SITL home env for a .plan (eval before make px4_sitl)."
+    )
+    se.add_argument("--plan", type=Path, required=True)
+    se.set_defaults(func=_sitl_env)
 
     f = sub.add_parser("fly", help="Execute a .plan on PX4 (SITL or hardware).")
     f.add_argument("--plan", type=Path, required=True)

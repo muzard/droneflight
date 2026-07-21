@@ -3,6 +3,14 @@
 Simulation assets for PX4 SITL + Gazebo Harmonic. Run instructions live in
 [../RUNBOOK.md](../RUNBOOK.md).
 
+## `run_sitl.sh` — launch at the plan's home
+
+`./run_sitl.sh <mission.plan> [PX4-Autopilot dir]` starts `make px4_sitl gz_x500`
+with `PX4_HOME_*` set to the plan's home (via `droneflight sitl-env`), so the
+uploaded mission lands at the real AO instead of PX4's Zurich default — the
+number-one first-flight trap. Run it **on the Ubuntu VM** (untested from macOS;
+the home-injection logic it calls is unit-tested).
+
 ## Trailing-fiber tether model (required build item)
 
 No off-the-shelf sim models a drone paying out a fiber (Technology-Selection §4.2),
