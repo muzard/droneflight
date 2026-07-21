@@ -10,10 +10,32 @@
 #
 # Then, in a second shell (inside the VM):
 #   droneflight fly --plan /path/to/mission.plan --url udp://:14540
+#
+# Defaults to HEADLESS=1: Gazebo's 3D acceleration is broken in Apple-Silicon VMs
+# (UTM renders a black world, Parallels renders garbage), and software rendering
+# is slow. We validate mission execution from telemetry, not pixels. To force the
+# GUI anyway: HEADLESS=0 ./run_sitl.sh ...
+#
+# To fly over the PLANNED TERRAIN instead of PX4's flat default world, generate
+# it with `droneplanner gz-world`, copy the .sdf into
+# $PX4_DIR/Tools/simulation/gz/worlds/, then:
+#   PX4_GZ_WORLD=planner_terrain ./run_sitl.sh <plan> $PX4_DIR
 set -euo pipefail
 
-PLAN="${1:?usage: run_sitl.sh <mission.plan> [PX4-Autopilot dir]}"
+export HEADLESS="${HEADLESS:-1}"
+
+PLAN="${1:?usage: run_sitl.sh <mission.plan> [PX4-Autopilot dir] [gz world name]}"
 PX4_DIR="${2:-${PX4_AUTOPILOT_DIR:-$HOME/PX4-Autopilot}}"
+# World as a positional arg so terrain selection can't be silently forgotten
+# (PX4 falls back to its FLAT default.sdf, which invalidates terrain testing).
+WORLD="${3:-${PX4_GZ_WORLD:-}}"
+if [[ -n "$WORLD" ]]; then
+  export PX4_GZ_WORLD="$WORLD"
+  if [[ ! -f "$PX4_DIR/Tools/simulation/gz/worlds/$WORLD.sdf" ]]; then
+    echo "error: world '$WORLD' not found at $PX4_DIR/Tools/simulation/gz/worlds/$WORLD.sdf" >&2
+    exit 1
+  fi
+fi
 
 if ! command -v droneflight >/dev/null 2>&1; then
   echo "error: droneflight not on PATH — activate the venv / pip install -e ." >&2
@@ -26,7 +48,13 @@ fi
 
 # Place the SITL vehicle at the plan's home, not PX4's Zurich default.
 eval "$(droneflight sitl-env --plan "$PLAN")"
-echo "PX4 SITL home: $PX4_HOME_LAT, $PX4_HOME_LON @ ${PX4_HOME_ALT} m"
+echo "PX4 SITL home: $PX4_HOME_LAT, $PX4_HOME_LON @ ${PX4_HOME_ALT} m (HEADLESS=$HEADLESS)"
+if [[ -n "${PX4_GZ_WORLD:-}" ]]; then
+  echo "world: $PX4_GZ_WORLD"
+else
+  echo "world: *** PX4 default (default.sdf) — FLAT. Terrain-following is NOT being tested. ***"
+  echo "       pass a world name as arg 3, e.g.: run_sitl.sh <plan> <px4-dir> planner_terrain"
+fi
 
 cd "$PX4_DIR"
 exec make px4_sitl gz_x500

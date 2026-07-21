@@ -1,0 +1,21 @@
+# PX4 parameters for SITL bring-up runs — removes failsafes that confound a test.
+# Load via QGroundControl or `param load sitl_bringup.params` in the pxh shell.
+# Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
+#
+# ⚠️ SIM_* parameters are SIMULATION-ONLY. Never carry this file to an aircraft.
+
+# --- Data-link loss ---------------------------------------------------------
+# 0 = disabled. Required here because `droneflight fly` disconnects when the
+# mission completes, which PX4 reads as "GCS lost" and answers with RTL.
+#
+# This is ALSO a real design decision, not just sim hygiene: this aircraft flies
+# autonomously and covertly, and may have no GCS link at all. Left at RTL, it
+# would abandon the mission and climb/beeline home the moment a link drops —
+# while paying out fiber. See the failsafe-policy note in NAV-FIDELITY.md /
+# CLAUDE.md before choosing the flight value.
+1	1	NAV_DLL_ACT	0	6
+
+# --- Simulated battery (SITL only) ------------------------------------------
+# 0 = disable simulated drain, so a long mission doesn't trip a battery warning
+# mid-test. By default SITL drains to SIM_BAT_MIN_PCT (50%) and warns.
+1	1	SIM_BAT_DRAIN	0.0	9

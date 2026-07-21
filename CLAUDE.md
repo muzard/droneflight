@@ -93,9 +93,29 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   inject the plan's home so a mission lands at the AO, not Zurich; RUNBOOK
   sequences the first flight **GPS-enabled first** (isolate the executor/MAVSDK
   path), then GPS-denied.
-- ⏳ **Slice 1 (needs the VM — user's step):** stand up Ubuntu 24.04 arm64 VM
-  (PX4/ROS2 Jazzy/Gazebo Harmonic/MAVSDK), fly a `.plan` GPS-enabled, fix what
-  `mavsdk_connector.py` gets wrong (altitude frame, mission encoding, arming/RTL).
+- ✅ **Slice 1 DONE (2026-07-21, first live flight):** PX4 v1.18-beta SITL +
+  Gazebo on the Ubuntu VM flew a planner `.plan` end-to-end, GPS-enabled.
+  `droneflight fly` reported **COMPLETED 38/38**; `mavsdk_connector.py` needed
+  **no fixes** — altitude framing (`alt_agl_m` → MAVSDK `relative_altitude_m`),
+  mission encoding, arming and RTL all worked first time. ~10.5 min flight,
+  ~5.8 m/s average (plan cruise 6.0).
+- ⚠️ **…but the route was degenerate — don't over-trust that result.** The plan
+  came from `configs/mission.example.yaml`, which has **no terrain**, so the
+  planner emitted its straight-line stub: tortuosity **1.0000**, max turn
+  **0.001°**, **constant 30 m** altitude, report `analysis_not_performed`.
+  Consequences: the tether-safe **speed policy never engaged** (it slows through
+  turns; there were none), the **altitude band/climb limits were never
+  exercised**, and the measured cross-track (max **0.48 m**, mean 0.08 m) is
+  meaningless as corridor-holding — perfect GPS, no wind, straight line. **A
+  non-degenerate `.plan` is a precondition for the next SITL results to mean
+  anything** (droneplanner has a procedural demo AO with terrain/forest, but no
+  CLI path to emit a `.plan` from it — that gap is the cheap fix).
+- 🔎 **Failsafe finding (real, program-level):** post-mission, link loss + SITL
+  battery tripped `RTL: start return at 61 m`. An RTL that **climbs to 61 m and
+  beelines home** discards the nap-of-the-earth concealment profile *and* drags
+  the fiber off the laydown route. This aircraft is designed to fly with no GCS,
+  so `NAV_DLL_ACT` and RTL altitude must be deliberate design choices, not
+  defaults. `configs/px4/sitl_bringup.params` neutralises them for testing.
 - ⏭ **Next build items:** the **external-vision injection bridge** (stream
   `nav.py`/`correction.py` truth+error as `VISION_POSITION_ESTIMATE` into EKF2 →
   GPS-denied real in the loop) and the **v0 tether disturbance plugin**

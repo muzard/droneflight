@@ -68,7 +68,13 @@ class MavsdkConnector:  # pragma: no cover - requires a live autopilot
             for it in items
         ]
         try:
+            # Clear first: PX4 keeps the previously-uploaded mission *and* its
+            # current-item index, so `start_mission()` after a failed run resumes
+            # mid-route (e.g. "11/77") instead of flying from the start. Clearing
+            # makes a re-run idempotent without restarting the simulator.
+            await system.mission.clear_mission()
             await system.mission.upload_mission(MissionPlan(mav_items))
+            await system.mission.set_current_mission_item(0)
         except Exception as exc:
             raise ConnectorError(f"mission upload failed: {exc}") from exc
 

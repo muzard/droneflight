@@ -2,10 +2,11 @@
 
 How to actually run the flight stack. The offline `validate` path runs anywhere;
 **live execution needs PX4 SITL + Gazebo**, which does not run on macOS — use an
-**Ubuntu 24.04 (arm64) VM** on the M4 (UTM is free; Parallels is smoother). ROS 2
-Jazzy, PX4 SITL, and Gazebo Harmonic all have native arm64 builds and run without
-emulation on Apple silicon. Do **not** use amd64 Docker images for Gazebo (qemu
-emulation is far too slow to render).
+**Ubuntu 24.04 (arm64) VM** on the M4 (UTM is free; Parallels is smoother). PX4
+SITL and Gazebo Harmonic have native arm64 builds and run without emulation on
+Apple silicon. Do **not** use amd64 Docker images for Gazebo (qemu emulation is
+far too slow to render). Plan on running **headless** (§1.2) and driving it over
+**SSH** (§1.7); ROS 2 is **not** needed for this MVP (§1.8).
 
 ## 0. Offline (macOS, no sim) — works today
 
@@ -17,14 +18,211 @@ droneflight validate --plan /path/to/mission.plan --night  # sensor tradeoff
 
 ## 1. Ubuntu VM: install the sim stack
 
+### 1.0 What runs where (don't install everything in the VM)
+
+The `.plan` is the integration boundary — and also the VM boundary.
+
+| Component | Where | Why |
+|---|---|---|
+| `droneplanner` | **Mac only** | Pure offline. Generate the `.plan` on the Mac, hand the *file* to the VM. |
+| PX4-Autopilot, Gazebo, MAVSDK | **VM only** | Cannot run on macOS. |
+| `droneflight` | **both** | Mac: dev/tests/`validate`/`nav`/`simfly`. VM: `fly` + `sitl-env` against PX4. |
+
+⚠️ **Never reuse `DroneAutomation/.venv` inside the VM** — it holds macOS-arm64
+binaries. The guest gets its own venv (see §1.7).
+
+### 1.1 Create the VM
+
+Any arm64 hypervisor works; all run Ubuntu natively on M-silicon (no emulation).
+
+| Option | Cost | Notes |
+|---|---|---|
+| **UTM** (recommended) | free | Apple Virtualization backend. Gives you a desktop if you ever want one. |
+| **Multipass** | free | `brew install multipass && multipass launch 24.04 --name px4 --cpus 6 --memory 8G --disk 80G` — fastest, headless-only. |
+| **Parallels / VMware Fusion** | paid / free-personal | Smoothest integration. |
+
+Get **Ubuntu 24.04 LTS (Noble), arm64** — the *server* ISO is fine (we run
+headless). Size it generously: **6+ vCPU, 8 GB RAM, 80 GB disk** — a PX4 source
+build is heavy. **Tick "Install OpenSSH server"** in the installer (see §1.7 —
+headless means SSH is your main interface).
+
+> **Do not** use amd64 images or amd64 Docker: qemu emulation is far too slow to
+> render.
+
+### 1.2 ⚠️ Plan on running headless
+
+Gazebo's **3D acceleration does not work in Apple-Silicon VMs** — UTM's GPU-GL
+renders a [black world](https://github.com/utmapp/UTM/issues/3122) and Parallels
+renders garbage; the fallback is software rendering (llvmpipe), which is slow.
+This is fine: we validate the mission from **telemetry, not pixels**, so run
+`HEADLESS=1` (the default in `sitl/run_sitl.sh`). For a visual, use
+**QGroundControl on the macOS host** — its 2D map view shows the vehicle tracking
+the mission and needs no 3D in the VM (requires bridged networking; see §6).
+
+### 1.3 Install PX4 + Gazebo Harmonic
+
+Two paths. **Source build is the one to end up on** (needed to rebuild PX4 and to
+develop the tether plugin); the pre-built `.deb` is a same-day shortcut if you
+just want to see a mission fly.
+
+**(a) Source build — recommended**
+
 ```bash
-# ROS 2 Jazzy (LTS) — https://docs.ros.org/en/jazzy/Installation.html
-# PX4 SITL
+sudo apt update && sudo apt install -y git
 git clone https://github.com/PX4/PX4-Autopilot.git --recursive
-cd PX4-Autopilot && bash ./Tools/setup/ubuntu.sh
-# Gazebo Harmonic (gz-harmonic) — https://gazebosim.org/docs/harmonic/install
-# MAVSDK server ships with the `mavsdk` pip package used here.
+cd PX4-Autopilot && bash ./Tools/setup/ubuntu.sh    # installs deps + Gazebo
+# log out/in (or reboot) so group/env changes apply, then:
+make px4_sitl                                        # first build: slow (10-30 min)
 ```
+
+*Forgot the log-out? For **SITL it doesn't matter.** That step exists for (a) the
+`dialout` group — needed only to reach **real hardware** over USB/serial, not for
+UDP-based SITL, and (b) `~/.local/bin` on `PATH` for pip-installed build tools —
+and if the build completed, those were found. Just confirm the binary exists
+(§1.5). Only re-login before touching a physical autopilot.*
+
+⚠️ **Building with the droneflight venv active → `Failed to import em`.** CMake
+resolves Python to whatever is first on `PATH`, so an active venv shadows the
+system Python that `ubuntu.sh` installed PX4's build deps into. Since
+`sitl/run_sitl.sh` *needs* the venv (it calls `droneflight sitl-env`), the clean
+fix is to make one environment satisfy both:
+
+```bash
+. ~/venv/bin/activate
+pip install -r ~/PX4-Autopilot/Tools/setup/requirements.txt
+```
+
+Use the requirements file, **not** `pip install empy` — PX4 pins `empy==3.3.4`
+because empy 4.x broke the API. (Alternative: build PX4 with the venv
+deactivated, and only activate it for `droneflight` commands.)
+
+**(b) Pre-built package — fast start.** PX4 publishes SITL `.deb`s for Noble
+**arm64** on its [Releases page](https://github.com/PX4/PX4-Autopilot/releases).
+Add the OSRF repo first, then install:
+
+```bash
+sudo curl -fsSL https://packages.osrfoundation.org/gazebo.gpg \
+  -o /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] \
+  http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/gazebo-stable.list > /dev/null
+sudo apt update && sudo apt install ./px4-gazebo_*.deb
+PX4_SIM_MODEL=gz_x500 px4-gazebo                     # run it
+```
+
+*(With path (b) there is no `make`, so `sitl/run_sitl.sh` doesn't apply — export
+the `PX4_HOME_*` vars from `droneflight sitl-env` yourself before launching.)*
+
+### 1.4 Install droneflight (+ MAVSDK)
+
+```bash
+sudo apt install -y python3-venv python3-pip
+git clone <your droneflight remote>  # or share the folder from the Mac — see §1.6/§1.7
+python3 -m venv ~/venv && . ~/venv/bin/activate   # venv lives in the GUEST fs
+cd /path/to/droneflight && pip install -e ".[dev]"   # pulls mavsdk (Apache-2.0)
+# without cd'ing, put the extras on the path:  pip install -e "/path/to/droneflight[dev]"
+```
+
+Quote `".[dev]"` — unquoted, the shell treats `[dev]` as a glob. `[dev]` adds
+ruff/mypy/pytest; plain `-e .` (pydantic + mavsdk) is enough to *fly*, but the
+test suite is a useful install check (§1.5). Re-activate the venv in every new
+shell/tmux pane.
+
+If the source is a host mount, keep the venv **off** the mount (as above) — only
+the source is shared, since binaries differ per-OS.
+
+⚠️ **`error: externally-managed-environment`** — Ubuntu 24.04 ships Python 3.12
+under [PEP 668](https://pythonspeed.com/articles/externally-managed-environment-pep-668/),
+which blocks `pip install` into the *system* Python. The venv above **is** the
+fix: activate it first (`. ~/venv/bin/activate`) and pip works normally. Do
+**not** reach for `--break-system-packages` — that pollutes the OS Python that
+apt manages.
+
+MAVSDK-Python ships the `mavsdk_server` binary per-arch; on arm64 it resolves to
+the `linux-arm64-musl` build. If pip picks the wrong one, force it:
+
+```bash
+MAVSDK_SERVER_ARCH=aarch64 pip install --force-reinstall --no-cache-dir mavsdk
+```
+
+### 1.5 Verify before flying
+
+```bash
+ls -l ~/PX4-Autopilot/build/px4_sitl_default/bin/px4   # the build actually produced a binary
+gz sim --versions                                      # Gazebo present
+python -c "import mavsdk; print('mavsdk ok')"
+pytest -q                                              # 68 passed => package is sane
+droneflight validate --plan /path/to/mission.plan      # offline path works
+groups | grep -q dialout && echo "dialout ok" || echo "no dialout (fine for SITL)"
+```
+
+### 1.6 Getting the code and a `.plan` into the VM
+
+**Code — `git clone`.** Give the VM a **read-only deploy key** (tighter than an
+account key, and it survives detached `tmux`, unlike `ssh -A` agent forwarding):
+
+```bash
+ssh-keygen -t ed25519 -C "px4-vm" -f ~/.ssh/id_ed25519 -N ""   # in the VM
+cat ~/.ssh/id_ed25519.pub    # -> GitHub repo > Settings > Deploy keys > Add (read-only)
+git clone git@github.com:<you>/droneflight.git ~/droneflight
+```
+
+*(`gh auth login` works too if you prefer the GitHub CLI.)* Only `droneflight`
+is needed in the guest — `droneplanner` stays on the Mac (§1.0).
+
+**The `.plan` — not via git.** `out/` and `*.plan` are gitignored (it's a build
+artifact), so copy it across:
+
+```bash
+scp <mac>:/path/to/droneplanner/out/mission.plan  ~/plans/    # from the VM, or scp from the Mac
+```
+
+For a *fixed* SITL regression plan that should travel with the repo, note
+droneplanner's `.gitignore` whitelists `!configs/*.plan` — drop it in
+`droneplanner/configs/` and commit it deliberately.
+
+> Repos are on GitHub now: confirm they're **private**. This program's own
+> compliance notes (Technology-Selection §8, and the gotcha below) say to review
+> export/ITAR posture *before sharing* the integrated autonomy stack.
+
+### 1.7 Working over SSH (the dev loop)
+
+Headless means **SSH is the interface** — enable it. From the Mac:
+
+```bash
+ssh-copy-id user@<vm-ip>          # key auth, not passwords; `hostname -I` in the guest
+# ~/.ssh/config:  Host px4vm / HostName <vm-ip> / User <user>   ->  ssh px4vm
+```
+
+It's a local VM on a private network; just don't port-forward 22 to the internet.
+(Multipass users: `multipass shell px4` already works, and it manages keys.)
+
+Two things that save real pain:
+
+- **Run PX4 inside `tmux`** (`sudo apt install tmux`) so a dropped SSH session
+  doesn't kill the sim mid-flight. Two panes: `run_sitl.sh` in one, `fly` in the other.
+- **Mount the droneflight folder from the Mac** (UTM/Parallels shared folder, or
+  `multipass mount ~/Claude/Projects/DroneAutomation/droneflight px4:/home/ubuntu/droneflight`)
+  and create the venv **inside the guest filesystem**, pointing at the mount:
+
+  ```bash
+  python3 -m venv ~/venv && ~/venv/bin/pip install -e /path/to/mounted/droneflight
+  ```
+
+  An editable install over a host mount means code edited on the Mac takes effect
+  in the VM immediately — no copying. That is the slice-1 loop (fix
+  `mavsdk_connector.py` on the Mac, re-run in the VM). Keep the **venv off the
+  mount** (binaries differ per-OS) — only the source is shared.
+
+VS Code **Remote-SSH** works well as an alternative to the mount if you'd rather
+edit in the guest directly.
+
+### 1.8 Not needed yet: ROS 2
+
+**ROS 2 Jazzy is *not* required for this MVP** — `droneflight` speaks MAVLink to
+PX4 directly via MAVSDK. ROS 2 only becomes necessary for the later perception
+phase (Isaac ROS / cuVSLAM), which needs x86+RTX hardware anyway. Skip it for now
+and save yourself a large install.
 
 ## 2. Launch PX4 SITL + Gazebo **at the plan's home**
 
@@ -41,7 +239,48 @@ by injecting `PX4_HOME_*` from `droneflight sitl-env`:
 # PX4 exposes MAVLink on udp://:14540 (what droneflight --url targets).
 ```
 
+## 2b. Fly over the planned terrain (not PX4's flat world)
+
+PX4's default Gazebo world is **flat**, so a terrain-aware `.plan` flown in it
+proves nothing about nap-of-the-earth flight — and actively hides altitude-frame
+bugs (a relative-to-home defect that put 57/77 waypoints underground survived a
+green SITL flight for exactly this reason). Generate a world from the same DTM
+the route was planned over:
+
+```bash
+# on the Mac (droneplanner has the DTM + rasterio)
+droneplanner demo-ao --out demo_ao/
+droneplanner plan     --mission demo_ao/mission.yaml --out out_demo/
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan \
+                      --out demo_ao/worlds/planner_terrain.sdf
+
+# copy the .sdf AND the .tif it references to the VM, then:
+cp planner_terrain.sdf ~/PX4-Autopilot/Tools/simulation/gz/worlds/
+PX4_GZ_WORLD=planner_terrain ./sitl/run_sitl.sh ~/plans/mission.plan ~/PX4-Autopilot
+```
+
+The world sets `<spherical_coordinates>` to the plan's home so the Gazebo origin
+and `PX4_HOME_*` agree, and offsets the heightmap so home lands on the origin.
+The DEM `<uri>` is an **absolute path** — keep the `.tif` at that path on the VM,
+or edit the URI (alternatively put it on `GZ_SIM_RESOURCE_PATH`).
+
+**First-load checks** (the parts that can only be verified by running it):
+1. Does the world load at all? Gazebo needs GDAL support to read a GeoTIFF DEM.
+2. Does the vehicle **sit on the ground** at spawn? If it starts buried or
+   hovering, adjust the terrain model's `<pose>` z — it is a single labelled
+   number in the SDF, and the vertical-datum assumption is the likeliest thing to
+   be off.
+3. Does `commander status` show a sane altitude relative to the terrain?
+
 ## 3. First flight — prove the pipe (GPS-enabled)
+
+> **"It booted and then stopped doing anything" is correct behaviour.** Once you
+> see `INFO [px4] Startup script returned successfully` and a `pxh>` prompt, PX4
+> is up and **idling by design** — the vehicle stays grounded and disarmed until a
+> client connects and commands it. The repeating `Preflight Fail: No connection to
+> the GCS` is harmless spam. Nothing more happens until you run the `fly` command
+> below in a second pane. (`MAVLink only on localhost` likewise just confirms you
+> should run `droneflight` *inside* the VM.)
 
 Do the **first** run with PX4's default GPS-enabled EKF2. This isolates the
 executor/MAVSDK path (upload → arm → start → monitor → RTL) from the GPS-denied
@@ -85,8 +324,107 @@ cable model is a later refinement.
   need an NVIDIA RTX GPU on x86_64 Linux — **not** the Mac. Benchmark VIO drift on
   EuRoC/TUM/UZH before flying.
 
+## 6. Networking (where to run what)
+
+**Default: run everything inside the VM.** PX4 SITL, `droneflight fly`, and the
+plan all live in the guest, so `udp://:14540` just works with zero network
+configuration. This is the recommended setup for the first flight — don't add
+networking as a second variable while debugging the executor.
+
+**Optional, once it flies: QGroundControl on the macOS host** for a 2D map view
+(and easy param loading) without needing 3D in the VM. This needs the VM on
+**bridged** networking so it has a LAN IP the Mac can reach, and PX4's MAVLink
+stream pointed at the host (PX4 SITL broadcasts to `14550` for a GCS). Exact
+setup varies by hypervisor — worth doing once the basic loop is green, not before.
+
+## 7. Logs, results, and shutting down
+
+### What IS logged automatically — PX4 ULog
+
+PX4 writes a full **ULog** flight log to the simulated SD card:
+
+```
+~/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/<time>.ulg
+```
+
+This is the authoritative record — EKF state, position estimates, setpoints, mode
+changes, arming decisions, failsafes. It persists on the VM disk across reboots.
+Read it with:
+
+- **[PX4 Flight Review](https://review.px4.io)** — drag the `.ulg` in, get plots. Easiest.
+- **pyulog** — `pip install pyulog`, then `ulog_info x.ulg` / `ulog2csv x.ulg`.
+- **PlotJuggler** for live/offline plotting.
+
+⚠️ **PX4 logs *while armed* by default** — so a run that fails preflight and never
+arms may leave **no `.ulg` at all**. When debugging arming/bring-up, set
+`SDLOG_MODE` to one of its log-from-boot options (check the param description in
+QGC or `param show SDLOG_MODE`) so you capture the pre-arm phase too.
+
+### What is NOT logged — `droneflight` console output
+
+`droneflight fly` logs to the **console only** (`logging.basicConfig`, stderr);
+the `FlightResult` is printed once and discarded. Nothing is written to a file.
+Capture it yourself:
+
+```bash
+droneflight fly --plan ~/plans/mission.plan --url udp://:14540 2>&1 | tee ~/logs/fly-$(date +%F-%H%M).log
+```
+
+Or log a whole tmux pane continuously:
+
+```bash
+tmux pipe-pane -o 'cat >> ~/logs/px4-console.log'      # toggle off: tmux pipe-pane
+tmux capture-pane -p -S -3000 > ~/logs/scrollback.log   # dump existing scrollback
+```
+
+Do this **before** a run you might want to ask about — console scrollback is
+finite and a `tmux kill-session` takes it with it.
+
+### Getting logs off the VM (for analysis on the Mac)
+
+The PX4 pane can't capture itself (it runs `pxh>`, not a shell) — target it from
+another pane, then pull everything to the Mac:
+
+```bash
+# in the VM
+tmux list-panes -a                                            # find the id, e.g. px4:0.0
+tmux capture-pane -t px4:0.0 -p -S -5000 > ~/logs/px4-console.log
+
+# on the Mac — DroneAutomation/sim-logs/ sits outside both git repos
+DROP=/Users/arttu/Claude/Projects/DroneAutomation/sim-logs
+scp <vm>:'~/logs/*.log' $DROP/
+scp <vm>:'~/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/*.ulg' $DROP/
+```
+
+Decode a `.ulg` on the Mac with `pip install pyulog` → `ulog_info x.ulg`,
+`ulog_messages x.ulg`, `ulog2csv x.ulg`.
+
+### Shutting down
+
+Safe to power off between sessions — everything (PX4 build, venv, clone, `.ulg`
+logs) lives on the VM disk and survives.
+
+- Stop PX4 first (`shutdown` at the `pxh>` prompt, or `Ctrl-C`), then
+  `sudo poweroff` — a **clean** shutdown, not a force-kill of the VM window, so
+  the filesystem stays consistent.
+- **tmux sessions do *not* survive a reboot.** tmux persists across *SSH
+  disconnects*, not across VM restarts — you'll recreate panes next session.
+- **Suspend/pause the VM instead** (hypervisor save-state) for a much faster
+  resume *and* tmux sessions stay alive. Preferred if you're coming back soon.
+
 ## Notes / gotchas
 
+- **"Preflight Fail: No connection to the ground control station" is expected
+  log spam, not a failure.** A GCS is *not required* to run SITL
+  ([PX4 #20478](https://github.com/PX4/PX4-Autopilot/issues/20478)); PX4 prints it
+  continuously when nothing is connected. Likewise most boot-time preflight
+  warnings (power/RC/GPS) simply mean *"can't arm yet"*, not *"sim is broken"*.
+  The sim is healthy if you get a **`pxh>` prompt**. For the precise, current
+  arming state run **`commander check`** in that shell — that is the real
+  diagnostic, and several checks clear once a GCS/MAVSDK link connects.
+- **Snapshot the VM once §1.5 verifies green**, before flying/tinkering. The PX4
+  toolchain install is ~an hour; a snapshot makes a bad `apt` or a broken build
+  a 30-second rollback instead of a redo.
 - Keep the sim host awake during long runs.
 - GPS-denied: gate readiness on *local* position health, not global (the adapter
   already does).
