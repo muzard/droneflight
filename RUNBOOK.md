@@ -170,21 +170,27 @@ Repos: `github.com/muzard/droneplanner` and `github.com/muzard/droneflight`.
 `droneplanner` is cloned **only to deliver sim assets** — do **not** `pip install`
 it in the guest, its geospatial stack is heavy and unnecessary there.
 
-```bash
-cd ~
-git clone https://github.com/muzard/droneflight.git
-git clone https://github.com/muzard/droneplanner.git    # assets only, no install
-cd ~/droneflight && . ~/venv/bin/activate && pip install -e ".[dev]"
-```
-
-*If the clone prompts for credentials the repos are private* — add a **read-only
-deploy key** per repo (survives detached `tmux`, unlike `ssh -A`):
+**Auth is SSH.** GitHub dropped HTTPS password auth, so `https://` clones fail
+with *"Password authentication is not supported"*. Give the VM its own key:
 
 ```bash
 ssh-keygen -t ed25519 -C "px4-vm" -f ~/.ssh/id_ed25519 -N ""
-cat ~/.ssh/id_ed25519.pub   # -> GitHub repo > Settings > Deploy keys > Add (read-only)
-# then clone with git@github.com:muzard/<repo>.git
+cat ~/.ssh/id_ed25519.pub    # -> GitHub > Settings > SSH and GPG keys > New SSH key
+ssh -o StrictHostKeyChecking=accept-new -T git@github.com   # "Hi muzard! ..." = working
 ```
+
+*(An account-level key covers both repos. Tighter but fiddlier: per-repo read-only
+**deploy keys** — GitHub rejects the same key on two repos, so that needs two
+keypairs plus `~/.ssh/config` host aliases.)*
+
+```bash
+cd ~
+git clone git@github.com:muzard/droneflight.git
+git clone git@github.com:muzard/droneplanner.git    # assets only, no install
+cd ~/droneflight && . ~/venv/bin/activate && pip install -e ".[dev]"
+```
+
+The Mac uses SSH remotes too (`git remote set-url origin git@github.com:muzard/<repo>.git`).
 
 **Routine sync** — after every push from the Mac:
 
