@@ -116,18 +116,39 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   the fiber off the laydown route. This aircraft is designed to fly with no GCS,
   so `NAV_DLL_ACT` and RTL altitude must be deliberate design choices, not
   defaults. `configs/px4/sitl_bringup.params` neutralises them for testing.
-- 🔄 **Slice 2 IN PROGRESS — fly the terrain world.** `droneplanner gz-world`
-  emits a Gazebo world whose heightmap is the planned DTM (§2b of RUNBOOK).
-  Status: the altitude-frame fix is **confirmed in flight** — the drone tracked
-  the commanded relative-altitude profile precisely (30→27.4→20.1→11.0 m). But
-  every run so far has actually loaded PX4's **flat `default.sdf`**, so the
-  heightmap is **still unverified**: the drone flew its correct descending
-  profile into a flat floor at z=0 and the land detector latched (`dist_bottom`
-  tracked `alt` exactly — the tell that there is no relief beneath it).
-  **Next action:** launch with the world as arg 3 and check `gz model --list`
-  contains `terrain`. If it does not, the likely cause is the heightmap
-  **(2^n)+1 square-dimension constraint** — our DEM is 160×160 — fix by
-  resampling to 257×257 inside `gz-world`.
+- 🔄 **Slice 2 IN PROGRESS — fly the terrain world. ONE OPEN BUG.**
+  `droneplanner gz-world` injects the planned DTM as a heightmap into **PX4's own
+  `default.sdf`** (RUNBOOK §2b). The world loads, the vehicle spawns correctly,
+  climbs perfectly — then **tumbles the instant it translates** (`Attitude
+  failure (roll/pitch)`, roll → 180°, land-detector latches, mission stalls).
+
+  **Proven working (don't re-investigate — measured in ULogs):**
+  - Altitude-frame conversion — drone tracked the commanded relative profile
+    exactly (30→27.4→20.1→11.0 m).
+  - Heightmap loads: `terrain` appears in `gz model --list`. The (2^n)+1
+    dimension constraint does **not** apply — 160×160 is fine.
+  - Vertical datum correct: at rest `z = -0.009 m`, `dist_bottom = 0.010`.
+    Gazebo does place a DEM's *minimum* at the model pose z.
+  - Terrain placement correct near home (`alt - dist_bottom` ≈ 0 as expected).
+  - Hover/control sound: 18 s climb at **0.2°** attitude error.
+  - Physics timing clean: `sensor_combined` dt median 4.00 ms, p99 4.00,
+    0 gaps >50 ms, cpuload 0.31 → **not** a lockstep/heightfield-cost problem.
+  - World config now inherited from PX4 (magnetic_field, atmosphere, ode
+    250 Hz, zero `<plugin>` elements).
+
+  **Still unexplained:** tumble occurs only with a heightmap present (the flat
+  `default.sdf` flies fine), in *both* the hand-written and PX4-derived worlds.
+  Not datum, placement, sensors, world config, or timing — all eliminated above.
+
+  **Next experiment (set up, not yet run):** `droneplanner gz-world --flat`
+  emits a structurally identical world with an effectively flat DEM (1 m ramp
+  over 4 km). Fly it:
+  - **stable** → the problem is terrain *slope/normals* (look at heightmap
+    sampling/`<size>` z semantics; note the ODE AABB reported z max = DEM max
+    elevation 150.32, not the 110.32 relief passed as `<size>`);
+  - **still tumbles** → the problem is the *heightmap collision itself*,
+    independent of shape (try `<collision>`-free visual-only terrain to confirm,
+    then a coarser DEM).
 - ⚠️ **Workflow: the VM syncs by `git pull`** from `github.com/muzard/{droneplanner,droneflight}`.
   Both repos are cloned in the guest — droneflight is installed, droneplanner is
   clone-only (it just delivers `demo_ao/` DEMs + Gazebo worlds; don't pip-install

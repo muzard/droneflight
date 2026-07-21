@@ -300,6 +300,8 @@ the route was planned over:
 droneplanner demo-ao --out demo_ao/
 droneplanner plan     --mission demo_ao/mission.yaml --out out_demo/
 droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan \
+                      --base-world <PX4>/Tools/simulation/gz/worlds/default.sdf \
+                      --dem-path /home/<user>/droneplanner/demo_ao/dtm.tif \
                       --out demo_ao/worlds/planner_terrain.sdf
 
 # copy the .sdf AND the .tif it references to the VM (§1.6), then:
@@ -321,13 +323,49 @@ and `PX4_HOME_*` agree, and offsets the heightmap so home lands on the origin.
 The DEM `<uri>` is an **absolute path** — keep the `.tif` at that path on the VM,
 or edit the URI (alternatively put it on `GZ_SIM_RESOURCE_PATH`).
 
-**First-load checks** (the parts that can only be verified by running it):
-1. Does the world load at all? Gazebo needs GDAL support to read a GeoTIFF DEM.
-2. Does the vehicle **sit on the ground** at spawn? If it starts buried or
-   hovering, adjust the terrain model's `<pose>` z — it is a single labelled
-   number in the SDF, and the vertical-datum assumption is the likeliest thing to
-   be off.
-3. Does `commander status` show a sane altitude relative to the terrain?
+**`--base-world` is required.** The terrain is injected into PX4's own world so
+it inherits `<magnetic_field>`, `<atmosphere>`, ODE @250 Hz, and — critically —
+gz-sim's *default plugin set*, which loads only when a world declares **no**
+`<plugin>` elements. A from-scratch world silently loses all of that: every
+sensor dies ("No valid data from Accel 0", "Found 0 compass"), and with no
+magnetic field the EKF yaw diverges and the vehicle tumbles. The generator also
+sets `<world name>` to the output **file stem** — mismatch there makes PX4 hang
+forever on *"Waiting for Gazebo world..."*.
+
+### ⚠️ Known open bug — terrain worlds tumble on translation
+
+The vehicle spawns correctly, climbs perfectly, then **tumbles as soon as it
+translates** (`Attitude failure (roll)`, roll → 180°, land detector latches,
+mission stalls). Reproducible with any heightmap present; the flat `default.sdf`
+flies fine.
+
+**Already eliminated, with ULog evidence — do not re-investigate:**
+
+| Hypothesis | Verdict |
+|---|---|
+| Heightmap fails to load / needs (2^n)+1 dims | ❌ `terrain` is in `gz model --list`; 160×160 is fine |
+| Vertical datum wrong | ❌ at rest `z = -0.009`, `dist_bottom = 0.010` |
+| Terrain misplaced | ❌ `alt - dist_bottom` ≈ 0 near home, as planned |
+| Sensors missing | ❌ fixed by inheriting PX4's world |
+| Attitude/control tuning | ❌ 18 s climb at 0.2° attitude error |
+| Lockstep / heightfield CPU cost | ❌ `sensor_combined` dt median 4.00 ms, p99 4.00, 0 gaps >50 ms, cpuload 0.31 |
+
+**Next experiment (built, not yet run)** — bisect shape vs. heightmap:
+
+```bash
+droneplanner gz-world ... --flat --out demo_ao/worlds/planner_flat.sdf
+# copy planner_flat.sdf AND dtm_flat.tif to the VM, then fly planner_flat
+```
+
+* **stable over flat DEM** → it is terrain *slope/normals*. Note the ODE debug
+  line reports `AABB max z = 150.32` (the DEM's max elevation) rather than the
+  110.32 relief passed as `<size>` — the vertical-scale semantics are worth
+  pinning down there.
+* **still tumbles** → it is the heightmap collision itself, shape-independent:
+  try a visual-only terrain (drop `<collision>`) to confirm, then a coarser DEM.
+
+Interim workaround: fly PX4's flat `default.sdf` for anything that is not
+terrain-following (the executor, speed policy, and the EV bridge all work there).
 
 ## 3. First flight — prove the pipe (GPS-enabled)
 
