@@ -151,7 +151,7 @@ MAVSDK_SERVER_ARCH=aarch64 pip install --force-reinstall --no-cache-dir mavsdk
 ls -l ~/PX4-Autopilot/build/px4_sitl_default/bin/px4   # the build actually produced a binary
 gz sim --versions                                      # Gazebo present
 python -c "import mavsdk; print('mavsdk ok')"
-pytest -q                                              # 119 passed => package is sane
+pytest -q                                              # 126 passed => package is sane
 droneflight validate --plan /path/to/mission.plan      # offline path works
 groups | grep -q dialout && echo "dialout ok" || echo "no dialout (fine for SITL)"
 ```
@@ -448,18 +448,70 @@ That is a second *onboard* instance: PX4 listens on 14581 and streams to 14541,
 which is where `ev-bridge` connects (its `--url` default). Check with
 `mavlink status` that two instances are up.
 
+⚠️ **Two ports, not one.** MAVSDK-Python also spawns its own `mavsdk_server` on a
+**fixed gRPC port** (default 50051) and does *not* check whether it is free, so two
+droneflight processes silently fight over it — the second server fails to bind and
+its client attaches to the *other* process's connection, quietly ignoring one of
+the `--url` values. `ev-bridge` therefore defaults to `--server-port 50052`; leave
+`fly` on 50051. Each concurrent MAVSDK process needs a distinct gRPC port.
+
 ### 3b.2 Parameters
 
+> ⚠️ **You cannot feed a `.params` file to pxh at all.** The
+> `<vid> <cid> <name> <value> <type>` text in `configs/px4/` is
+> **QGroundControl's** format. PX4's own `param load` / `param import` read
+> **BSON**, so pointing them at these files fails with
+> `tinybson: node name overflow` as they try to parse the comment header. And
+> `param load` would be wrong even in BSON: it **resets every parameter to default
+> first**, so loading two files in sequence silently discards the first — you would
+> get `NAV_DLL_ACT=0` with EKF2 **still fusing GPS**, a "GPS-denied" run that is
+> nothing of the kind.
+>
+> Also: `pxh>` is PX4's own prompt, not a shell — no `$USER`, no `~`, no globbing.
+
+With QGroundControl: Tools → Load from file, both files, then reboot. **Headless**
+(the normal case here), generate console commands from the same files so the two
+can't drift:
+
 ```bash
-pxh> param load /path/to/droneflight/configs/px4/gps_denied_ekf2.params
-pxh> param load /path/to/droneflight/configs/px4/sitl_bringup.params
-pxh> reboot
+droneflight px4-params --file configs/px4/gps_denied_ekf2.params \
+                       --file configs/px4/sitl_bringup.params
+```
+
+Paste its output into pxh — it ends with `param save` — then `reboot`:
+
+```
+param set EKF2_EV_CTRL 11
+param set EKF2_GPS_CTRL 0
+param set EKF2_HGT_REF 3
+param set EKF2_EV_DELAY 50.0
+param set COM_ARM_WO_GPS 1
+param set MIS_TAKEOFF_ALT 5.0
+param set NAV_DLL_ACT 0
+param set SIM_BAT_DRAIN 0.0
+param save
 ```
 
 `gps_denied_ekf2.params` sets `EKF2_GPS_CTRL=0` (no GPS aiding), `EKF2_EV_CTRL=11`
 (EV horizontal + vertical position + yaw — the fields
 `VISION_POSITION_ESTIMATE` actually carries), `EKF2_HGT_REF=3` and
 `COM_ARM_WO_GPS=1`.
+
+**After the reboot, verify — and re-add the bridge's endpoint.** `mavlink start`
+does not persist across a reboot, and a silently-reset parameter is the failure
+mode this whole section is guarding against:
+
+```bash
+pxh> mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541
+pxh> param show EKF2_GPS_CTRL
+pxh> param show EKF2_EV_CTRL
+pxh> param show EKF2_HGT_REF
+pxh> param show NAV_DLL_ACT
+```
+
+Expect `0`, `11`, `3`, `0` (`param show` takes one name/pattern, so ask one at a
+time). If `EKF2_GPS_CTRL` is not 0, the params did not stick and every run from
+here is GPS-aided — fix it before flying, not after.
 
 ### 3b.3 Order matters: bridge first, then fly
 
@@ -545,6 +597,10 @@ something on a **non-degenerate plan** — the straight-line stub from
 | `injected err` stays 0.0 | the vehicle has not moved, or truth is not updating | error accrues with distance flown; check `gz topic -e -t <topic>` by hand |
 | vehicle drifts off immediately in a straight line | frame error (ENU/NED swap) | `ev-bridge --dry-run` and compare published N/E against `gz topic` truth |
 | bridge and `fly` fight over the port | both on 14540 | second `mavlink start` instance (§3b.1); bridge on 14541 |
+| `param ... failed (2)` in pxh | `$USER`/`~` passed literally — pxh is not a shell | type the absolute path |
+| `tinybson: node name overflow` on `param import` | pxh reads BSON; `.params` is QGC text | `droneflight px4-params --file ...` and paste the `param set` lines (§3b.2) |
+| run looks clean but suspiciously accurate | params never applied, or `param load` wiped them; GPS still fused | re-check `param show EKF2_GPS_CTRL` = 0 (§3b.2) |
+| `mavlink status` shows one instance after a reboot | `mavlink start` does not persist | re-run it after every reboot (§3b.2) |
 
 `ev-bridge --dry-run` reads truth and computes poses **without** publishing or
 connecting to PX4 — the fastest way to check topic names and frames before

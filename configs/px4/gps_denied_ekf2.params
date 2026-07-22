@@ -1,11 +1,19 @@
 # PX4 EKF2 parameters for GPS-denied flight on external vision.
-# Load via QGroundControl (Vehicle Setup > Parameters > Tools > Load from file)
-# or `param load gps_denied_ekf2.params` in the pxh shell, then reboot.
 # Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
 # These are a STARTING POINT — tune EV delay/noise to your VIO/VTRN pipeline.
 #
+# HOW TO APPLY THIS FILE
+#   QGroundControl: Vehicle Setup > Parameters > Tools > Load from file, then reboot.
+#   Headless / pxh console: this text format is QGC's, NOT PX4's. `param load` and
+#   `param import` in pxh read *BSON* and fail on this file with a tinybson
+#   "node name overflow" as they try to parse these comments. Generate console
+#   commands instead:
+#       droneflight px4-params --file configs/px4/gps_denied_ekf2.params \
+#                              --file configs/px4/sitl_bringup.params
+#   and paste the `param set` lines into pxh, then `reboot`.
+#
 # Pairs with `droneflight ev-bridge`, which supplies the vision pose. In SITL,
-# load sitl_bringup.params as well.
+# apply sitl_bringup.params as well.
 
 # External-vision fusion bitmask: 1 = horizontal position, 2 = vertical position,
 # 4 = velocity, 8 = yaw.  11 = position (H+V) + yaw, which is exactly what

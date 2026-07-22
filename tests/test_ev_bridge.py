@@ -550,3 +550,24 @@ async def test_acceptance_ab_offline_proxy() -> None:
     assert on <= 15.0, f"VTRN should hold the corridor, got {on:.1f} m"
     assert off > 50.0, f"dead reckoning should wander well out, got {off:.1f} m"
     assert off > 5 * on
+
+
+async def test_publish_rate_does_not_undershoot_the_target() -> None:
+    """50 Hz truth at a 30 Hz target must average ~30 Hz, not 25.
+
+    Comparing against the *last publish* skips a whole sample whenever the truth
+    period does not divide the target period — a real SITL run came out at
+    25.1 Hz for a requested 30. The deadline accumulator fixes the average.
+    """
+    truth = [
+        TruthSample(t_s=i * 0.02, east_m=0.0, north_m=i * 0.1, up_m=30.0) for i in range(500)
+    ]  # 50 Hz, 10 s
+    stats, _ = await _run(ErrorInjector(DriftConfig()), truth, rate_hz=30.0)
+    span = truth[-1].t_s - truth[0].t_s
+    assert stats.published / span == pytest.approx(30.0, abs=1.0)
+
+
+async def test_publish_rate_cannot_exceed_the_truth_rate() -> None:
+    truth = [TruthSample(t_s=i * 0.1, east_m=0.0, north_m=0.0, up_m=1.0) for i in range(50)]
+    stats, _ = await _run(ErrorInjector(DriftConfig()), truth, rate_hz=100.0)
+    assert stats.published == 50  # forwards everything, invents nothing

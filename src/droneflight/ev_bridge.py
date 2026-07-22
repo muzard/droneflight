@@ -649,7 +649,12 @@ class EvBridge:
         stats = EvBridgeStats()
         interval = 1.0 / self.config.rate_hz if self.config.rate_hz > 0 else 0.0
         last_pos: tuple[float, float] | None = None
-        last_pub_t = -math.inf
+        # Publish against a rolling *deadline*, not "time since last publish".
+        # The latter silently undershoots whenever the truth rate is not a
+        # multiple of the target: 50 Hz truth asked for 30 Hz publishes every
+        # other sample and yields 25 Hz. Accumulating the deadline keeps the
+        # long-run average honest.
+        next_pub_t = -math.inf
         t0: float | None = None
 
         async for sample in truth.stream():
@@ -676,9 +681,9 @@ class EvBridge:
             stats.final_error_m = err
             stats.track_enu.append((sample.east_m, sample.north_m))
 
-            if sample.t_s - last_pub_t < interval:
+            if sample.t_s < next_pub_t:
                 continue
-            last_pub_t = sample.t_s
+            next_pub_t = sample.t_s + interval if next_pub_t == -math.inf else next_pub_t + interval
 
             pose = self._pose_for(sample, (err_e, err_n))
             await publisher.publish(pose)

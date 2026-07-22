@@ -33,3 +33,53 @@ def px4_home_env(mission: FlightMission) -> dict[str, str]:
 def format_env_exports(env: dict[str, str]) -> str:
     """Render an env mapping as a shell ``export`` block (for ``eval``)."""
     return "\n".join(f"export {key}={value}" for key, value in env.items())
+
+
+class ParamFileError(ValueError):
+    """A ``.params`` file could not be parsed."""
+
+
+_PARAM_TYPE_INT = 6
+_PARAM_TYPE_FLOAT = 9
+
+
+def parse_qgc_params(text: str) -> list[tuple[str, str]]:
+    """Parse a QGroundControl ``.params`` file into ``(name, value)`` pairs.
+
+    The format is ``<vehicle_id> <component_id> <name> <value> <type>``, tab or
+    space separated, with ``#`` comments.
+    """
+    out: list[tuple[str, str]] = []
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) != 5:
+            raise ParamFileError(f"line {lineno}: expected 5 fields, got {len(fields)}: {raw!r}")
+        _vid, _cid, name, value, type_str = fields
+        try:
+            ptype = int(type_str)
+            out.append(
+                (name, str(int(float(value))) if ptype == _PARAM_TYPE_INT else str(float(value)))
+            )
+        except ValueError as exc:
+            raise ParamFileError(f"line {lineno}: bad value/type in {raw!r}") from exc
+    if not out:
+        raise ParamFileError("no parameters found")
+    return out
+
+
+def format_pxh_param_sets(params: list[tuple[str, str]]) -> str:
+    """Render parameters as ``param set`` lines for PX4's ``pxh>`` console.
+
+    PX4's own ``param load`` / ``param import`` read **BSON**, not this text
+    format — pointing them at a ``.params`` file fails with a ``tinybson`` node
+    name overflow as it tries to parse the comment header. QGroundControl reads
+    the text format, but a headless VM has no QGC, so the console path is
+    ``param set``. Generating those lines from the same file keeps one source of
+    truth instead of a hand-copied list that drifts.
+    """
+    lines = [f"param set {name} {value}" for name, value in params]
+    lines.append("param save")
+    return "\n".join(lines)

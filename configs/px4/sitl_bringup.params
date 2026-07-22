@@ -1,6 +1,9 @@
 # PX4 parameters for SITL bring-up runs — removes failsafes that confound a test.
-# Load via QGroundControl or `param load sitl_bringup.params` in the pxh shell.
 # Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
+#
+# Apply via QGroundControl (Tools > Load from file). In a headless pxh console
+# this text format is NOT readable — `param load`/`param import` want BSON. Use
+# `droneflight px4-params --file <this file>` and paste the `param set` lines.
 #
 # ⚠️ SIM_* parameters are SIMULATION-ONLY. Never carry this file to an aircraft.
 

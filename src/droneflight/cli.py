@@ -46,7 +46,13 @@ from droneflight.plan_loader import (
     load_qgc_plan,
 )
 from droneflight.sensors import SensorSelectionError, select_sensor_mode
-from droneflight.sitl_launch import format_env_exports, px4_home_env
+from droneflight.sitl_launch import (
+    ParamFileError,
+    format_env_exports,
+    format_pxh_param_sets,
+    parse_qgc_params,
+    px4_home_env,
+)
 
 
 def _validate(args: argparse.Namespace) -> int:
@@ -178,6 +184,19 @@ def _sitl_env(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(format_env_exports(px4_home_env(mission)))
+    return 0
+
+
+def _px4_params(args: argparse.Namespace) -> int:
+    """Emit `param set` lines for pxh from QGC .params files (pxh can't read them)."""
+    pairs: list[tuple[str, str]] = []
+    for path in args.file:
+        try:
+            pairs.extend(parse_qgc_params(Path(path).read_text(encoding="utf-8")))
+        except (OSError, ParamFileError) as exc:
+            print(f"error: {path}: {exc}", file=sys.stderr)
+            return 2
+    print(format_pxh_param_sets(pairs))
     return 0
 
 
@@ -338,7 +357,12 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
 
         from droneflight.ev_bridge import MavsdkMocapPublisher
 
-        system = System()
+        # MAVSDK-Python spawns its own `mavsdk_server` on a FIXED gRPC port
+        # (default 50051) with no conflict check. `droneflight fly` runs
+        # concurrently and takes that default, so the bridge must move off it —
+        # otherwise the second server fails to bind and the two processes end up
+        # sharing one MAVLink connection, silently ignoring one of the --url values.
+        system = System(port=args.server_port)
         await system.connect(system_address=args.url)
         async for state in system.core.connection_state():
             if state.is_connected:
@@ -495,6 +519,13 @@ def app(argv: list[str] | None = None) -> int:
     se.add_argument("--plan", type=Path, required=True)
     se.set_defaults(func=_sitl_env)
 
+    pp = sub.add_parser(
+        "px4-params",
+        help="Emit `param set` lines for the pxh console from QGC .params files.",
+    )
+    pp.add_argument("--file", action="append", required=True, help="A .params file (repeatable).")
+    pp.set_defaults(func=_px4_params)
+
     fp = sub.add_parser(
         "flatten-plan",
         help="Rewrite a plan to a constant altitude for PX4's FLAT world (destroys "
@@ -539,6 +570,12 @@ def app(argv: list[str] | None = None) -> int:
         choices=("none", "epoch", "sim"),
         default="none",
         help="Vision message timestamp; switch if EKF2 rejects the stream (RUNBOOK §3b).",
+    )
+    eb.add_argument(
+        "--server-port",
+        type=int,
+        default=50052,
+        help="gRPC port for this process's mavsdk_server. MUST differ from `fly`'s (50051).",
     )
     eb.add_argument("--dry-run", action="store_true", help="Read truth but do not publish to PX4.")
     eb.add_argument(
