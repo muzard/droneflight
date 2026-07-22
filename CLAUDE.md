@@ -37,7 +37,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 134 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 141 tests, ~96% cov
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -149,7 +149,7 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
 
 - 🎯 **Slice 3 — external-vision injection bridge: BUILT, not yet flown.**
   `ev_bridge.py` + `droneflight ev-bridge` / `ev-report` are written, linted,
-  typed and tested (134 tests, ~96% cov) — but **everything below the unit tests
+  typed and tested (141 tests, ~96% cov) — but **everything below the unit tests
   is unverified until a VM session runs it.** Procedure: RUNBOOK §3b.
   - **Truth is Gazebo, never PX4.** `GazeboTruthSource` shells out to
     `gz topic -e --json-output` (model odometry, falling back to the world pose
@@ -194,11 +194,81 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     an explicit value still overrides. Any fixed constant here is wrong — the safe
     value is a property of the route.
 
-  *Acceptance (unrun):* mission completes GPS-denied; the **true** (Gazebo) track
-  stays within corridor tolerance with fixes enabled and demonstrably wanders out
-  with `--no-vtrn` — i.e. reproduce `nav.py`'s offline A/B against real flight.
-  Both arms print the corridor verdict; `ev-report` recomputes it from a
-  `--record` JSONL. Only meaningful on a **non-degenerate plan**.
+  - 📊 **First GPS-denied flight, 2026-07-22 (`sim-logs/13_17_18.ulg`,
+    `ev-vtrn.jsonl`).** Armed on injected vision, flew **41/77 waypoints (~4 km)**
+    before the watchdog aborted. Measured, VTRN arm:
+
+    | Quantity | Value |
+    |---|---|
+    | EV publish rate | 30.0 Hz, `cs_ev_pos` on continuously 62→475 s |
+    | EKF2 lock (est − published) | mean **0.42 m**, max 10.1 m |
+    | Injected error | max **9.0 m**, mean 3.6 m (22/27 fixes accepted) |
+    | **True track vs plan, MISSION phase** | max **10.4 m**, mean 3.4 m — **0/10139 samples outside the 15 m corridor** |
+
+    So the VTRN arm **holds the corridor in real flight**. The `--no-vtrn` control
+    arm is still unrun, so the A/B is half done.
+  - ⚠️ **Score the MISSION phase only.** The whole-run number for the same flight
+    is max 122.6 m — all of it the post-abort RTL, which beelines home across a
+    tortuous route. `ev-bridge` now records PX4's flight mode per sample and
+    `ev-report` segments on it (older records get a warning); endpoint deviation
+    is flagged as meaningless when the route was not completed.
+
+  - ✅ **77/77 COMPLETED GPS-denied (2026-07-22, `sim-logs/13_40_08.ulg`).**
+    AUTO_MISSION 25→937 s, `finished=True`, EV 30.0 Hz, EKF2 lock (est−published)
+    mean 0.42 m. True track vs plan: **max 11.5 m, mean 5.3 m — within the 15 m
+    corridor.** The MVP flies.
+  - 🔴 **…but that run's basemap was degenerate — the result does NOT validate
+    VTRN.** `route_reference()` builds its polyline in `_to_local` absolute metres
+    (~5.2e6); the bridge samples at Gazebo **home-relative ENU** (~0). Every query
+    landed **5344 km** off-route, projected onto the same endpoint, and collapsed
+    the spatially varying field to **one bucket** — which happened to be open
+    terrain. So the flight ran against "perfect map everywhere", exactly the
+    optimistic assumption `correction.py` exists to remove. Fixed:
+    `route_reference(..., home_relative=True)` for the bridge, and
+    `PatchyReference.sample()` now **raises** on an off-route query instead of
+    silently degenerating (it immediately caught four tests making the same
+    mistake). **The VTRN arm must be re-flown.**
+  - 🔴 **Fixes were teleported into the published pose.** `correction.py` shrinks
+    error rather than jumping it — but the bridge applied the result to the
+    *published* pose in one sample (up to **10.1 m**, median 3.5 m). EKF2's
+    outlier gate rejected the step: 13 momentary losses of EV fusion, each
+    ~1.1 s after an accepted fix (7/13 vs 1.3 expected by chance), `ev_hpos` test
+    ratios to 311, 4.6 % of mission samples rejected. Fixed with
+    `ErrorInjector(correction_ramp_m=...)` (`ev-bridge --fix-ramp`, default 10 m):
+    7.8 m → 1.5 m max step with identical corrector decisions.
+  - 📉 **Monte Carlo, 40 seeds, corrected frame — the flight was the lucky case:**
+
+    | Scenario | median | p90 | worst | outside 15 m | fix avail | blunders |
+    |---|---|---|---|---|---|---|
+    | VTRN, 40 % forest / 10 % stale | 10.6 m | 15.6 m | 17.0 m | **4/40** | 48 % | 0 |
+    | VTRN, 70 % forest / 30 % stale | 17.4 m | 55.0 m | 114.0 m | **25/40** | 20 % | 7 |
+    | no VTRN (control) | 102.1 m | 106.4 m | 106.8 m | 40/40 | — | — |
+
+    So VTRN is **not** a reliable corridor guarantee: it fails 1 seed in 10 on a
+    benign map and most of the time in a conflict zone. One flight is one seed.
+
+  *Acceptance — ⏭ **NEXT SESSION STARTS HERE**. Three arms, all UNRUN on the
+  fixed code. Full procedure, predictions and pitfalls: **RUNBOOK §3c**.*
+
+  | Arm | Basemap | Predicted (seed 0) | Expect |
+  |---|---|---|---|
+  | A `vtrn` | 40 % forest / 10 % stale | max dev **15.0 m** | WITHIN (marginal) |
+  | B `novtrn` | none (dead reckoning) | max dev **106.4 m** | LEFT |
+  | C `conflict` | 70 % forest / 30 % stale | max dev **21.9 m** | LEFT |
+
+  Run each with `sitl/run_ev_arm.sh <arm> <plan>` (pins `--seed 0
+  --fidelity-seed 1` across arms — varying seeds between arms confounds the
+  comparison), then compare in one table:
+  `droneflight ev-report --plan … --record ev-vtrn.jsonl --record ev-novtrn.jsonl
+  --record ev-conflict.jsonl`. **The result only means something if the arms
+  disagree**; the report says so. Arm A sits exactly on the tolerance, so treat a
+  narrow pass/fail as noise — arm B is the one that must separate.
+
+  *Still unbuilt, ranked (was going to be next):* **EV dropout injection** (real
+  VIO loses lock; the stream has never been interrupted, so the failsafe path is
+  untested) and **yaw-error injection** (heading is currently ground truth, so a
+  whole error axis is unexercised and it couples into position through the
+  controller). Then the tether plugin.
 
 - ⚠️ **Workflow: the VM syncs by `git pull`** from `github.com/muzard/{droneplanner,droneflight}`.
   Both repos are cloned in the guest — droneflight is installed, droneplanner is

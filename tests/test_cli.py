@@ -288,3 +288,101 @@ def test_flatten_plan_rejects_a_plan_with_no_waypoints(tmp_path: Path) -> None:
     plan, out = tmp_path / "t.plan", tmp_path / "flat.plan"
     plan.write_text(json.dumps({"fileType": "Plan", "mission": {"items": []}}))
     assert app(["flatten-plan", "--plan", str(plan), "--out", str(out)]) == 2
+
+
+def _write_track_with_modes(path: Path) -> None:
+    """A run that flies the route, then RTLs straight home after an abort."""
+    lines = []
+    # On-route mission samples: hugging the plan (north from home).
+    for i, n in enumerate(range(0, 1000, 50)):
+        lines.append(
+            json.dumps(
+                {
+                    "t": i * 0.5,
+                    "truth": {"e": 2.0, "n": float(n), "u": 30.0},
+                    "err": {"e": 1.0, "n": 0.0},
+                    "pub": {"n": float(n), "e": 3.0, "d": -30.0, "yaw": 0.0},
+                    "mode": "FlightMode.MISSION",
+                }
+            )
+        )
+    # Post-abort RTL: beelines home well off the planned polyline.
+    for i, e in enumerate(range(0, 400, 50)):
+        lines.append(
+            json.dumps(
+                {
+                    "t": 100 + i * 0.5,
+                    "truth": {"e": float(e), "n": 500.0, "u": 30.0},
+                    "err": {"e": 1.0, "n": 0.0},
+                    "pub": {"n": 500.0, "e": float(e), "d": -30.0, "yaw": 0.0},
+                    "mode": "FlightMode.RETURN_TO_LAUNCH",
+                }
+            )
+        )
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_ev_report_scores_the_mission_phase_not_the_rtl(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A post-abort RTL cuts across the route; scoring it buries the real result."""
+    plan, track = tmp_path / "m.plan", tmp_path / "run.jsonl"
+    _write_plan(plan)
+    _write_track_with_modes(track)
+    rc = app(["ev-report", "--plan", str(plan), "--record", str(track)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[MISSION, 20]" in out
+    assert "WITHIN corridor" in out  # 2 m off-route, not the 350 m RTL excursion
+    assert "excluded samples in: FlightMode.RETURN_TO_LAUNCH" in out
+
+
+def test_ev_report_warns_when_the_record_has_no_modes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan, track = tmp_path / "m.plan", tmp_path / "run.jsonl"
+    _write_plan(plan)
+    _write_track(track, [(0.0, float(n)) for n in range(0, 1000, 50)])
+    assert app(["ev-report", "--plan", str(plan), "--record", str(track)]) == 0
+    out = capsys.readouterr().out
+    assert "WHOLE RUN (no mode field)" in out
+    assert "no flight-mode field" in out
+
+
+def test_ev_report_compares_multiple_arms(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The A/B/C deliverable: one table, and a warning if the arms agree."""
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    good, bad = tmp_path / "vtrn.jsonl", tmp_path / "novtrn.jsonl"
+    _write_track(good, [(1.0, float(n)) for n in range(0, 1000, 50)], err=1.0)
+    _write_track(bad, [(80.0, float(n)) for n in range(0, 1000, 50)], err=80.0)
+
+    rc = app(["ev-report", "--plan", str(plan), "--record", str(good), "--record", str(bad)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    lines = [ln for ln in out.splitlines() if ln.startswith(("vtrn", "novtrn"))]
+    assert len(lines) == 2
+    assert lines[0].endswith("WITHIN")
+    assert lines[1].endswith("LEFT")
+    assert "1 arm(s) held the corridor, 1 left it" in out
+
+
+def test_ev_report_flags_arms_that_all_agree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """All-pass or all-fail means the route decided it, not the navigation."""
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    for path in (a, b):
+        _write_track(path, [(1.0, float(n)) for n in range(0, 1000, 50)], err=1.0)
+    assert app(["ev-report", "--plan", str(plan), "--record", str(a), "--record", str(b)]) == 0
+    assert "2 arm(s) held the corridor, 0 left it" in capsys.readouterr().out
+
+
+def test_ev_report_reports_a_missing_record(tmp_path: Path) -> None:
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    assert app(["ev-report", "--plan", str(plan), "--record", str(tmp_path / "nope.jsonl")]) == 2

@@ -151,7 +151,7 @@ MAVSDK_SERVER_ARCH=aarch64 pip install --force-reinstall --no-cache-dir mavsdk
 ls -l ~/PX4-Autopilot/build/px4_sitl_default/bin/px4   # the build actually produced a binary
 gz sim --versions                                      # Gazebo present
 python -c "import mavsdk; print('mavsdk ok')"
-pytest -q                                              # 134 passed => package is sane
+pytest -q                                              # 141 passed => package is sane
 droneflight validate --plan /path/to/mission.plan      # offline path works
 groups | grep -q dialout && echo "dialout ok" || echo "no dialout (fine for SITL)"
 ```
@@ -623,6 +623,75 @@ something on a **non-degenerate plan** — the straight-line stub from
 `ev-bridge --dry-run` reads truth and computes poses **without** publishing or
 connecting to PX4 — the fastest way to check topic names and frames before
 involving the autopilot.
+
+## 3c. The GPS-denied acceptance experiment (three arms)
+
+**Status: all three arms are UNRUN.** A 77/77 flight on 2026-07-22 completed
+within the corridor, but two defects found afterwards make it void as evidence
+(see CLAUDE.md): the reference basemap was silently degenerate, and VTRN fixes
+were teleported into the published pose. Both are fixed; the arms must be flown
+on the fixed code.
+
+The three arms differ **only** in the basemap handed to the VTRN corrector.
+Everything else — plan, seeds, params, ramp — is held constant, so a difference
+in outcome can only come from the navigation.
+
+| Arm | Basemap | Offline prediction (seed 0) | Expected verdict |
+|---|---|---|---|
+| **A `vtrn`** | 40 % forest / 10 % stale | max dev **15.0 m**, 55/107 fixes | WITHIN (marginal!) |
+| **B `novtrn`** | none — dead reckoning | max dev **106.4 m**, no fixes | LEFT |
+| **C `conflict`** | 70 % forest / 30 % stale | max dev **21.9 m**, 25/107 fixes | LEFT |
+
+⚠️ **Arm A is predicted at 15.0 m against a 15 m tolerance** — it is a coin-flip at
+this seed, and over 40 seeds it fails 4 times. Do not treat a narrow pass or fail
+as signal; it is one sample. Arm B is the one that must separate cleanly.
+
+### Running an arm
+
+Per arm: restart SITL, re-add the endpoint, run the bridge, then fly.
+
+```bash
+# pane A — SITL (params persist across restarts; the endpoint does not)
+./sitl/run_sitl.sh ~/drone/plans/ev_test.plan ~/drone/PX4-Autopilot
+#   at pxh>:   mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541
+#   confirm:   param show EKF2_GPS_CTRL     -> 0
+
+# pane B — the arm (vtrn | novtrn | conflict). Wait for `est-pub` lines.
+./sitl/run_ev_arm.sh vtrn ~/drone/plans/ev_test.plan ~/logs
+
+# pane C — fly it
+droneflight fly --plan ~/drone/plans/ev_test.plan --url udpin://0.0.0.0:14540 \
+    2>&1 | tee ~/logs/fly-vtrn.log
+```
+
+`run_ev_arm.sh` pins `--seed 0 --fidelity-seed 1` for every arm. **Do not vary the
+seeds between arms** — a different seed is a different weather system, and the
+comparison stops meaning anything.
+
+Repeat for `novtrn` and `conflict`. Each writes `~/logs/ev-<arm>.jsonl`.
+
+### Reading the result
+
+```bash
+droneflight ev-report --plan ~/drone/plans/ev_test.plan \
+    --record ~/logs/ev-vtrn.jsonl \
+    --record ~/logs/ev-novtrn.jsonl \
+    --record ~/logs/ev-conflict.jsonl
+```
+
+One table, MISSION phase only (post-abort RTL excluded automatically). **The
+experiment only means something if the arms disagree** — the report says so
+explicitly, because all-pass or all-fail means the route decided the outcome, not
+the navigation.
+
+### What to watch during each run
+
+* `EKF2 global origin set to …` — else `fly` will never arm.
+* `est-pub` settling near 0 — EKF2 is fusing the injected vision.
+* `injected err` growing with distance, and **shrinking at fixes in arms A and C**.
+  In arm B it should grow monotonically to ~100 m.
+* `progress watchdog: 565s` at `fly` start — a fixed 60 s aborted a healthy flight
+  at 41/77 before this was derived from the plan.
 
 ## 4. Custom tether model (required build item)
 

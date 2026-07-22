@@ -577,6 +577,10 @@ class BridgeSample:
     published: VisionPose
     estimate_ned: tuple[float, float, float] | None = None
     fix: str | None = None
+    # PX4's flight mode, so analysis can separate the mission from an RTL or
+    # loiter. Without it a post-abort return-to-home — which beelines across the
+    # planned route — is scored as navigation error and dominates the result.
+    mode: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -599,6 +603,8 @@ class BridgeSample:
             doc["est"] = {"n": round(n, 3), "e": round(e, 3), "d": round(d, 3)}
         if self.fix is not None:
             doc["fix"] = self.fix
+        if self.mode is not None:
+            doc["mode"] = self.mode
         return doc
 
 
@@ -663,6 +669,7 @@ class EvBridge:
         *,
         recorder: TrackRecorder | None = None,
         estimate_probe: Callable[[], tuple[float, float, float] | None] | None = None,
+        mode_probe: Callable[[], str | None] | None = None,
         on_sample: Callable[[BridgeSample], None] | None = None,
     ) -> None:
         self.injector = injector
@@ -671,6 +678,7 @@ class EvBridge:
         # Diagnostic only: PX4's own estimate, logged so a run can be checked for
         # "is EKF2 actually fusing this?". It must never feed the injector.
         self.estimate_probe = estimate_probe
+        self.mode_probe = mode_probe
         self.on_sample = on_sample
 
     async def run(
@@ -730,6 +738,7 @@ class EvBridge:
                 published=pose,
                 estimate_ned=self.estimate_probe() if self.estimate_probe else None,
                 fix=fix.outcome.value if fix else None,
+                mode=self.mode_probe() if self.mode_probe else None,
             )
             if self.recorder is not None:
                 self.recorder.write(record)
@@ -880,6 +889,7 @@ def load_track(path: Path) -> list[BridgeSample]:
                     (_num(est, "n"), _num(est, "e"), _num(est, "d")) if est is not None else None
                 ),
                 fix=doc.get("fix"),
+                mode=doc.get("mode"),
             )
         )
     return samples

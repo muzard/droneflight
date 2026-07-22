@@ -15,6 +15,7 @@ import math
 import signal
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from droneflight import __version__
@@ -22,6 +23,7 @@ from droneflight.config import FlightConfig
 from droneflight.correction import CorrectionConfig
 from droneflight.ev_bridge import (
     BridgeSample,
+    CorridorReport,
     EvBridgeError,
     EvBridgeStats,
     GazeboTopic,
@@ -231,54 +233,149 @@ def _build_injector(args: argparse.Namespace, mission: FlightMission) -> ErrorIn
             forest_frac=args.forest_frac,
             stale_frac=args.stale_frac,
             seed=args.fidelity_seed,
+            # The bridge samples at Gazebo's home-relative ENU truth position.
+            home_relative=True,
         )
     )
     return ErrorInjector(
         DriftConfig(rate=args.drift_rate, seed=args.seed),
         reference,
         CorrectionConfig(attempt_interval_m=args.attempt_interval),
+        correction_ramp_m=getattr(args, "fix_ramp", 0.0),
     )
 
 
 def _print_corridor(
-    label: str, track: list[tuple[float, float]], mission: FlightMission, tolerance_m: float
+    label: str,
+    track: list[tuple[float, float]] | None,
+    mission: FlightMission | None,
+    tolerance_m: float,
+    report: CorridorReport | None = None,
 ) -> None:
-    report = analyse_track(track, plan_track_enu(mission), tolerance_m=tolerance_m)
+    if report is None:
+        assert track is not None and mission is not None
+        report = analyse_track(track, plan_track_enu(mission), tolerance_m=tolerance_m)
+    # Endpoint deviation only means something if the route was flown to the end;
+    # after an abort it just measures how far from the goal the run stopped.
+    endpoint = (
+        f"endpoint {report.endpoint_deviation_m:.1f} m"
+        if report.endpoint_deviation_m <= 10.0 * tolerance_m
+        else f"endpoint {report.endpoint_deviation_m:.0f} m (route not completed — ignore)"
+    )
     print(
         f"{label}: max {report.max_deviation_m:.1f} m, mean {report.mean_deviation_m:.1f} m, "
-        f"endpoint {report.endpoint_deviation_m:.1f} m "
-        f"(tolerance {report.tolerance_m:.0f} m) — "
+        f"{endpoint} (tolerance {report.tolerance_m:.0f} m) — "
         f"{'WITHIN corridor' if report.within_corridor else 'LEFT the corridor'}"
     )
 
 
+def _flying_mission(sample: BridgeSample) -> bool:
+    return bool(sample.mode and "mission" in sample.mode.lower())
+
+
+@dataclass(frozen=True)
+class _RecordSummary:
+    """One flown arm, reduced to the numbers the A/B/C compares."""
+
+    name: str
+    samples: int
+    duration_s: float
+    max_error_m: float
+    final_error_m: float
+    accepted: int
+    attempts: int
+    blunders: int
+    report: CorridorReport
+    scored: str  # which samples the corridor number covers
+    excluded: str
+
+
+def _summarise_record(path: Path, mission: FlightMission, corridor_m: float) -> _RecordSummary:
+    samples = load_track(path)
+    if not samples:
+        raise EvBridgeError(f"no samples in {path}")
+    fixes = [s.fix for s in samples if s.fix]
+    # Score the MISSION phase only. After an abort, RTL flies a straight line
+    # home across a tortuous planned route — scored naively that is a ~120 m
+    # "navigation error" which buries the ~10 m the experiment actually measured.
+    in_mission = [s for s in samples if _flying_mission(s)]
+    other = [s for s in samples if not _flying_mission(s)]
+    scored_samples = in_mission or samples
+    scored = f"MISSION, {len(in_mission)}" if in_mission else "WHOLE RUN (no mode field)"
+    excluded = ", ".join(sorted({s.mode or "?" for s in other})) if in_mission and other else ""
+    return _RecordSummary(
+        name=path.stem,
+        samples=len(samples),
+        duration_s=samples[-1].t_s - samples[0].t_s,
+        max_error_m=max(math.hypot(*s.error_en) for s in samples),
+        final_error_m=math.hypot(*samples[-1].error_en),
+        accepted=sum(1 for f in fixes if f.startswith("accepted")),
+        attempts=len(fixes),
+        blunders=sum(1 for f in fixes if f == "accepted_corrupt"),
+        report=analyse_track(
+            [(s.truth_enu[0], s.truth_enu[1]) for s in scored_samples],
+            plan_track_enu(mission),
+            tolerance_m=corridor_m,
+        ),
+        scored=scored,
+        excluded=excluded,
+    )
+
+
 def _ev_report(args: argparse.Namespace) -> int:
-    """Corridor analysis of a recorded EV-bridge run (offline, runs anywhere)."""
+    """Corridor analysis of recorded EV-bridge runs (offline, runs anywhere).
+
+    Pass ``--record`` more than once to compare the acceptance arms side by side.
+    """
     try:
         mission = load_qgc_plan(args.plan)
     except PlanLoadError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    samples = load_track(args.record)
-    if not samples:
-        print(f"error: no samples in {args.record}", file=sys.stderr)
-        return 2
-
-    truth = [(s.truth_enu[0], s.truth_enu[1]) for s in samples]
-    fixes = [s.fix for s in samples if s.fix]
-    accepted = sum(1 for f in fixes if f.startswith("accepted"))
-    print(f"samples: {len(samples)}  ({samples[-1].t_s - samples[0].t_s:.0f} s of sim time)")
-    print(
-        f"injected error: final {math.hypot(*samples[-1].error_en):.1f} m, "
-        f"max {max(math.hypot(*s.error_en) for s in samples):.1f} m"
-    )
-    if fixes:
-        print(f"optical fixes: {accepted}/{len(fixes)} accepted")
     try:
-        _print_corridor("TRUE track vs plan", truth, mission, args.corridor)
-    except EvBridgeError as exc:
+        rows = [_summarise_record(p, mission, args.corridor) for p in args.record]
+    except (EvBridgeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    if len(rows) == 1:
+        r = rows[0]
+        print(f"samples: {r.samples}  ({r.duration_s:.0f} s of sim time)")
+        print(f"injected error: final {r.final_error_m:.1f} m, max {r.max_error_m:.1f} m")
+        if r.attempts:
+            print(
+                f"optical fixes: {r.accepted}/{r.attempts} accepted "
+                f"({r.accepted / r.attempts * 100:.0f}%), {r.blunders} stale blunders accepted"
+            )
+        _print_corridor(f"TRUE track vs plan [{r.scored}]", None, None, args.corridor, r.report)
+        if r.excluded:
+            print(f"  excluded samples in: {r.excluded}")
+        elif "WHOLE RUN" in r.scored:
+            print(
+                "  warning: no flight-mode field in this record, so a post-abort "
+                "RTL/loiter\n  is being scored as navigation error. Re-record to "
+                "segment the phases."
+            )
+        return 0
+
+    print(f"corridor tolerance {args.corridor:.0f} m — scoring the MISSION phase of each arm\n")
+    head = f"{'arm':<22}{'max dev':>9}{'mean':>8}{'max err':>9}{'fixes':>11}{'blund':>7}  verdict"
+    print(head)
+    print("-" * len(head))
+    for r in rows:
+        fixes = f"{r.accepted}/{r.attempts}" if r.attempts else "—"
+        print(
+            f"{r.name[:21]:<22}{r.report.max_deviation_m:8.1f}m{r.report.mean_deviation_m:7.1f}m"
+            f"{r.max_error_m:8.1f}m{fixes:>11}{r.blunders:7d}  "
+            f"{'WITHIN' if r.report.within_corridor else 'LEFT'}"
+        )
+    held = [r for r in rows if r.report.within_corridor]
+    left = [r for r in rows if not r.report.within_corridor]
+    print(
+        f"\n{len(held)} arm(s) held the corridor, {len(left)} left it. The experiment only "
+        "means\nsomething if the arms DISAGREE — all-pass or all-fail says the route, not "
+        "the\nnavigation, decided the outcome."
+    )
     return 0
 
 
@@ -355,7 +452,9 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
         )
 
     estimate: list[tuple[float, float, float] | None] = [None]
+    mode: list[str | None] = [None]
     watcher: asyncio.Task[None] | None = None
+    mode_watcher: asyncio.Task[None] | None = None
     publisher: VisionPublisher
 
     if args.dry_run:
@@ -405,7 +504,12 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
             async for pv in system.telemetry.position_velocity_ned():
                 estimate[0] = (pv.position.north_m, pv.position.east_m, pv.position.down_m)
 
+        async def watch_mode() -> None:
+            async for flight_mode in system.telemetry.flight_mode():
+                mode[0] = str(flight_mode)
+
         watcher = asyncio.create_task(watch_estimate())
+        mode_watcher = asyncio.create_task(watch_mode())
 
     config = EvBridgeConfig(
         rate_hz=args.rate,
@@ -421,6 +525,7 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
                 config,
                 recorder=recorder,
                 estimate_probe=None if args.dry_run else (lambda: estimate[0]),
+                mode_probe=None if args.dry_run else (lambda: mode[0]),
                 on_sample=_live_monitor(),
             )
             stats = await bridge.run(
@@ -430,8 +535,9 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
         print(f"error: {exc}", file=sys.stderr)
         return 4
     finally:
-        if watcher is not None:
-            watcher.cancel()
+        for task in (watcher, mode_watcher):
+            if task is not None:
+                task.cancel()
 
     for line in _format_bridge_stats(stats):
         print(line)
@@ -586,6 +692,13 @@ def app(argv: list[str] | None = None) -> int:
         help="Apply optical VTRN fixes. --no-vtrn is the dead-reckoning control arm.",
     )
     eb.add_argument("--attempt-interval", type=float, default=50.0, help="Meters between fixes.")
+    eb.add_argument(
+        "--fix-ramp",
+        type=float,
+        default=10.0,
+        help="Metres over which an accepted fix is bled into the published pose "
+        "(0 = instant, which EKF2 rejects as an outlier).",
+    )
     eb.add_argument("--forest-frac", type=float, default=0.4)
     eb.add_argument("--stale-frac", type=float, default=0.1)
     eb.add_argument("--fidelity-seed", type=int, default=1)
@@ -627,7 +740,13 @@ def app(argv: list[str] | None = None) -> int:
 
     er = sub.add_parser("ev-report", help="Corridor analysis of a recorded ev-bridge run.")
     er.add_argument("--plan", type=Path, required=True)
-    er.add_argument("--record", type=Path, required=True, help="JSONL from `ev-bridge --record`.")
+    er.add_argument(
+        "--record",
+        type=Path,
+        required=True,
+        action="append",
+        help="JSONL from `ev-bridge --record`. Repeat to compare acceptance arms.",
+    )
     er.add_argument("--corridor", type=float, default=15.0)
     er.set_defaults(func=_ev_report)
 

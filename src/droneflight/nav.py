@@ -114,9 +114,23 @@ class ErrorInjector:
         drift: DriftConfig,
         reference: ReferenceMap | None = None,
         config: CorrectionConfig | None = None,
+        *,
+        correction_ramp_m: float = 0.0,
     ) -> None:
         self.config = config or CorrectionConfig()
         self.reference = reference
+        # Distance over which an accepted fix is bled into the reported error
+        # instead of applied in one step. 0 = instant (the offline default).
+        #
+        # Instant application is wrong at the autopilot boundary: it teleports the
+        # *published* pose by up to ~10 m, and EKF2's innovation gate rejects the
+        # jump — measured in SITL as 13 momentary losses of EV fusion, each
+        # ~1.1 s after an accepted fix, with test ratios to 311. A real pipeline
+        # absorbs a map match over the filter's own dynamics; the pose handed to
+        # the autopilot stays continuous. Ramping models that, and keeps EKF2
+        # fusing the correction instead of discarding it.
+        self.correction_ramp_m = correction_ramp_m
+        self._pending = (0.0, 0.0)  # correction not yet bled into the error
         self._walker = DriftWalker(drift)
         self._corrector = OpticalCorrector(self.config, seed=drift.seed)
         self._since_attempt = 0.0
@@ -147,6 +161,7 @@ class ErrorInjector:
         if distance_m <= 0.0:
             return None
         self._walker.advance(distance_m)
+        self._bleed_pending(distance_m)
         self.distance_m += distance_m
         if self.reference is None:
             return None
@@ -156,11 +171,31 @@ class ErrorInjector:
         if self._since_attempt < self.config.attempt_interval_m:
             return None
 
-        fix, error = self._corrector.attempt(self._walker.error, self.reference.sample(x, y))
-        self._walker.set_error(error)
+        # The corrector returns the error *after* fusing. With a ramp we hold the
+        # delta back and bleed it in over the next `correction_ramp_m` metres, so
+        # the pose the autopilot sees never steps.
+        before = self._walker.error
+        fix, error = self._corrector.attempt(before, self.reference.sample(x, y))
+        if self.correction_ramp_m > 0.0:
+            px, py = self._pending
+            self._pending = (px + error[0] - before[0], py + error[1] - before[1])
+        else:
+            self._walker.set_error(error)
         self.counts[fix.outcome] += 1
         self._since_attempt = 0.0
         return fix
+
+    def _bleed_pending(self, distance_m: float) -> None:
+        """Apply a slice of any held-back correction, proportional to distance."""
+        if self.correction_ramp_m <= 0.0:
+            return
+        px, py = self._pending
+        if px == 0.0 and py == 0.0:
+            return
+        frac = min(1.0, distance_m / self.correction_ramp_m)
+        ex, ey = self._walker.error
+        self._walker.set_error((ex + px * frac, ey + py * frac))
+        self._pending = (px * (1.0 - frac), py * (1.0 - frac))
 
 
 @dataclass(frozen=True)
@@ -293,10 +328,28 @@ def route_reference(
     forest_frac: float = 0.4,
     stale_frac: float = 0.1,
     seed: int = 0,
+    home_relative: bool = False,
 ) -> PatchyReference:
-    """Build a route-aligned :class:`PatchyReference` for ``mission``."""
-    lat0 = mission.home_lat
-    pts = [_to_local(w.lat, w.lon, lat0) for w in mission.waypoints]
+    """Build a route-aligned :class:`PatchyReference` for ``mission``.
+
+    ⚠️ **Frame.** The returned map is a *spatial field*, so it only works if
+    callers sample it in the frame its polyline was built in.
+    :func:`simulate_corrected_navigation` walks the route in the absolute-ish
+    local metres of :func:`_to_local`, which is the default here. The live bridge
+    works in **home-relative ENU** (Gazebo's world frame) and must pass
+    ``home_relative=True``.
+
+    Getting this wrong is silent and ruinous: every sample lands millions of
+    metres from the polyline, projects onto the same endpoint, and the whole
+    varying field collapses to a single bucket — usually reporting a perfect map
+    everywhere. :meth:`PatchyReference.sample` now raises instead.
+    """
+    if home_relative:
+        pts = [
+            local_enu(w.lat, w.lon, mission.home_lat, mission.home_lon) for w in mission.waypoints
+        ]
+    else:
+        pts = [_to_local(w.lat, w.lon, mission.home_lat) for w in mission.waypoints]
     return PatchyReference.along_route(
         pts, forest_frac=forest_frac, stale_frac=stale_frac, seed=seed
     )

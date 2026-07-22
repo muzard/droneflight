@@ -125,6 +125,8 @@ class PatchyReference:
     open_staleness: float
     stale_staleness: float
     accuracy_m: float
+    # Queries further than this from the route are rejected as a frame error.
+    max_offroute_m: float = 50_000.0
 
     @classmethod
     def along_route(
@@ -180,8 +182,8 @@ class PatchyReference:
             accuracy_m=accuracy_m,
         )
 
-    def _arclen_of_nearest(self, x: float, y: float) -> float:
-        """Arc length of the closest point on the polyline to ``(x, y)``."""
+    def _arclen_of_nearest(self, x: float, y: float) -> tuple[float, float]:
+        """Arc length of the closest point on the polyline to ``(x, y)``, and its distance."""
         best_d2 = math.inf
         best_s = 0.0
         for i, (a, b) in enumerate(pairwise(self._pts)):
@@ -196,16 +198,28 @@ class PatchyReference:
             if d2 < best_d2:
                 best_d2 = d2
                 best_s = self._cum[i] + t * math.sqrt(seg2)
-        return best_s
+        return best_s, math.sqrt(best_d2)
 
     def sample(self, x: float, y: float) -> MapSample:
         total = self._cum[-1]
         n = len(self._matchability)
         if total <= 0.0:
-            idx = 0
-        else:
-            frac = self._arclen_of_nearest(x, y) / total
-            idx = min(n - 1, max(0, int(frac * n)))
+            return MapSample(self._matchability[0], self._staleness[0], self._accuracy[0])
+        arclen, offroute = self._arclen_of_nearest(x, y)
+        if offroute > self.max_offroute_m:
+            # A query this far from the route is a *frame* error, not a flight
+            # path. Left silent it is invisible and catastrophic: every sample
+            # projects onto the same endpoint, so the spatially varying map
+            # collapses to one bucket and the run reports whatever quality that
+            # bucket happens to have — typically "perfect map everywhere", the
+            # optimistic assumption this class exists to remove. Cost one real
+            # SITL result before it was caught.
+            raise ValueError(
+                f"reference sampled {offroute / 1000:.0f} km off-route at ({x:.0f}, {y:.0f}). "
+                "The query and the reference polyline are in different frames — see "
+                "nav.route_reference(home_relative=...)."
+            )
+        idx = min(n - 1, max(0, int(arclen / total * n)))
         return MapSample(self._matchability[idx], self._staleness[idx], self._accuracy[idx])
 
 

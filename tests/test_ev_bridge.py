@@ -275,7 +275,9 @@ async def test_vtrn_bounds_the_error_that_no_vtrn_lets_run() -> None:
     config = CorrectionConfig(attempt_interval_m=50.0)
 
     off, _ = await _run(ErrorInjector(drift, None, config), samples, rate_hz=0.0)
-    reference = route_reference(mission, forest_frac=0.2, stale_frac=0.0, seed=1)
+    reference = route_reference(
+        mission, forest_frac=0.2, stale_frac=0.0, seed=1, home_relative=True
+    )
     on, _ = await _run(ErrorInjector(drift, reference, config), samples, rate_hz=0.0)
 
     assert on.attempts > 0
@@ -365,7 +367,9 @@ def test_analyse_track_needs_both_sides() -> None:
 
 async def test_record_and_load_round_trip(tmp_path: Path) -> None:
     path = tmp_path / "run.jsonl"
-    injector = ErrorInjector(DriftConfig(rate=0.02, seed=4), route_reference(_mission(), seed=1))
+    injector = ErrorInjector(
+        DriftConfig(rate=0.02, seed=4), route_reference(_mission(), seed=1, home_relative=True)
+    )
     with TrackRecorder(path) as recorder:
         bridge = EvBridge(
             injector,
@@ -545,7 +549,7 @@ async def _closed_loop_corridor(reference: object) -> float:
 
 async def test_acceptance_ab_offline_proxy() -> None:
     """Fixes on: the true track holds the corridor. Fixes off: it leaves."""
-    on = await _closed_loop_corridor(route_reference(_zigzag_mission(), seed=1))
+    on = await _closed_loop_corridor(route_reference(_zigzag_mission(), seed=1, home_relative=True))
     off = await _closed_loop_corridor(None)
     assert on <= 15.0, f"VTRN should hold the corridor, got {on:.1f} m"
     assert off > 50.0, f"dead reckoning should wander well out, got {off:.1f} m"
@@ -606,3 +610,44 @@ def test_wait_for_truth_topic_returns_immediately_when_present() -> None:
     topic = wait_for_truth_topic(lister=lambda: ["/model/x500_0/odometry"], sleep=slept.append)
     assert topic.kind == "odometry"
     assert slept == []
+
+
+async def test_ramped_fixes_keep_the_published_pose_continuous() -> None:
+    """An instant fix teleports the pose; EKF2's outlier gate then rejects it.
+
+    Measured in SITL: jumps to 10.1 m in one sample, 13 momentary losses of EV
+    fusion. Ramping must remove the steps without changing where the error ends up.
+    """
+    mission = _mission()
+    truth = _straight_truth(n=600, step_m=2.0)  # ~1.2 km at 2 m/sample
+    drift = DriftConfig(rate=0.02, seed=5)
+    config = CorrectionConfig(attempt_interval_m=50.0)
+    reference = route_reference(
+        mission, forest_frac=0.2, stale_frac=0.0, seed=1, home_relative=True
+    )
+
+    def max_step(poses: list) -> float:
+        return max(
+            math.hypot(b.north_m - a.north_m, b.east_m - a.east_m) - 2.0 for a, b in pairwise(poses)
+        )
+
+    instant_stats, instant = await _run(ErrorInjector(drift, reference, config), truth, rate_hz=0.0)
+    ramped_inj = ErrorInjector(drift, reference, config, correction_ramp_m=25.0)
+    ramped_stats, ramped = await _run(ramped_inj, truth, rate_hz=0.0)
+
+    # Truth advances 2 m per sample here, so any excess is the fix being applied.
+    assert max_step(instant.poses) > 5.0, "instant application teleports the pose"
+    assert max_step(ramped.poses) < 1.0, "ramped pose must stay smooth between samples"
+    # Same corrector decisions — only the delivery is spread out.
+    assert ramped_stats.attempts == instant_stats.attempts
+    assert ramped_stats.accepted == instant_stats.accepted
+    assert ramped_stats.accepted > 0
+    # And it still bounds the error: ramping delivery must not lose the correction.
+    assert ramped_stats.final_error_m == pytest.approx(instant_stats.final_error_m, abs=1.0)
+
+
+def test_correction_ramp_defaults_to_instant_so_offline_is_unchanged() -> None:
+    injector = ErrorInjector(
+        DriftConfig(seed=1), route_reference(_mission(), seed=1, home_relative=True)
+    )
+    assert injector.correction_ramp_m == 0.0
