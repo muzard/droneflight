@@ -3,14 +3,29 @@
 # or `param load gps_denied_ekf2.params` in the pxh shell, then reboot.
 # Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
 # These are a STARTING POINT — tune EV delay/noise to your VIO/VTRN pipeline.
+#
+# Pairs with `droneflight ev-bridge`, which supplies the vision pose. In SITL,
+# load sitl_bringup.params as well.
 
-# Fuse external vision for horizontal position, velocity, and yaw (bitmask 0..15).
-1	1	EKF2_EV_CTRL	15	6
-# Disable all GPS fusion (0 = no GPS aiding).
+# External-vision fusion bitmask: 1 = horizontal position, 2 = vertical position,
+# 4 = velocity, 8 = yaw.  11 = position (H+V) + yaw, which is exactly what
+# VISION_POSITION_ESTIMATE carries. That message has no velocity field, so bit 2
+# (i.e. 15) would ask EKF2 to fuse something the bridge never sends; set it only
+# if you switch to ODOMETRY with a populated twist.
+1	1	EKF2_EV_CTRL	11	6
+# Disable all GPS fusion (0 = no GPS aiding) — this is what makes the run
+# GPS-denied. It also means EKF2 gets no global origin from GNSS, so `ev-bridge`
+# sends SET_GPS_GLOBAL_ORIGIN (the plan's home); without that a lat/lon mission
+# cannot be flown at all. See RUNBOOK §3b.
 1	1	EKF2_GPS_CTRL	0	6
-# Height reference: 1 = external vision (fall back to 2 = baro if EV height is noisy).
+# Height reference: 0 = barometer, 1 = GPS, 2 = range sensor, 3 = vision.
+# 3 keeps height on the same source as position; fall back to 0 (baro) if the EV
+# height is noisy. NOTE: the bridge injects horizontal error only, so EV height
+# is ground truth here — height performance is NOT being tested.
 1	1	EKF2_HGT_REF	3	6
 # External-vision measurement delay (ms) — set to your pipeline's latency.
+# With `ev-bridge --timestamp none` PX4 stamps on receipt, so this parameter is
+# the only thing modelling pipeline lag; a real VIO/VTRN stack is tens of ms behind.
 1	1	EKF2_EV_DELAY	50	9
 # Allow arming without a GPS lock (GPS-denied ops).
 1	1	COM_ARM_WO_GPS	1	6

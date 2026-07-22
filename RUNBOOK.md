@@ -400,16 +400,134 @@ progress — and now **aborts to RTL if progress stalls** for `progress_timeout_
 mission-item encoding, altitude framing (plan is AGL/relative-to-home), and
 arming gates here first.
 
-## 3b. Then GPS-denied (external vision)
+## 3b. Then GPS-denied (external vision) — the EV bridge
 
-Once the GPS-enabled flight is clean, switch to the mission's real regime: load
-`configs/px4/gps_denied_ekf2.params` (QGroundControl → Parameters → Load, or
-`param load` in the pxh shell, then reboot) so EKF2 fuses **external vision**
-instead of GPS. SITL then needs a vision pose fed in — that injection bridge
-(streaming `nav.py`/`correction.py`'s truth+error as `VISION_POSITION_ESTIMATE`)
-is the **next build item**; on the aircraft this pose comes from the companion
-computer (VIO/VTRN). Gate readiness on *local* position health, not global (the
-adapter already does).
+Once the GPS-enabled flight is clean, switch to the mission's real regime. EKF2
+fuses **external vision** instead of GPS, and `droneflight ev-bridge` supplies
+that vision: Gazebo's ground truth **corrupted by the same drift + VTRN model**
+`droneflight nav` measures offline. PX4 then flies the corrupted estimate, so the
+*true* track wanders by however much the navigation error says it should. On the
+aircraft this pose comes from the companion computer (VIO/VTRN); here it is
+injected, which is the whole point of the MVP — real perception needs the x86+RTX
+box (Track B).
+
+Use the **flat `default.sdf`**. Terrain is parked (§2b) and irrelevant here: the
+error is injected, not sensed from the ground.
+
+### 3b.1 Two MAVLink endpoints
+
+`droneflight fly` binds `udp://:14540`, so the bridge needs its own endpoint —
+one process per UDP port. In the `pxh>` shell, after PX4 boots:
+
+```
+pxh> mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541
+```
+
+That is a second *onboard* instance: PX4 listens on 14581 and streams to 14541,
+which is where `ev-bridge` connects (its `--url` default). Check with
+`mavlink status` that two instances are up.
+
+### 3b.2 Parameters
+
+```bash
+pxh> param load /path/to/droneflight/configs/px4/gps_denied_ekf2.params
+pxh> param load /path/to/droneflight/configs/px4/sitl_bringup.params
+pxh> reboot
+```
+
+`gps_denied_ekf2.params` sets `EKF2_GPS_CTRL=0` (no GPS aiding), `EKF2_EV_CTRL=11`
+(EV horizontal + vertical position + yaw — the fields
+`VISION_POSITION_ESTIMATE` actually carries), `EKF2_HGT_REF=3` and
+`COM_ARM_WO_GPS=1`.
+
+### 3b.3 Order matters: bridge first, then fly
+
+EKF2 has no position at all until vision arrives, so `droneflight fly` would sit
+at its readiness gate forever. Start the bridge first and wait for it to report a
+lock.
+
+```bash
+# shell A — PX4 SITL at the plan's home, flat world
+./sitl/run_sitl.sh ~/plans/mission.plan ~/PX4-Autopilot
+
+# shell B — the vision stream (VTRN fixes ON)
+droneflight ev-bridge --plan ~/plans/mission.plan --url udp://:14541 \
+    --record ~/logs/ev-vtrn.jsonl
+
+# shell C — once shell B shows est-pub settling near 0, fly the mission
+droneflight fly --plan ~/plans/mission.plan --url udp://:14540
+```
+
+Shell B prints a line every 5 s of sim time:
+
+```
+t=   35.0  truth E,N=(    12.4,   180.6)  injected err=   3.6 m  est-pub= 0.28 m
+```
+
+* **`injected err`** — how far the pose we publish is from truth. This is the
+  GPS-denied error, and it should grow with distance and shrink at fixes.
+* **`est-pub`** — PX4's own estimate minus the pose we just sent. **Near zero means
+  EKF2 is fusing the external vision.** Large or growing means it is rejecting the
+  stream; see the troubleshooting table. This is a *readback only* — it never
+  feeds the error model.
+
+### 3b.4 ⚠️ The global origin (expect this to be the first failure)
+
+A `.plan` is lat/lon, but with `EKF2_GPS_CTRL=0` EKF2 never gets a global origin —
+it normally takes one from the GNSS fix it is no longer allowed to use. Without an
+origin the local frame is purely relative, `is_home_position_ok` never goes true,
+and the mission is rejected before it starts.
+
+`ev-bridge` therefore sends `SET_GPS_GLOBAL_ORIGIN` (the plan's home) via MAVSDK's
+`mavlink_direct` at startup, and prints `EKF2 global origin set to …`. This is not
+a sim hack: on the aircraft it is **VTRN, not GPS, that ties the local frame to the
+world**, and this is that tie.
+
+If your `mavsdk_server` is too old to have `mavlink_direct`, the bridge fails with
+a clear error. Workarounds, in order of preference: upgrade `mavsdk`
+(`pip install -U mavsdk`); or run `--no-set-origin` and send the message from
+QGroundControl/MAVProxy; or accept a local-only demonstration and drive the route
+in Offboard mode instead of AUTO (not built).
+
+### 3b.5 The acceptance A/B
+
+The claim to prove is *`nav.py`'s offline finding reproduces in real flight*: safe
+forest flight needs bounded navigation, not just avoidance. Fly the same plan
+twice, changing only the fixes:
+
+```bash
+# arm A — VTRN fixes ON (should hold the corridor)
+droneflight ev-bridge --plan ~/plans/mission.plan --record ~/logs/ev-vtrn.jsonl
+# arm B — dead reckoning only (should wander out)
+droneflight ev-bridge --plan ~/plans/mission.plan --no-vtrn \
+    --record ~/logs/ev-novtrn.jsonl
+```
+
+Each run prints the corridor result on the **true** (Gazebo) track at the end, and
+`--record` keeps the track for later:
+
+```bash
+droneflight ev-report --plan ~/plans/mission.plan --record ~/logs/ev-novtrn.jsonl
+```
+
+Pass = arm A `WITHIN corridor`, arm B `LEFT the corridor`. ⚠️ It only means
+something on a **non-degenerate plan** — the straight-line stub from
+`mission.example.yaml` has no turns and nothing to hold (see CLAUDE.md).
+
+### 3b.6 Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `no ground-truth topic for model 'x500_0'` | model/world named differently | `gz topic -l`; pass `--model` / `--world` (the error prints what it saw) |
+| `est-pub` large or growing; `ekf2 vision data stopped` | message timestamp in the wrong clock domain | try `--timestamp epoch`, then `--timestamp sim` (default `none` = PX4 stamps on receipt) |
+| `fly` never gets past its readiness gate | no vision yet, or no global origin | start `ev-bridge` **first**; check it printed `EKF2 global origin set to …` |
+| `injected err` stays 0.0 | the vehicle has not moved, or truth is not updating | error accrues with distance flown; check `gz topic -e -t <topic>` by hand |
+| vehicle drifts off immediately in a straight line | frame error (ENU/NED swap) | `ev-bridge --dry-run` and compare published N/E against `gz topic` truth |
+| bridge and `fly` fight over the port | both on 14540 | second `mavlink start` instance (§3b.1); bridge on 14541 |
+
+`ev-bridge --dry-run` reads truth and computes poses **without** publishing or
+connecting to PX4 — the fastest way to check topic names and frames before
+involving the autopilot.
 
 ## 4. Custom tether model (required build item)
 

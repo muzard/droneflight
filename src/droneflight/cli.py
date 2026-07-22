@@ -8,15 +8,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import math
+import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from droneflight import __version__
 from droneflight.config import FlightConfig
+from droneflight.correction import CorrectionConfig
+from droneflight.ev_bridge import (
+    BridgeSample,
+    EvBridgeError,
+    EvBridgeStats,
+    GazeboTopic,
+    analyse_track,
+    load_track,
+    plan_track_enu,
+)
 from droneflight.executor import fly_mission, prepare_items
+from droneflight.model import FlightMission
 from droneflight.nav import (
     DriftConfig,
+    ErrorInjector,
     VtrnConfig,
     route_reference,
     simulate_corrected_navigation,
@@ -146,6 +162,239 @@ def _sitl_env(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_injector(args: argparse.Namespace, mission: FlightMission) -> ErrorInjector:
+    """Assemble the GPS-denied error model the bridge will inject.
+
+    ``--no-vtrn`` drops the reference map entirely: pure dead reckoning, no
+    absolute fixes. That is the control arm of the acceptance A/B.
+    """
+    reference = (
+        None
+        if not args.vtrn
+        else route_reference(
+            mission,
+            forest_frac=args.forest_frac,
+            stale_frac=args.stale_frac,
+            seed=args.fidelity_seed,
+        )
+    )
+    return ErrorInjector(
+        DriftConfig(rate=args.drift_rate, seed=args.seed),
+        reference,
+        CorrectionConfig(attempt_interval_m=args.attempt_interval),
+    )
+
+
+def _print_corridor(
+    label: str, track: list[tuple[float, float]], mission: FlightMission, tolerance_m: float
+) -> None:
+    report = analyse_track(track, plan_track_enu(mission), tolerance_m=tolerance_m)
+    print(
+        f"{label}: max {report.max_deviation_m:.1f} m, mean {report.mean_deviation_m:.1f} m, "
+        f"endpoint {report.endpoint_deviation_m:.1f} m "
+        f"(tolerance {report.tolerance_m:.0f} m) — "
+        f"{'WITHIN corridor' if report.within_corridor else 'LEFT the corridor'}"
+    )
+
+
+def _ev_report(args: argparse.Namespace) -> int:
+    """Corridor analysis of a recorded EV-bridge run (offline, runs anywhere)."""
+    try:
+        mission = load_qgc_plan(args.plan)
+    except PlanLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    samples = load_track(args.record)
+    if not samples:
+        print(f"error: no samples in {args.record}", file=sys.stderr)
+        return 2
+
+    truth = [(s.truth_enu[0], s.truth_enu[1]) for s in samples]
+    fixes = [s.fix for s in samples if s.fix]
+    accepted = sum(1 for f in fixes if f.startswith("accepted"))
+    print(f"samples: {len(samples)}  ({samples[-1].t_s - samples[0].t_s:.0f} s of sim time)")
+    print(
+        f"injected error: final {math.hypot(*samples[-1].error_en):.1f} m, "
+        f"max {max(math.hypot(*s.error_en) for s in samples):.1f} m"
+    )
+    if fixes:
+        print(f"optical fixes: {accepted}/{len(fixes)} accepted")
+    try:
+        _print_corridor("TRUE track vs plan", truth, mission, args.corridor)
+    except EvBridgeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _format_bridge_stats(stats: EvBridgeStats) -> list[str]:
+    """Render the bridge's run summary (pure, so it is testable without a sim)."""
+    lines = [
+        f"samples {stats.samples}, published {stats.published}, flown {stats.distance_m:.0f} m",
+        f"injected error: max {stats.max_error_m:.1f} m, final {stats.final_error_m:.1f} m",
+    ]
+    if stats.attempts:
+        lines.append(
+            f"optical fixes: {stats.accepted}/{stats.attempts} accepted "
+            f"({stats.fix_availability * 100:.0f}% avail); declined: "
+            f"{stats.no_features} no-texture, {stats.low_confidence} low-conf, "
+            f"{stats.gated_out} gated-out; {stats.corrupt_accepted} blunders slipped through"
+        )
+    return lines
+
+
+def _live_monitor(interval_s: float = 5.0) -> Callable[[BridgeSample], None]:
+    """Periodic one-liner: is EKF2 actually fusing what we publish?
+
+    ``est-pub`` is PX4's own estimate minus the pose we just sent it. Near zero
+    means EKF2 has locked onto the external vision; large or growing means the
+    stream is being rejected (usually the message timestamp — see RUNBOOK §3b).
+    It is a **readback**, never an input to the error model.
+    """
+    last = [-math.inf]
+
+    def monitor(sample: BridgeSample) -> None:
+        if sample.t_s - last[0] < interval_s:
+            return
+        last[0] = sample.t_s
+        line = (
+            f"t={sample.t_s:7.1f}  truth E,N=({sample.truth_enu[0]:8.1f},"
+            f"{sample.truth_enu[1]:8.1f})  injected err={math.hypot(*sample.error_en):6.1f} m"
+        )
+        if sample.estimate_ned is not None:
+            n, e, _d = sample.estimate_ned
+            delta = math.hypot(n - sample.published.north_m, e - sample.published.east_m)
+            line += f"  est-pub={delta:5.2f} m"
+        else:
+            line += "  est-pub=  n/a"
+        print(line, flush=True)
+
+    return monitor
+
+
+async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
+    args: argparse.Namespace, mission: FlightMission, injector: ErrorInjector, topic: GazeboTopic
+) -> int:
+    from droneflight.ev_bridge import (
+        EvBridge,
+        EvBridgeConfig,
+        GazeboTruthSource,
+        RecordingPublisher,
+        TrackRecorder,
+        VisionPublisher,
+    )
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop.set)
+
+    estimate: list[tuple[float, float, float] | None] = [None]
+    watcher: asyncio.Task[None] | None = None
+    publisher: VisionPublisher
+
+    if args.dry_run:
+        publisher = RecordingPublisher()
+        print("dry run: reading truth and computing poses, NOT publishing to PX4")
+    else:
+        from mavsdk import System
+
+        from droneflight.ev_bridge import MavsdkMocapPublisher
+
+        system = System()
+        await system.connect(system_address=args.url)
+        async for state in system.core.connection_state():
+            if state.is_connected:
+                break
+        print(f"connected to PX4 at {args.url}")
+        publisher = MavsdkMocapPublisher(system)
+
+        if args.set_origin:
+            from droneflight.ev_bridge import set_global_origin
+
+            try:
+                await set_global_origin(
+                    system, mission.home_lat, mission.home_lon, mission.home_alt_m
+                )
+            except EvBridgeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 4
+            print(
+                f"EKF2 global origin set to {mission.home_lat:.6f}, {mission.home_lon:.6f} "
+                f"@ {mission.home_alt_m:.1f} m — the plan's home"
+            )
+
+        async def watch_estimate() -> None:
+            async for pv in system.telemetry.position_velocity_ned():
+                estimate[0] = (pv.position.north_m, pv.position.east_m, pv.position.down_m)
+
+        watcher = asyncio.create_task(watch_estimate())
+
+    config = EvBridgeConfig(
+        rate_hz=args.rate,
+        corridor_tolerance_m=args.corridor,
+        timestamp_mode=args.timestamp,
+        max_duration_s=args.duration,
+    )
+    try:
+        with contextlib.ExitStack() as stack:
+            recorder = stack.enter_context(TrackRecorder(args.record)) if args.record else None
+            bridge = EvBridge(
+                injector,
+                config,
+                recorder=recorder,
+                estimate_probe=None if args.dry_run else (lambda: estimate[0]),
+                on_sample=_live_monitor(),
+            )
+            stats = await bridge.run(
+                GazeboTruthSource(topic, gz_binary=args.gz), publisher, stop=stop
+            )
+    except EvBridgeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+    finally:
+        if watcher is not None:
+            watcher.cancel()
+
+    for line in _format_bridge_stats(stats):
+        print(line)
+    if stats.track_enu:
+        _print_corridor("TRUE track vs plan", stats.track_enu, mission, args.corridor)
+    if args.record:
+        print(f"track written to {args.record}")
+    return 0
+
+
+def _ev_bridge(args: argparse.Namespace) -> int:  # pragma: no cover - requires sim + autopilot
+    """Stream Gazebo truth + injected error into PX4 as external vision."""
+    from droneflight.ev_bridge import resolve_truth_topic
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        mission = load_qgc_plan(args.plan)
+    except PlanLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        topic = resolve_truth_topic(args.world, args.model, gz_binary=args.gz)
+    except EvBridgeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 4
+
+    print(f"ground truth: {topic.topic} ({topic.kind}) — Gazebo, not PX4's estimate")
+    print(
+        f"error model: {args.drift_rate * 100:.1f}% VIO drift, "
+        + (
+            f"optical fixes every {args.attempt_interval:.0f} m over a "
+            f"{args.forest_frac * 100:.0f}% forest / {args.stale_frac * 100:.0f}% stale basemap"
+            if args.vtrn
+            else "NO absolute fixes (dead reckoning only — the control arm)"
+        )
+    )
+    return asyncio.run(_run_ev_bridge(args, mission, _build_injector(args, mission), topic))
+
+
 def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live autopilot
     from droneflight.mavsdk_connector import MavsdkConnector
 
@@ -209,6 +458,56 @@ def app(argv: list[str] | None = None) -> int:
     )
     se.add_argument("--plan", type=Path, required=True)
     se.set_defaults(func=_sitl_env)
+
+    eb = sub.add_parser(
+        "ev-bridge",
+        help="Stream Gazebo ground truth + injected GPS-denied error into PX4 as external vision.",
+    )
+    eb.add_argument("--plan", type=Path, required=True)
+    eb.add_argument(
+        "--url",
+        default="udp://:14541",
+        help="MAVLink URL (use a SECOND endpoint: `droneflight fly` holds 14540).",
+    )
+    eb.add_argument("--world", default="default", help="Gazebo world name.")
+    eb.add_argument("--model", default="x500_0", help="Gazebo model name to take truth from.")
+    eb.add_argument("--gz", default="gz", help="Gazebo CLI binary.")
+    eb.add_argument("--rate", type=float, default=30.0, help="Vision publish rate (Hz, sim time).")
+    eb.add_argument("--drift-rate", type=float, default=0.02, help="VIO drift, fraction of dist.")
+    eb.add_argument("--seed", type=int, default=0, help="Drift seed.")
+    eb.add_argument(
+        "--vtrn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply optical VTRN fixes. --no-vtrn is the dead-reckoning control arm.",
+    )
+    eb.add_argument("--attempt-interval", type=float, default=50.0, help="Meters between fixes.")
+    eb.add_argument("--forest-frac", type=float, default=0.4)
+    eb.add_argument("--stale-frac", type=float, default=0.1)
+    eb.add_argument("--fidelity-seed", type=int, default=1)
+    eb.add_argument("--corridor", type=float, default=15.0, help="Corridor tolerance (m).")
+    eb.add_argument("--duration", type=float, default=0.0, help="Stop after N s of sim time.")
+    eb.add_argument("--record", type=Path, help="Write the run as JSONL for `ev-report`.")
+    eb.add_argument(
+        "--timestamp",
+        choices=("none", "epoch", "sim"),
+        default="none",
+        help="Vision message timestamp; switch if EKF2 rejects the stream (RUNBOOK §3b).",
+    )
+    eb.add_argument("--dry-run", action="store_true", help="Read truth but do not publish to PX4.")
+    eb.add_argument(
+        "--set-origin",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Anchor EKF2's local frame to the plan's home so a lat/lon mission can fly.",
+    )
+    eb.set_defaults(func=_ev_bridge)
+
+    er = sub.add_parser("ev-report", help="Corridor analysis of a recorded ev-bridge run.")
+    er.add_argument("--plan", type=Path, required=True)
+    er.add_argument("--record", type=Path, required=True, help="JSONL from `ev-bridge --record`.")
+    er.add_argument("--corridor", type=float, default=15.0)
+    er.set_defaults(func=_ev_report)
 
     f = sub.add_parser("fly", help="Execute a .plan on PX4 (SITL or hardware).")
     f.add_argument("--plan", type=Path, required=True)

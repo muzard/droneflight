@@ -23,6 +23,7 @@ verifiable without hardware.
 | **Closed-loop forest sim** (`reactive.py`) | ✅ flies the route through trees; avoidance ON vs OFF |
 | **GPS-denied nav emulation** (`nav.py`) | ✅ VIO drift + VTRN correction (idealised + fidelity-limited) |
 | **Optical terrain-relative correction** (`correction.py`) | ✅ data-driven fixes over a spatially varying basemap; confidence + innovation gating |
+| **External-vision injection** (`ev_bridge.py`) | ✅ built + tested offline; ⚠️ **not yet flown** — Gazebo truth + injected error → PX4 EKF2 |
 | MAVSDK adapter (`mavsdk_connector.py`) | ⚠️ live path — runs against SITL, not unit-tested |
 | PX4 SITL + Gazebo tether model | ⏳ RUNBOOK + config; needs the Ubuntu sim host |
 | Real onboard perception (VIO/VTRN/LIO estimator) | later — separate effort |
@@ -37,11 +38,18 @@ droneflight nav      --plan out/mission.plan --forest-frac 0.7 --stale-frac 0.3 
 droneflight simfly   --plan out/mission.plan --density 25          # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan out/mission.plan --drift-rate 0.02 --vtrn-interval 150
 eval "$(droneflight sitl-env --plan out/mission.plan)"            # set PX4 SITL home = plan home
+droneflight ev-report --plan out/mission.plan --record run.jsonl   # corridor stats of a recorded EV run
 droneflight fly      --plan out/mission.plan --url udp://:14540    # live: execute on PX4/SITL
+
+# GPS-denied in the loop: stream Gazebo truth + injected error as external vision
+droneflight ev-bridge --plan out/mission.plan --url udp://:14541 --record run.jsonl
+droneflight ev-bridge --plan out/mission.plan --no-vtrn             # the dead-reckoning control arm
 ```
 
-`validate`, `nav`, and `simfly` are fully offline (kinematic, no autopilot);
-`fly` needs a running PX4 (SITL or hardware) reachable at `--url`.
+`validate`, `nav`, `simfly`, and `ev-report` are fully offline (kinematic, no
+autopilot); `fly` needs a running PX4 (SITL or hardware) reachable at `--url`, and
+`ev-bridge` needs Gazebo **and** PX4 — see [RUNBOOK.md](RUNBOOK.md) §3b, which also
+covers the second MAVLink endpoint and the EKF2 global origin.
 
 ## Optical detection + avoidance (won't crash into trees)
 

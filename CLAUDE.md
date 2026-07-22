@@ -17,10 +17,11 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
 | `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver) |
 | `correction.py` | **optical terrain-relative correction** — data-driven fixes over a spatially varying basemap; confidence floor + innovation gate + Kalman fuse |
+| `ev_bridge.py` | **external-vision injection** — Gazebo truth + injected error → PX4 `VISION_POSITION_ESTIMATE`; ENU→NED frames, track recording, corridor analysis |
 | `executor.py` + `connector.py` | connect→upload→arm→start→monitor, RTL on error (+ progress-stall watchdog); fake connector for tests |
 | `mavsdk_connector.py` | live PX4 adapter (⚠️ needs SITL; excluded from coverage, not unit-tested) |
 | `sitl_launch.py` | inject the plan's home into PX4 SITL (`PX4_HOME_*`) so a mission lands at the real AO, not Zurich |
-| `config.py`, `cli.py` | config + `validate` / `nav` / `simfly` / `sitl-env` / `fly` commands |
+| `config.py`, `cli.py` | config + `validate` / `nav` / `simfly` / `sitl-env` / `ev-bridge` / `ev-report` / `fly` commands |
 
 ## Run / test
 ```bash
@@ -32,11 +33,13 @@ droneflight nav      --plan .../mission.plan --forest-frac 0.7 --stale-frac 0.3 
 droneflight simfly   --plan .../mission.plan --density 25               # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan .../mission.plan --drift-rate 0.02 --vtrn-interval 150
 eval "$(droneflight sitl-env --plan .../mission.plan)"                  # PX4 SITL home = plan home
+droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udp://:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 68 tests, ~96% cov
+droneflight ev-bridge --plan .../mission.plan --url udp://:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 116 tests, ~96% cov
 ```
-`validate`/`nav`/`simfly`/`sitl-env` are pure offline (run anywhere); `fly` needs
-a live PX4.
+`validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
+`fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
 
 ## Key facts (some from user feedback — don't regress)
 - **Sensor choice is a concealment tradeoff, not "lidar is best"** (user P.S.):
@@ -74,8 +77,13 @@ a live PX4.
 - `reactive.py` is a **2D horizontal kinematic** sim (no physics, no vertical
   avoidance) — a fast design tool, not fidelity. Real fidelity = PX4 SITL + Gazebo
   (RUNBOOK) on the Ubuntu VM.
-- No real onboard state estimator (VIO/VTRN/LIO) — `nav.py` emulates its *error*,
-  it is not an estimator. That + the Gazebo tether plugin are the next big items.
+- No real onboard state estimator (VIO/VTRN/LIO) — `nav.py` emulates its *error*
+  and `ev_bridge.py` injects that error into EKF2; neither is an estimator. Real
+  VIO/VTRN needs the x86+RTX box (Track B).
+- `ev_bridge.py`'s **live** paths are unexercised: the MAVSDK `mocap` publish, the
+  `SET_GPS_GLOBAL_ORIGIN` send, and the real `gz topic` subprocess (a fake `gz`
+  binary covers the parsing and process plumbing, not Gazebo's actual output
+  format). Injected error is **horizontal only** — EV height and yaw are truth.
 - `correction.py` is a **fidelity/error emulator, not a matcher** — no real
   orthophoto/DSM, no feature extraction; the matchability/staleness fields are
   synthetic. Real numbers need the §6.3 bench (replay nadir imagery over real
@@ -138,30 +146,49 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   sim is stepping at all (`listener sensor_combined -n 1`, and
   `gz topic -e -t /world/planner_nocol/clock -n 3`).
 
-- 🎯 **Slice 3 NEXT — external-vision injection bridge (the MVP piece).**
-  Make GPS-denied real in the loop: EKF2 fused on **external vision** whose pose
-  is `ground truth + injected error` from `nav.py`/`correction.py`. This is where
-  the drift/fidelity work stops being an offline model and starts flying.
-  **Use the flat `default.sdf`** — terrain is parked and irrelevant here, because
-  the error is *injected*, not sensed from terrain.
+- 🎯 **Slice 3 — external-vision injection bridge: BUILT, not yet flown.**
+  `ev_bridge.py` + `droneflight ev-bridge` / `ev-report` are written, linted,
+  typed and tested (116 tests, ~96% cov) — but **everything below the unit tests
+  is unverified until a VM session runs it.** Procedure: RUNBOOK §3b.
+  - **Truth is Gazebo, never PX4.** `GazeboTruthSource` shells out to
+    `gz topic -e --json-output` (model odometry, falling back to the world pose
+    broadcast). PX4's own position is read *only* as a diagnostic readback
+    (`estimate_probe`) and is structurally unable to reach the error model — the
+    circularity trap has a dedicated regression test.
+  - **One error model, two callers.** `nav.py` gained `DriftWalker` +
+    `ErrorInjector` (stateful, distance-driven); `simulate_navigation` and
+    `simulate_corrected_navigation` were refactored onto them and verified
+    **bit-identical** over 180 configs. So SITL injects the model the offline
+    study measured, not a second copy of it.
+  - **Frames** ENU/FLU → NED/FRD in one tested place (`enu_to_ned`,
+    `enu_flu_to_ned_frd_euler`): yaw = π/2 − yaw_enu, pitch flips, roll does not.
+  - **Injected error is horizontal only** — EV height and yaw are ground truth,
+    so this bridge is optimistic about both. Deliberate: it keeps the experiment
+    about horizontal drift and whether optical fixes bound it.
+  - ⚠️ **Global origin — expect this to bite first.** With `EKF2_GPS_CTRL=0`,
+    EKF2 never gets a global origin (it normally takes one from the GNSS fix it
+    may no longer use), so `is_home_position_ok` stays false and a lat/lon
+    mission is rejected *before it starts*. The bridge sends
+    `SET_GPS_GLOBAL_ORIGIN` (plan home) via MAVSDK `mavlink_direct`. Not a sim
+    hack — on the aircraft it is VTRN, not GPS, that ties the local frame to the
+    world.
+  - ⚠️ **Two MAVLink endpoints.** `fly` binds 14540, so the bridge needs its own
+    (`mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541`), and must be
+    started **before** `fly` — EKF2 has no position until vision arrives.
+  - ⚠️ **Message timestamping is unresolved** (`--timestamp none|epoch|sim`,
+    default `none`). Whether PX4 wants 0, companion epoch, or sim time depends on
+    whether MAVLink timesync has converged, which I could not settle from the
+    Mac. The live `est-pub` readback answers it in ~30 s; RUNBOOK §3b tabulates
+    the symptom.
+  - `EKF2_EV_CTRL` changed **15 → 11**: `VISION_POSITION_ESTIMATE` has no
+    velocity field, so bit 2 asked EKF2 to fuse something never sent. (Two stale
+    comments in that params file were wrong too — `EKF2_HGT_REF` 3 = vision, not 1.)
 
-  *Sketch (new module, e.g. `ev_bridge.py`):*
-  1. **Ground truth** — subscribe to Gazebo's model odometry for `x500_0`
-     (`gz topic`). ⚠️ Do **not** use PX4's own local position as truth: it is the
-     EKF output, so feeding it back is circular and will look artificially good.
-  2. **Corrupt it** — apply `DriftConfig` (coherent VIO drift) and, at
-     `CorrectionConfig.attempt_interval_m`, `OpticalCorrector.attempt()` against a
-     `ReferenceMap`. Reuse `correction.py` as-is; it already takes an error vector.
-  3. **Publish** — stream as MAVLink `VISION_POSITION_ESTIMATE`/`ODOMETRY` at
-     ~30–50 Hz (MAVSDK `mocap` plugin). Mind frames (NED) and set `EKF2_EV_DELAY`
-     to the real pipeline latency.
-  4. **Params** — load `configs/px4/gps_denied_ekf2.params` (`EKF2_EV_CTRL=15`,
-     `EKF2_GPS_CTRL=0`, `EKF2_HGT_REF=3`, `COM_ARM_WO_GPS=1`) plus
-     `sitl_bringup.params`.
-
-  *Acceptance:* mission completes GPS-denied; the **true** (Gazebo) track stays
-  within corridor tolerance with VTRN fixes enabled, and demonstrably wanders out
-  with them disabled — i.e. reproduce `nav.py`'s offline A/B against real flight.
+  *Acceptance (unrun):* mission completes GPS-denied; the **true** (Gazebo) track
+  stays within corridor tolerance with fixes enabled and demonstrably wanders out
+  with `--no-vtrn` — i.e. reproduce `nav.py`'s offline A/B against real flight.
+  Both arms print the corridor verdict; `ev-report` recomputes it from a
+  `--record` JSONL. Only meaningful on a **non-degenerate plan**.
 
 - ⚠️ **Workflow: the VM syncs by `git pull`** from `github.com/muzard/{droneplanner,droneflight}`.
   Both repos are cloned in the guest — droneflight is installed, droneplanner is
@@ -174,7 +201,7 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   **duplicate waypoint clusters** (0.2–1.0 m apart) — 77 waypoints, only ~25
   distinct. Wastes autopilot mission slots and makes logs noisy. Needs a
   minimum-spacing filter on the emitted waypoints.
-- ⏭ **Next build items:** the **external-vision injection bridge** (stream
-  `nav.py`/`correction.py` truth+error as `VISION_POSITION_ESTIMATE` into EKF2 →
-  GPS-denied real in the loop) and the **v0 tether disturbance plugin**
-  (`sitl/`) to validate the speed policy against payout physics.
+- ⏭ **Next build items:** **fly the EV bridge on the VM** (RUNBOOK §3b — it is
+  built but unflown, and that is the only thing that turns Slice 3 green), then
+  the **v0 tether disturbance plugin** (`sitl/`) to validate the speed policy
+  against payout physics.

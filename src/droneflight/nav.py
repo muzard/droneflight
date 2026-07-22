@@ -27,6 +27,7 @@ from itertools import pairwise
 
 from droneflight.correction import (
     CorrectionConfig,
+    Fix,
     FixOutcome,
     OpticalCorrector,
     PatchyReference,
@@ -54,6 +55,114 @@ class VtrnConfig:
     residual_error_m: float = 2.0  # bounded error left after a fix
 
 
+class DriftWalker:
+    """Incremental VIO/LIO drift — the stateful core of the drift model.
+
+    Error accrues *coherently*: a slowly-wandering heading times a fixed fraction
+    of the distance travelled, so it grows like a biased random walk rather than
+    averaging out. Callers step it by distance, which is what makes the same
+    model usable offline (over a densified route) and online (over a live truth
+    stream — see :mod:`droneflight.ev_bridge`).
+
+    ``rng`` is injectable so a caller that needs *other* draws interleaved with
+    the walk (the idealised VTRN reset below) can share one stream and stay
+    deterministic.
+    """
+
+    def __init__(self, config: DriftConfig, rng: random.Random | None = None) -> None:
+        self.config = config
+        self._rng = rng if rng is not None else random.Random(config.seed)
+        self._heading = self._rng.uniform(0.0, 2.0 * math.pi)
+        self._ex = 0.0
+        self._ey = 0.0
+
+    @property
+    def error(self) -> tuple[float, float]:
+        """Current estimate-minus-truth error vector, local-ENU meters."""
+        return self._ex, self._ey
+
+    def set_error(self, error: tuple[float, float]) -> None:
+        """Overwrite the accumulated error (after an absolute fix)."""
+        self._ex, self._ey = error
+
+    def advance(self, distance_m: float) -> tuple[float, float]:
+        """Accrue drift over ``distance_m`` and return the new error vector."""
+        cfg = self.config
+        self._heading += self._rng.gauss(
+            0.0, math.radians(cfg.wander_deg_per_100m) * distance_m / 100.0
+        )
+        self._ex += cfg.rate * distance_m * math.cos(self._heading)
+        self._ey += cfg.rate * distance_m * math.sin(self._heading)
+        return self._ex, self._ey
+
+
+class ErrorInjector:
+    """Incremental GPS-denied error: coherent drift + gated optical fixes.
+
+    The online counterpart of :func:`simulate_corrected_navigation` — the same
+    two layers, but stepped by *travelled distance* instead of walked over a
+    precomputed path, so it can corrupt a live ground-truth stream. Both share
+    this implementation, so what SITL flies is the model the offline study
+    measured, not a re-derivation of it.
+
+    With ``reference=None`` the optical layer is off entirely: pure dead
+    reckoning, unbounded error. That is the "VTRN disabled" arm of the A/B.
+    """
+
+    def __init__(
+        self,
+        drift: DriftConfig,
+        reference: ReferenceMap | None = None,
+        config: CorrectionConfig | None = None,
+    ) -> None:
+        self.config = config or CorrectionConfig()
+        self.reference = reference
+        self._walker = DriftWalker(drift)
+        self._corrector = OpticalCorrector(self.config, seed=drift.seed)
+        self._since_attempt = 0.0
+        self.distance_m = 0.0
+        self.counts = {outcome: 0 for outcome in FixOutcome}
+
+    @property
+    def error(self) -> tuple[float, float]:
+        """Current estimate-minus-truth error vector, local-ENU meters."""
+        return self._walker.error
+
+    @property
+    def attempts(self) -> int:
+        return sum(self.counts.values())
+
+    @property
+    def accepted(self) -> int:
+        return self.counts[FixOutcome.ACCEPTED] + self.counts[FixOutcome.ACCEPTED_CORRUPT]
+
+    def advance(self, distance_m: float, x: float, y: float) -> Fix | None:
+        """Step the error by ``distance_m``; maybe attempt a fix at true ``(x, y)``.
+
+        Returns the :class:`~droneflight.correction.Fix` if a match was attempted
+        at this step, else ``None``. ``(x, y)`` is the **true** position (the
+        nadir camera looks at the real world, not at the estimate), so the caller
+        must pass ground truth here.
+        """
+        if distance_m <= 0.0:
+            return None
+        self._walker.advance(distance_m)
+        self.distance_m += distance_m
+        if self.reference is None:
+            return None
+
+        self._corrector.propagate(distance_m)
+        self._since_attempt += distance_m
+        if self._since_attempt < self.config.attempt_interval_m:
+            return None
+
+        fix, error = self._corrector.attempt(self._walker.error, self.reference.sample(x, y))
+        self._walker.set_error(error)
+        self.counts[fix.outcome] += 1
+        self._since_attempt = 0.0
+        return fix
+
+
 @dataclass(frozen=True)
 class NavResult:
     """Emulated navigation performance over a route."""
@@ -70,6 +179,18 @@ def _to_local(lat: float, lon: float, lat0: float) -> tuple[float, float]:
     x = math.radians(lon) * math.cos(math.radians(lat0)) * _EARTH_R
     y = math.radians(lat) * _EARTH_R
     return x, y
+
+
+def local_enu(lat: float, lon: float, ref_lat: float, ref_lon: float) -> tuple[float, float]:
+    """Local-ENU meters (east, north) of ``(lat, lon)`` about a reference point.
+
+    Equirectangular about ``ref_lat`` — sub-meter over a 5 km route, which is far
+    inside the corridor tolerances this is compared against. Used to put a
+    ``.plan`` in the same frame as the simulator's world origin.
+    """
+    x, y = _to_local(lat, lon, ref_lat)
+    x0, y0 = _to_local(ref_lat, ref_lon, ref_lat)
+    return x - x0, y - y0
 
 
 def _densify(pts: list[tuple[float, float]], step_m: float) -> list[tuple[float, float]]:
@@ -97,8 +218,7 @@ def simulate_navigation(
     path = _densify(local, sample_step_m)
 
     rng = random.Random(drift.seed)
-    heading = rng.uniform(0.0, 2.0 * math.pi)
-    ex = ey = 0.0
+    walker = DriftWalker(drift, rng)
     dist_since_fix = 0.0
     total = 0.0
     fixes = 0
@@ -111,16 +231,14 @@ def simulate_navigation(
         if seg == 0.0:
             continue
         total += seg
-        # Drift: step the wandering heading and accrue error along it.
-        heading += rng.gauss(0.0, math.radians(drift.wander_deg_per_100m) * seg / 100.0)
-        ex += drift.rate * seg * math.cos(heading)
-        ey += drift.rate * seg * math.sin(heading)
+        ex, ey = walker.advance(seg)
         dist_since_fix += seg
 
         if vtrn is not None and dist_since_fix >= vtrn.fix_interval_m:
             ang = rng.uniform(0.0, 2.0 * math.pi)
             ex = vtrn.residual_error_m * math.cos(ang)
             ey = vtrn.residual_error_m * math.sin(ang)
+            walker.set_error((ex, ey))
             dist_since_fix = 0.0
             fixes += 1
 
@@ -208,49 +326,30 @@ def simulate_corrected_navigation(
     local = [_to_local(w.lat, w.lon, lat0) for w in mission.waypoints]
     path = _densify(local, sample_step_m)
 
-    rng = random.Random(drift.seed)
-    corrector = OpticalCorrector(config, seed=drift.seed)
-    heading = rng.uniform(0.0, 2.0 * math.pi)
-    ex = ey = 0.0
-    dist_since_attempt = 0.0
-    total = 0.0
+    injector = ErrorInjector(drift, reference, config)
     max_err = 0.0
     err_sum = 0.0
     last_err = 0.0
-    counts = {outcome: 0 for outcome in FixOutcome}
-    attempts = 0
 
     for (ax, ay), (bx, by) in pairwise(path):
         seg = math.hypot(bx - ax, by - ay)
+        injector.advance(seg, bx, by)
         if seg == 0.0:
             continue
-        total += seg
-        heading += rng.gauss(0.0, math.radians(drift.wander_deg_per_100m) * seg / 100.0)
-        ex += drift.rate * seg * math.cos(heading)
-        ey += drift.rate * seg * math.sin(heading)
-        corrector.propagate(seg)
-        dist_since_attempt += seg
-
-        if dist_since_attempt >= config.attempt_interval_m:
-            fix, (ex, ey) = corrector.attempt((ex, ey), reference.sample(bx, by))
-            counts[fix.outcome] += 1
-            attempts += 1
-            dist_since_attempt = 0.0
-
-        err = math.hypot(ex, ey)
+        err = math.hypot(*injector.error)
         last_err = err
         max_err = max(max_err, err)
         err_sum += err
 
     n = max(1, len(path) - 1)
-    accepted = counts[FixOutcome.ACCEPTED] + counts[FixOutcome.ACCEPTED_CORRUPT]
+    counts = injector.counts
     return CorrectedNavResult(
-        distance_m=total,
+        distance_m=injector.distance_m,
         max_error_m=max_err,
         endpoint_error_m=last_err,
         mean_error_m=err_sum / n,
-        attempts=attempts,
-        accepted=accepted,
+        attempts=injector.attempts,
+        accepted=injector.accepted,
         no_features=counts[FixOutcome.NO_FEATURES],
         low_confidence=counts[FixOutcome.LOW_CONFIDENCE],
         gated_out=counts[FixOutcome.GATED_OUT],
