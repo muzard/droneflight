@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from droneflight.config import FlightConfig
 from droneflight.connector import FakeConnector
 from droneflight.executor import fly_mission, prepare_items
@@ -99,3 +101,42 @@ def test_not_ready_message_names_the_missing_flag() -> None:
 
     msg = not_ready_message(30.0, None, None)
     assert "no telemetry at all" in msg
+
+
+def test_auto_progress_timeout_outlasts_the_longest_leg() -> None:
+    """A 60 s constant aborted a healthy SITL flight mid-leg at 41/77."""
+    from droneflight.executor import auto_progress_timeout_s
+    from droneflight.model import MissionItem
+
+    # ~1.1 km leg at 6 m/s = ~188 s — the leg that actually tripped the watchdog.
+    items = [
+        MissionItem(lat=46.90, lon=15.0, alt_agl_m=30.0, speed_ms=6.0),
+        MissionItem(lat=46.91017, lon=15.0, alt_agl_m=30.0, speed_ms=6.0),
+    ]
+    timeout = auto_progress_timeout_s(items)
+    assert timeout > 188.0, "must outlast the leg it is monitoring"
+    assert timeout == pytest.approx(188.5 * 3.0, rel=0.02)
+
+
+def test_auto_progress_timeout_has_a_floor_for_short_routes() -> None:
+    from droneflight.executor import auto_progress_timeout_s
+    from droneflight.model import MissionItem
+
+    close = [
+        MissionItem(lat=46.90, lon=15.0, alt_agl_m=30.0, speed_ms=6.0),
+        MissionItem(lat=46.9001, lon=15.0, alt_agl_m=30.0, speed_ms=6.0),
+    ]
+    assert auto_progress_timeout_s(close) == 60.0
+    assert auto_progress_timeout_s(close[:1]) == 60.0
+
+
+async def test_explicit_progress_timeout_overrides_the_derived_one() -> None:
+    conn = FakeConnector(stall_after=1)
+    result = await fly_mission(conn, _mission(4), FlightConfig(progress_timeout_s=0.05))
+    assert "no mission progress within 0s" in (result.aborted_reason or "")
+
+
+async def test_derived_timeout_is_used_when_config_leaves_it_unset() -> None:
+    conn = FakeConnector()
+    result = await fly_mission(conn, _mission(4), FlightConfig())
+    assert result.completed  # no spurious abort with the default (auto) timeout

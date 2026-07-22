@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 
@@ -56,6 +57,37 @@ class FlightResult:
     rtl_triggered: bool = False
 
 
+def auto_progress_timeout_s(
+    items: list[MissionItem], *, margin: float = 3.0, floor_s: float = 60.0
+) -> float:
+    """A progress watchdog long enough to outlast the mission's longest leg.
+
+    The watchdog measures time between *waypoint arrivals*, so its safe value is
+    a property of the route, not a constant: a 1.1 km leg at 6 m/s takes 188 s
+    and a fixed 60 s timeout aborts a perfectly healthy flight mid-leg (observed
+    in SITL — RTL at exactly arrival + 60 s, 41/77). Deriving it from the planned
+    leg durations keeps the hang detector useful without it firing on long legs.
+
+    ``margin`` covers the gap between planned and achieved ground speed
+    (acceleration, wind, acceptance radii — SITL flew ~3 % under plan). This is
+    still a coarse liveness proxy; a real heartbeat/telemetry watchdog would be
+    better and is not built.
+    """
+    from droneflight.nav import local_enu  # geodesy helper; no cycle
+
+    if len(items) < 2:
+        return floor_s
+    ref = items[0]
+    longest = 0.0
+    prev = local_enu(ref.lat, ref.lon, ref.lat, ref.lon)
+    for item in items[1:]:
+        cur = local_enu(item.lat, item.lon, ref.lat, ref.lon)
+        seconds = math.dist(prev, cur) / max(item.speed_ms, 0.1)
+        longest = max(longest, seconds)
+        prev = cur
+    return max(floor_s, longest * margin)
+
+
 def prepare_items(mission: FlightMission, config: FlightConfig) -> list[MissionItem]:
     """Apply the tether-safe speed policy to a mission (pure, testable).
 
@@ -81,12 +113,18 @@ async def fly_mission(
     total = len(items)
 
     try:
+        progress_timeout = (
+            config.progress_timeout_s
+            if config.progress_timeout_s is not None
+            else auto_progress_timeout_s(items)
+        )
+        _log.info("progress watchdog: %.0fs", progress_timeout)
         await connector.connect(config.connection_url, config.ready_timeout_s)
         await connector.upload_mission(items)
         await connector.arm()
         await connector.start_mission()
         async for current, total in _monitored_progress(
-            connector.mission_progress(), config.progress_timeout_s
+            connector.mission_progress(), progress_timeout
         ):
             flown = current
             _log.info("mission progress: %d/%d", current, total)

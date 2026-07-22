@@ -16,8 +16,10 @@ class FlightConfig:
     connection_url: str = "udp://:14540"
     # Seconds to wait for the autopilot to report ready before aborting.
     ready_timeout_s: float = 30.0
-    # Abort/RTL if the mission stalls (no progress) for this long.
-    progress_timeout_s: float = 60.0
+    # Abort/RTL if the mission stalls (no progress) for this long. None = derive
+    # it from the plan's longest leg (see executor.auto_progress_timeout_s); a
+    # fixed value aborts healthy flights on long legs.
+    progress_timeout_s: float | None = None
     # Return to launch on any in-flight error rather than loitering.
     rtl_on_error: bool = True
 

@@ -151,7 +151,7 @@ MAVSDK_SERVER_ARCH=aarch64 pip install --force-reinstall --no-cache-dir mavsdk
 ls -l ~/PX4-Autopilot/build/px4_sitl_default/bin/px4   # the build actually produced a binary
 gz sim --versions                                      # Gazebo present
 python -c "import mavsdk; print('mavsdk ok')"
-pytest -q                                              # 130 passed => package is sane
+pytest -q                                              # 134 passed => package is sane
 droneflight validate --plan /path/to/mission.plan      # offline path works
 groups | grep -q dialout && echo "dialout ok" || echo "no dialout (fine for SITL)"
 ```
@@ -391,7 +391,7 @@ external-vision variable, so bring-up failures have one cause at a time.
 
 ```bash
 # In a second shell (inside the VM, or a host that can reach the VM's UDP):
-droneflight fly --plan /path/to/mission.plan --url udp://:14540
+droneflight fly --plan /path/to/mission.plan --url udpin://0.0.0.0:14540
 ```
 
 The executor applies tether-safe speeds, uploads, arms, starts, and monitors
@@ -447,6 +447,14 @@ pxh> mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541
 That is a second *onboard* instance: PX4 listens on 14581 and streams to 14541,
 which is where `ev-bridge` connects (its `--url` default). Check with
 `mavlink status` that two instances are up.
+
+> ⚠️ **Re-run this after EVERY PX4 restart.** `mavlink start` is not persistent
+> (unlike the parameters, which are). Without it the bridge binds 14541 and waits
+> forever for a system that never appears — and because it never reaches PX4, the
+> ULog shows nothing at all and `fly` later times out looking unrelated. The
+> startup banner lists the live instances: if you do not see
+> `udp port 14581 remote port 14541`, it is not running. The bridge now gives up
+> after `--connect-timeout` (default 30 s) and says exactly this.
 
 ⚠️ **Two ports, not one.** MAVSDK-Python also spawns its own `mavsdk_server` on a
 **fixed gRPC port** (default 50051) and does *not* check whether it is free, so two
@@ -524,11 +532,11 @@ lock.
 ./sitl/run_sitl.sh ~/plans/ev_test.plan ~/PX4-Autopilot
 
 # shell B — the vision stream (VTRN fixes ON)
-droneflight ev-bridge --plan ~/plans/ev_test.plan --url udp://:14541 \
+droneflight ev-bridge --plan ~/plans/ev_test.plan --url udpin://0.0.0.0:14541 \
     --record ~/logs/ev-vtrn.jsonl
 
 # shell C — once shell B shows est-pub settling near 0, fly the mission
-droneflight fly --plan ~/plans/ev_test.plan --url udp://:14540
+droneflight fly --plan ~/plans/ev_test.plan --url udpin://0.0.0.0:14540
 ```
 
 **If shell B exits immediately, that is your answer** — it fails *before* touching
@@ -606,6 +614,7 @@ something on a **non-degenerate plan** — the straight-line stub from
 | `injected err` stays 0.0 | the vehicle has not moved, or truth is not updating | error accrues with distance flown; check `gz topic -e -t <topic>` by hand |
 | vehicle drifts off immediately in a straight line | frame error (ENU/NED swap) | `ev-bridge --dry-run` and compare published N/E against `gz topic` truth |
 | bridge and `fly` fight over the port | both on 14540 | second `mavlink start` instance (§3b.1); bridge on 14541 |
+| mission aborts mid-leg, `no mission progress within 60s` | fixed watchdog shorter than a long leg | fixed: the timeout is now derived from the plan (override with `fly --progress-timeout`) |
 | `param ... failed (2)` in pxh | `$USER`/`~` passed literally — pxh is not a shell | type the absolute path |
 | `tinybson: node name overflow` on `param import` | pxh reads BSON; `.params` is QGC text | `droneflight px4-params --file ...` and paste the `param set` lines (§3b.2) |
 | run looks clean but suspiciously accurate | params never applied, or `param load` wiped them; GPS still fused | re-check `param show EKF2_GPS_CTRL` = 0 (§3b.2) |
@@ -674,7 +683,7 @@ the `FlightResult` is printed once and discarded. Nothing is written to a file.
 Capture it yourself:
 
 ```bash
-droneflight fly --plan ~/plans/ev_test.plan --url udp://:14540 2>&1 | tee ~/logs/fly-$(date +%F-%H%M).log
+droneflight fly --plan ~/plans/ev_test.plan --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/fly-$(date +%F-%H%M).log
 ```
 
 Or log a whole tmux pane continuously:

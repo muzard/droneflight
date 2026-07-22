@@ -1,7 +1,7 @@
 """``droneflight`` CLI: validate and fly a planner ``.plan`` on PX4.
 
 droneflight validate --plan out/mission.plan          # offline: policies + sensor mode
-droneflight fly --plan out/mission.plan --url udp://:14540   # live: execute on PX4/SITL
+droneflight fly --plan out/mission.plan --url udpin://0.0.0.0:14540  # live: execute on PX4/SITL
 """
 
 from __future__ import annotations
@@ -345,6 +345,15 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
+    def connect_help() -> str:
+        return (
+            f"error: no MAVLink system on {args.url} within {args.connect_timeout:.0f}s.\n"
+            "  PX4 must have an endpoint streaming to that port, and `mavlink start` does\n"
+            "  NOT survive a reboot — re-run it in pxh after every restart:\n"
+            "      mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541\n"
+            "  Confirm with `mavlink status` that two onboard instances are up (RUNBOOK §3b.1)."
+        )
+
     estimate: list[tuple[float, float, float] | None] = [None]
     watcher: asyncio.Task[None] | None = None
     publisher: VisionPublisher
@@ -363,10 +372,17 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
         # otherwise the second server fails to bind and the two processes end up
         # sharing one MAVLink connection, silently ignoring one of the --url values.
         system = System(port=args.server_port)
-        await system.connect(system_address=args.url)
-        async for state in system.core.connection_state():
-            if state.is_connected:
-                break
+        try:
+            # Bounded: MAVSDK's own discovery wait never returns, so without this
+            # a missing endpoint looks like the bridge silently doing nothing.
+            async with asyncio.timeout(args.connect_timeout):
+                await system.connect(system_address=args.url)
+                async for state in system.core.connection_state():
+                    if state.is_connected:
+                        break
+        except TimeoutError:
+            print(connect_help(), file=sys.stderr)
+            return 4
         print(f"connected to PX4 at {args.url}")
         publisher = MavsdkMocapPublisher(system)
 
@@ -466,7 +482,11 @@ def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live
     except PlanLoadError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    config = FlightConfig(connection_url=args.url, night_operation=args.night)
+    config = FlightConfig(
+        connection_url=args.url,
+        night_operation=args.night,
+        progress_timeout_s=args.progress_timeout,
+    )
     result = asyncio.run(fly_mission(MavsdkConnector(), mission, config))
     print(
         f"{'COMPLETED' if result.completed else 'ABORTED'}: "
@@ -477,6 +497,11 @@ def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live
 
 
 def app(argv: list[str] | None = None) -> int:
+    # Piping to `tee` makes stdout block-buffered while library logging goes to
+    # unbuffered stderr — so progress lines vanish and the run looks stalled.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+
     parser = argparse.ArgumentParser(prog="droneflight", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -545,8 +570,8 @@ def app(argv: list[str] | None = None) -> int:
     eb.add_argument("--plan", type=Path, required=True)
     eb.add_argument(
         "--url",
-        default="udp://:14541",
-        help="MAVLink URL (use a SECOND endpoint: `droneflight fly` holds 14540).",
+        default="udpin://0.0.0.0:14541",
+        help="MAVLink URL. Use a SECOND endpoint — `droneflight fly` holds 14540.",
     )
     eb.add_argument("--world", default="default", help="Gazebo world name.")
     eb.add_argument("--model", default="x500_0", help="Gazebo model name to take truth from.")
@@ -580,6 +605,12 @@ def app(argv: list[str] | None = None) -> int:
         help="gRPC port for this process's mavsdk_server. MUST differ from `fly`'s (50051).",
     )
     eb.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for a MAVLink system on --url before giving up.",
+    )
+    eb.add_argument(
         "--wait-topic",
         type=float,
         default=30.0,
@@ -602,8 +633,15 @@ def app(argv: list[str] | None = None) -> int:
 
     f = sub.add_parser("fly", help="Execute a .plan on PX4 (SITL or hardware).")
     f.add_argument("--plan", type=Path, required=True)
-    f.add_argument("--url", default="udp://:14540", help="MAVLink connection URL.")
+    f.add_argument("--url", default="udpin://0.0.0.0:14540", help="MAVLink connection URL.")
     f.add_argument("--night", action="store_true")
+    f.add_argument(
+        "--progress-timeout",
+        type=float,
+        default=None,
+        help="Seconds without waypoint progress before abort+RTL "
+        "(default: derived from the plan's longest leg).",
+    )
     f.set_defaults(func=_fly)
 
     args = parser.parse_args(argv)

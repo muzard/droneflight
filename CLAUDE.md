@@ -35,9 +35,9 @@ droneflight simfly   --plan .../mission.plan --drift-rate 0.02 --vtrn-interval 1
 eval "$(droneflight sitl-env --plan .../mission.plan)"                  # PX4 SITL home = plan home
 droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # constant alt for PX4's FLAT world
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
-droneflight fly      --plan .../mission.plan --url udp://:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
-droneflight ev-bridge --plan .../mission.plan --url udp://:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 130 tests, ~96% cov
+droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
+droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 134 tests, ~96% cov
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -149,7 +149,7 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
 
 - 🎯 **Slice 3 — external-vision injection bridge: BUILT, not yet flown.**
   `ev_bridge.py` + `droneflight ev-bridge` / `ev-report` are written, linted,
-  typed and tested (130 tests, ~96% cov) — but **everything below the unit tests
+  typed and tested (134 tests, ~96% cov) — but **everything below the unit tests
   is unverified until a VM session runs it.** Procedure: RUNBOOK §3b.
   - **Truth is Gazebo, never PX4.** `GazeboTruthSource` shells out to
     `gz topic -e --json-output` (model odometry, falling back to the world pose
@@ -184,6 +184,15 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   - `EKF2_EV_CTRL` changed **15 → 11**: `VISION_POSITION_ESTIMATE` has no
     velocity field, so bit 2 asked EKF2 to fuse something never sent. (Two stale
     comments in that params file were wrong too — `EKF2_HGT_REF` 3 = vision, not 1.)
+
+  - 🐛 **Watchdog false-positive, found and fixed (2026-07-22).** The first
+    GPS-denied flight aborted at **41/77**: the progress watchdog measures time
+    between *waypoint arrivals*, and leg 41→42 is **1130.8 m = 188 s** at cruise
+    against a fixed `progress_timeout_s=60`. ULog confirms RTL at arrival+60 s
+    exactly. `progress_timeout_s` is now **None = derive from the plan's longest
+    leg** (`executor.auto_progress_timeout_s`, 3× margin → 565 s for this route);
+    an explicit value still overrides. Any fixed constant here is wrong — the safe
+    value is a property of the route.
 
   *Acceptance (unrun):* mission completes GPS-denied; the **true** (Gazebo) track
   stays within corridor tolerance with fixes enabled and demonstrably wanders out

@@ -39,10 +39,10 @@ droneflight simfly   --plan out/mission.plan --density 25          # forest flig
 droneflight simfly   --plan out/mission.plan --drift-rate 0.02 --vtrn-interval 150
 eval "$(droneflight sitl-env --plan out/mission.plan)"            # set PX4 SITL home = plan home
 droneflight ev-report --plan out/mission.plan --record run.jsonl   # corridor stats of a recorded EV run
-droneflight fly      --plan out/mission.plan --url udp://:14540    # live: execute on PX4/SITL
+droneflight fly      --plan out/mission.plan --url udpin://0.0.0.0:14540    # live: execute on PX4/SITL
 
 # GPS-denied in the loop: stream Gazebo truth + injected error as external vision
-droneflight ev-bridge --plan out/mission.plan --url udp://:14541 --record run.jsonl
+droneflight ev-bridge --plan out/mission.plan --url udpin://0.0.0.0:14541 --record run.jsonl
 droneflight ev-bridge --plan out/mission.plan --no-vtrn             # the dead-reckoning control arm
 ```
 
