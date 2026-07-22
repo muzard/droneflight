@@ -701,7 +701,24 @@ the navigation.
 * `progress watchdog: 565s` at `fly` start — a fixed 60 s aborted a healthy flight
   at 41/77 before this was derived from the plan.
 
-## 3d. The error-axis arms (dropout, yaw) — ⏭ NEXT, both UNFLOWN
+## 3d. The error-axis arms (dropout, yaw) — ✅ both FLOWN 2026-07-22
+
+**Result: neither moved the corridor** (11.8 → 12.2 m dropout, → 11.9 m yaw), and
+both axes verifiably engaged. That is a finding about the *metric*: cross-track
+deviation is near-blind to heading error, because a multirotor on position
+setpoints does not steer with its nose. Score these arms on **EKF2 heading error
+from the ULog**, MISSION phase only. Full analysis: CLAUDE.md → Slice 3.
+
+Dropout's measured cost was **12.40° of heading error inside the gaps vs 2.07°
+outside**, with position unchanged — and EKF2 only held it that well by falling
+back on a magnetometer that reads perfect truth in SITL (`cs_mag_3d` 0 → 39.4 %).
+
+⏭ **`dropout-long` (6 s) is the next run** — it crosses `EKF2_NOAID_TOUT` and
+tests the position-loss failsafe, which is a different mechanism entirely.
+
+The procedure below is retained for re-running.
+
+### Original plan (as flown)
 
 The three arms above varied the **basemap**. These vary the **error axis**, and
 each adds exactly one on top of the `vtrn` basemap — so the already-flown
@@ -789,6 +806,108 @@ silently had its axis disabled is visible rather than being read as a null resul
 ⚠️ **Endpoint deviation is meaningless if `dropout-long` failsafes mid-route** —
 the report flags an incomplete route, but check `finished=` in the ULog before
 quoting any number from that arm.
+
+## 3e. `dropout-long`, magnetometer denied — ⏭ NEXT, UNFLOWN
+
+The honest worst case, and the run that should finally make something break.
+Two things change at once versus the flown 3 s `dropout` arm:
+
+1. **6 s gaps instead of 3 s** — crosses EKF2's 5 s `EKF2_NOAID_TOUT`, so
+   horizontal position is declared invalid and the **position-loss failsafe**
+   fires. That failsafe is live (only `NAV_DLL_ACT` and `SIM_BAT_DRAIN` are
+   neutralised).
+2. **No magnetometer** — `configs/px4/mag_denied.params`. The 3 s arm only held
+   heading to 12.40° because EKF2 fell back on 3D mag fusion (`cs_mag_3d` 0.0 %
+   → 39.4 %), and in SITL that magnetometer reads perfect truth. With it denied,
+   **external vision is the only heading observation**, so a gap leaves EKF2 on
+   gyro alone.
+
+### ⚠️ Read the result under this rule, decided before the run
+
+Two variables move together, so:
+
+* **If it breaks** (failsafe fires, mission aborts, heading runs away) — that is
+  a real and immediately useful worst-case result. Report it as "6 s gaps with no
+  magnetometer break it", *not* as either factor alone.
+* **If it does NOT break** — you have learned nothing attributable, and the two
+  isolating runs below are then required. Do not report a clean combined run as
+  "dropout-long is fine".
+
+Isolating runs, only needed if the combined run survives:
+
+| Run | Config | Isolates |
+|---|---|---|
+| F | `dropout-long`, mag **on** | the `NOAID_TOUT` crossing alone |
+| G | `vtrn` (no dropout), mag **denied** | the new heading baseline alone |
+
+### Parameters
+
+Apply all three files together, then reboot:
+
+```bash
+droneflight px4-params \
+    --file configs/px4/gps_denied_ekf2.params \
+    --file configs/px4/sitl_bringup.params \
+    --file configs/px4/mag_denied.params
+```
+
+⚠️ **`EKF2_MAG_TYPE`'s enum has changed across PX4 releases.** Verify `5 = None`
+on this build before trusting it — a wrong value silently leaves the magnetometer
+fusing and the whole point of the run is lost:
+
+```bash
+param show EKF2_MAG_TYPE
+```
+
+⚠️ **These params persist across SITL restarts.** Reset them afterwards or every
+later arm is silently magnetometer-denied — which would invalidate comparisons
+against every flight before today:
+
+```bash
+param reset EKF2_MAG_TYPE SYS_HAS_MAG EKF2_MAG_CHECK
+```
+
+### Running it
+
+Write to a **separate log directory** — `run_ev_arm.sh` names records after the
+arm, so a mag-denied `dropout-long` would otherwise overwrite a mag-enabled one:
+
+```bash
+# pane A — SITL, with all three param files applied and rebooted
+./sitl/run_sitl.sh ~/drone/plans/ev_test.plan ~/drone/PX4-Autopilot
+#   at pxh>:   mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541
+#   confirm:   param show EKF2_MAG_TYPE     -> 5
+#   confirm:   param show EKF2_NOAID_TOUT   -> 5000000
+#   confirm:   param show EKF2_GPS_CTRL     -> 0
+
+# pane B — the arm, into its own directory
+./sitl/run_ev_arm.sh dropout-long ~/drone/plans/ev_test.plan ~/logs/magdenied
+
+# pane C — fly it
+droneflight fly --plan ~/drone/plans/ev_test.plan --url udpin://0.0.0.0:14540 \
+    2>&1 | tee ~/logs/magdenied/fly-dropout-long.log
+```
+
+### Expect this to be the first failure: arming
+
+With no magnetometer and `EKF2_EV_CTRL=11`, **EV yaw is the only thing EKF2 can
+align heading against**. If the bridge is not already publishing, yaw alignment
+never completes and `fly` will not arm. The bridge-before-fly ordering (§3b.3) is
+not just convention here — it is load-bearing. If arming fails, check
+`cs_yaw_align` in the ULog before assuming the params are wrong.
+
+### What to watch
+
+* **The failsafe action at the first 6 s gap** — descend, land, hold, terminate?
+  **That behaviour is the result of this run**, not the corridor number.
+* Heading error during gaps, now with no mag fallback. The 3 s arm reached 12.40°
+  *with* the magnetometer; expect materially worse, and measure it rather than
+  guessing — `vehicle_attitude` vs `vehicle_attitude_groundtruth`, MISSION phase
+  only (the post-mission HOLD phase adds ~11° and will corrupt a whole-log number).
+* `cs_mag_3d` should now be **0 % everywhere**. If it is not, the mag is still
+  fusing and the run does not test what it claims to.
+* ⚠️ **If the mission aborts, the corridor and endpoint numbers are meaningless.**
+  Check `finished=` in the ULog before quoting either.
 
 ## 4. Custom tether model (required build item)
 

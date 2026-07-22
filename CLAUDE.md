@@ -37,7 +37,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 169 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 172 tests, ~96% cov
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -85,8 +85,8 @@ ruff check . && ruff format --check . && mypy --strict src && pytest -q # 169 te
   `SET_GPS_GLOBAL_ORIGIN` send, and the real `gz topic` subprocess (a fake `gz`
   binary covers the parsing and process plumbing, not Gazebo's actual output
   format). Injected position error is **horizontal only** — EV height is always
-  truth. Yaw is truth *by default* but can now be corrupted (`--yaw-bias` /
-  `--yaw-drift`); the yaw axis is built and unit-tested but **never flown**.
+  truth. Yaw is truth *by default* but can be corrupted (`--yaw-bias` /
+  `--yaw-drift`); flown 2026-07-22 and it barely moves cross-track — see Slice 3.
 - `correction.py` is a **fidelity/error emulator, not a matcher** — no real
   orthophoto/DSM, no feature extraction; the matchability/staleness fields are
   synthetic. Real numbers need the §6.3 bench (replay nadir imagery over real
@@ -151,7 +151,7 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
 
 - ✅ **Slice 3 — external-vision injection bridge: FLOWN, acceptance complete
   (2026-07-22).** `ev_bridge.py` + `droneflight ev-bridge` / `ev-report`, tested
-  offline (169 tests, ~96 % cov) **and now exercised in flight** — the three-arm
+  offline (172 tests, ~96 % cov) **and now exercised in flight** — the three-arm
   GPS-denied acceptance ran on the VM and the arms separated (table below).
   **The MVP flies GPS-denied.** Procedure: RUNBOOK §3b, arms: §3c.
   - **Truth is Gazebo, never PX4.** `GazeboTruthSource` shells out to
@@ -313,7 +313,7 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     11.7 m from ULog vs 11.8 m from JSONL). Useful when a record is lost — but the
     ULog cannot show fix availability or blunders, which live only in the JSONL.
 
-- 🆕 **EV dropout + yaw-error injection: BUILT (2026-07-22), not yet flown.**
+- ✅ **EV dropout + yaw-error injection: BUILT AND FLOWN (2026-07-22).**
   The two axes the acceptance never touched. Both **default to off**, so the
   three flown arms reproduce from the same command line — there is a test that
   asserts exactly that.
@@ -332,11 +332,74 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     it does **not** predict corridor deviation): `--dropout-interval 800` → 4
     losses / 99.2 % uptime over 5.13 km; `500` → 6 / 98.2 %; `250 --dropout-duration 5`
     → 15 / 92.7 %. `--yaw-drift 1.0` → 7.7° max heading error, `2.0` → 15.4°.
-  - **⏭ Arms are wired and ready to fly — `run_ev_arm.sh dropout | yaw` (and the
-    follow-on `dropout-long`). Procedure, predictions and what to watch:
-    RUNBOOK §3d.** Each adds one axis on top of the `vtrn` basemap, so the flown
-    `vtrn` arm (11.8 m) is their control and **no control re-flight is needed**.
-    Run them one at a time.
+  - ✅ **BOTH FLOWN 2026-07-22 — and the headline is that the corridor did not
+    move.** `dropout` (`sim-logs/19_30_04.ulg`, `ev-dropout.jsonl`) and `yaw`
+    (`19_51_48.ulg`, `ev-yaw.jsonl`), each one axis on top of the `vtrn` basemap,
+    seeds pinned, scored against the flown `vtrn` arm.
+
+    | Arm | max dev | mean | EV uptime | injected yaw | verdict |
+    |---|---|---|---|---|---|
+    | `vtrn` (control) | 11.8 m | 4.0 m | 100 % | — | WITHIN |
+    | `dropout` 500 m / 3 s | **12.2 m** | 4.1 m | 98.5 % | — | WITHIN |
+    | `yaw` 1.0 °/100 m | **11.9 m** | 4.0 m | 100 % | 6.3° | WITHIN |
+
+  - ✅ **Both axes verifiably engaged — this is a real null, not a broken run.**
+    PX4 itself saw **exactly 6 EV gaps of 3.0–3.1 s** (`vehicle_visual_odometry`
+    holes, independent of what the bridge claims), 543 publishes withheld. And
+    EKF2's heading **tracked the injected yaw**: correlation **+0.970**, range
+    ratio 0.90×, against a control heading-noise floor of 2.07°.
+  - 🔴 **The corridor metric is near-blind to heading error — and that is a
+    finding about the acceptance criterion, not about these arms.** A 6.1°
+    injected heading error moved max deviation by 0.1 m; a 12.4° dropout-induced
+    one moved it by 0.4 m. A multirotor flying **position setpoints** does not
+    steer with its nose: the position controller closes on EV position, which
+    neither axis perturbs. **CLAUDE.md's previous claim that yaw "couples into
+    position through the controller" is measured FALSE** at these magnitudes for
+    this vehicle in AUTO_MISSION. "WITHIN corridor" ≠ "navigation healthy".
+  - 🔬 **Dropout's real cost is heading, not position.** MISSION phase, in the
+    gap windows (+3 s recovery) vs outside them: heading error **12.40° vs 2.07°
+    max** (mean 1.03° vs 0.15°) — 6× — while EKF2 position error is **11.71 m vs
+    11.05 m**, i.e. unchanged. `EKF2_EV_CTRL=11` sources position *and yaw* from
+    vision, so a lock loss removes the only heading observation while 3 s of
+    inertial dead reckoning barely dents position. **The dropout arm was a bigger
+    yaw disturbance (12.4°) than the deliberate yaw arm (6.1°).**
+  - ⚠️ **That heading recovery leans on a magnetometer that reads perfect truth.**
+    During gaps EKF2 falls back to 3D mag fusion — `cs_mag_3d` goes **0.0 % →
+    39.4 %**. In SITL the mag is uncorrupted, so 12.4° is a **best case**. A covert
+    GPS-denied platform near ferrous structure, power lines or deliberate
+    interference has no such anchor. A mag-denied dropout variant
+    (`EKF2_MAG_TYPE`) is the honest version of this test.
+  - 🎯 **Where heading error actually hurts this system is camera pointing, which
+    nothing models.** The nadir VTRN camera and the forward avoidance FOV are both
+    body-fixed, so 12° of heading error swings both. `correction.py` has no
+    pointing-error term (matchability is purely spatial) and `perception.py`'s FOV
+    is already flagged as too narrow. That coupling — not cross-track — is the
+    reason to care about yaw here.
+  - 🧰 **`ev-report`'s comparison table now carries EV-uptime and yaw columns**
+    plus a note that a heading-only arm can be significant with a flat corridor.
+    It previously showed them only in single-record mode, so these two arms first
+    read as an ambiguous null — an arm whose axis never fired was indistinguishable
+    from one that fired and changed nothing.
+  - **⏭ NEXT: `dropout-long` (6 s) with the magnetometer DENIED** — wired as
+    `run_ev_arm.sh dropout-long` plus `configs/px4/mag_denied.params`. Crosses
+    EKF2's 5 s `EKF2_NOAID_TOUT` (→ position-loss failsafe, still live) *and*
+    removes the truth-perfect mag fallback, leaving EV as the only heading
+    observation. **Procedure, revert steps and the read-the-result rule:
+    RUNBOOK §3e.**
+    - ⚠️ **Two variables move at once.** Decided in advance: if it breaks, that
+      is a real worst-case result reported as "6 s gaps *with no magnetometer*";
+      if it survives, nothing is attributable and the two isolating runs (6 s
+      with mag; no-dropout without mag) become required. A clean combined run is
+      **not** "dropout-long is fine".
+    - ⚠️ **`EKF2_MAG_TYPE`'s enum has moved across PX4 releases** — verify 5 =
+      None on the build, or the mag keeps fusing and the run tests nothing.
+    - ⚠️ **Those params persist across SITL restarts** (`param reset
+      EKF2_MAG_TYPE SYS_HAS_MAG EKF2_MAG_CHECK` afterwards) — otherwise every
+      later arm is silently mag-denied and no longer comparable to anything
+      flown before 2026-07-22.
+    - ⚠️ **Expect arming to be the first failure:** with no mag, EV yaw is the
+      only heading EKF2 can align against, so the bridge-before-fly ordering is
+      load-bearing rather than conventional.
   - 🔑 **The dropout pair is designed around EKF2's 5 s `EKF2_NOAID_TOUT`** (PX4
     default; *not* set in `gps_denied_ekf2.params`, so confirm with
     `param show EKF2_NOAID_TOUT` before flying). 3 s = under it → EKF2 should ride
@@ -345,10 +408,12 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     `NAV_DLL_ACT` and `SIM_BAT_DRAIN` are neutralised), and it is the genuinely
     untested path. For `dropout-long` the *failsafe behaviour is the result*, not
     the corridor number.
-  - ⚠️ **The yaw arm cannot be judged from the console.** A heading error makes
-    the vehicle fly a rotated frame while still believing it is on route, so
-    `est-pub` stays near zero while the true track bows away. Only the corridor
-    number catches it — a clean-looking run means nothing here.
+  - ⚠️ **The yaw arm cannot be judged from the console *or* the corridor.**
+    `est-pub` stays near zero by construction — and, as flown, so does the
+    corridor. Score it on **EKF2 heading error vs Gazebo truth** from the ULog
+    (`vehicle_attitude` vs `vehicle_attitude_groundtruth`, MISSION phase only:
+    the post-mission HOLD phase adds ~11° of parked-vehicle heading error and
+    will make any whole-log number meaningless).
 
 - 🐛 **Found while building it: `DriftWalker`'s heading wander is a no-op at
   bridge granularity.** Its per-step deviation scales with distance, but a random

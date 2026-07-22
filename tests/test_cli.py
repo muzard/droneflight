@@ -480,3 +480,48 @@ def test_ev_bridge_parser_defaults_keep_both_new_axes_off() -> None:
     assert args.dropout_interval == 0.0
     assert args.yaw_bias == 0.0
     assert args.yaw_drift == 0.0
+
+
+def test_ev_report_table_shows_uptime_and_yaw(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The comparison table must reveal whether each arm's axis actually engaged.
+
+    Without these columns a dropout arm whose axis silently never fired looks
+    identical to one that fired and changed nothing — which is exactly the
+    ambiguity that made the first dropout/yaw result unreadable.
+    """
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+
+    def record(name: str, ev_down: bool, yaw: float) -> Path:
+        path = tmp_path / name
+        rows = []
+        for i in range(10):
+            doc = {
+                "t": i * 0.1,
+                "truth": {"e": 0.0, "n": float(i), "u": 30.0},
+                "err": {"e": 0.0, "n": 0.0},
+                "pub": {"n": float(i), "e": 0.0, "d": -30.0, "yaw": 0.0},
+                "mode": "MISSION",
+            }
+            if ev_down and i < 5:
+                doc["ev"] = "down"
+            if yaw:
+                doc["yaw_err"] = yaw
+            rows.append(json.dumps(doc))
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return path
+
+    args = ["ev-report", "--plan", str(plan)]
+    for name, down, yaw in (("clean", False, 0.0), ("dropped", True, 0.0), ("yawed", False, 0.1)):
+        args += ["--record", str(record(f"{name}.jsonl", down, yaw))]
+
+    assert app(args) == 0
+    out = capsys.readouterr().out
+    assert "EV up" in out and "yaw" in out
+    assert "100.0%" in out  # the clean arm
+    assert "50.0%" in out  # the dropout arm withheld half its publishes
+    assert "5.7" in out  # 0.1 rad of yaw, in degrees
+    # And the reader is warned not to read a flat corridor as "no effect".
+    assert "near-blind to yaw" in out

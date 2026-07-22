@@ -378,14 +378,22 @@ def _ev_report(args: argparse.Namespace) -> int:
         return 0
 
     print(f"corridor tolerance {args.corridor:.0f} m — scoring the MISSION phase of each arm\n")
-    head = f"{'arm':<22}{'max dev':>9}{'mean':>8}{'max err':>9}{'fixes':>11}{'blund':>7}  verdict"
+    head = (
+        f"{'arm':<18}{'max dev':>9}{'mean':>8}{'max err':>9}{'fixes':>10}"
+        f"{'blund':>7}{'EV up':>8}{'yaw':>8}  verdict"
+    )
     print(head)
     print("-" * len(head))
     for r in rows:
         fixes = f"{r.accepted}/{r.attempts}" if r.attempts else "—"
+        # Uptime and yaw belong in the comparison, not just the single-record
+        # view: without them an arm whose axis silently never engaged is
+        # indistinguishable from one that engaged and changed nothing.
+        uptime = f"{(1 - r.ev_down / r.samples) * 100:.1f}%" if r.samples else "—"
+        yaw = f"{r.max_yaw_error_deg:.1f}°" if r.max_yaw_error_deg else "—"
         print(
-            f"{r.name[:21]:<22}{r.report.max_deviation_m:8.1f}m{r.report.mean_deviation_m:7.1f}m"
-            f"{r.max_error_m:8.1f}m{fixes:>11}{r.blunders:7d}  "
+            f"{r.name[:17]:<18}{r.report.max_deviation_m:8.1f}m{r.report.mean_deviation_m:7.1f}m"
+            f"{r.max_error_m:8.1f}m{fixes:>10}{r.blunders:7d}{uptime:>8}{yaw:>8}  "
             f"{'WITHIN' if r.report.within_corridor else 'LEFT'}"
         )
     held = [r for r in rows if r.report.within_corridor]
@@ -395,6 +403,16 @@ def _ev_report(args: argparse.Namespace) -> int:
         "means\nsomething if the arms DISAGREE — all-pass or all-fail says the route, not "
         "the\nnavigation, decided the outcome."
     )
+    # Corridor deviation is a *position* metric. Measured 2026-07-22: a 6.1 deg
+    # injected heading error and a 12.4 deg dropout-induced one both left it
+    # unmoved, because a multirotor on position setpoints does not steer with its
+    # nose. An arm that only perturbs heading will read as a null result here.
+    if any(r.max_yaw_error_deg for r in rows) or any(r.ev_down for r in rows):
+        print(
+            "\nnote: an arm perturbing HEADING or EV availability may show no corridor\n"
+            "change and still be significant — cross-track is near-blind to yaw.\n"
+            "Score those arms on EKF2 heading error from the ULog, not on this table."
+        )
     return 0
 
 

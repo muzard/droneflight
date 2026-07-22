@@ -1,0 +1,46 @@
+# PX4 parameters for a MAGNETOMETER-DENIED GPS-denied run.
+# Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
+#
+# Apply ON TOP OF gps_denied_ekf2.params + sitl_bringup.params:
+#   droneflight px4-params --file configs/px4/gps_denied_ekf2.params \
+#                          --file configs/px4/sitl_bringup.params \
+#                          --file configs/px4/mag_denied.params
+# then paste the `param set` lines into pxh and `reboot`.
+#
+# WHY THIS EXISTS
+# The 2026-07-22 dropout arm measured 12.40 deg of EKF2 heading error inside the
+# 3 s vision gaps (vs 2.07 deg outside). But EKF2 only held it to that by falling
+# back on the magnetometer: `cs_mag_3d` went 0.0% -> 39.4% during the gaps. In
+# SITL the magnetometer reads PERFECT TRUTH, so that 12.40 deg is a best case and
+# the dropout result is quietly optimistic.
+#
+# A covert GPS-denied aircraft cannot assume a trustworthy magnetometer — near
+# ferrous structure, power lines, or deliberate interference it is degraded or
+# useless, and heading is precisely the axis a magnetometer is there to anchor.
+# Denying it makes external vision the ONLY heading observation, which is the
+# honest configuration for testing what a vision dropout actually costs.
+#
+# ⚠️ CONSEQUENCE: with EKF2_EV_CTRL=11 (position H+V + yaw), vision is now the
+# sole heading source. During an EV dropout EKF2 has NO heading observation at
+# all and runs on gyro alone. That is the point of the test — and it is why the
+# bridge must be publishing BEFORE arming (RUNBOOK 3b.3), since EKF2 has nothing
+# else to align yaw against.
+#
+# ⚠️ VERIFY THE ENUM ON YOUR BUILD BEFORE TRUSTING THIS FILE. The meaning of
+# EKF2_MAG_TYPE has changed across PX4 releases. At pxh:
+#       param show EKF2_MAG_TYPE
+#   and check the value list in QGC's parameter view (or `param info`). 5 = None
+#   on v1.14+; if this build disagrees, fix the value here rather than in your
+#   shell history, or the next run silently re-enables the magnetometer.
+
+# Magnetometer fusion OFF (5 = None). This is the parameter that actually
+# removes the heading anchor from EKF2.
+1	1	EKF2_MAG_TYPE	5	6
+
+# Tell the rest of the stack there is no magnetometer, so preflight checks do not
+# refuse to arm over a sensor we are deliberately ignoring.
+1	1	SYS_HAS_MAG	0	6
+
+# Disable the magnetic-field consistency check. With no mag fusion it has nothing
+# to check, and left on it can still block arming.
+1	1	EKF2_MAG_CHECK	0	6
