@@ -45,7 +45,9 @@ LOG="$OUTDIR/ev-$ARM.log"
 echo "arm '$ARM': ${ARGS[*]}  (seed 0, fidelity-seed 1)"
 echo "record: $RECORD"
 echo "log:    $LOG"
-exec droneflight ev-bridge \
+# No `exec` here: it would only replace the pipeline's subshell, and the bridge
+# needs to receive Ctrl-C itself so it can stop cleanly and print its summary.
+droneflight ev-bridge \
   --plan "$PLAN" \
   --seed 0 --fidelity-seed 1 \
   "${ARGS[@]}" \
