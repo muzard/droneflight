@@ -428,7 +428,7 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
 
 def _ev_bridge(args: argparse.Namespace) -> int:  # pragma: no cover - requires sim + autopilot
     """Stream Gazebo truth + injected error into PX4 as external vision."""
-    from droneflight.ev_bridge import resolve_truth_topic
+    from droneflight.ev_bridge import wait_for_truth_topic
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -437,7 +437,9 @@ def _ev_bridge(args: argparse.Namespace) -> int:  # pragma: no cover - requires 
         print(f"error: {exc}", file=sys.stderr)
         return 2
     try:
-        topic = resolve_truth_topic(args.world, args.model, gz_binary=args.gz)
+        topic = wait_for_truth_topic(
+            args.world, args.model, timeout_s=args.wait_topic, gz_binary=args.gz
+        )
     except EvBridgeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 4
@@ -576,6 +578,12 @@ def app(argv: list[str] | None = None) -> int:
         type=int,
         default=50052,
         help="gRPC port for this process's mavsdk_server. MUST differ from `fly`'s (50051).",
+    )
+    eb.add_argument(
+        "--wait-topic",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for Gazebo to advertise the truth topic before giving up.",
     )
     eb.add_argument("--dry-run", action="store_true", help="Read truth but do not publish to PX4.")
     eb.add_argument(

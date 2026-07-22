@@ -37,7 +37,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udp://:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udp://:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 126 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 130 tests, ~96% cov
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -149,7 +149,7 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
 
 - 🎯 **Slice 3 — external-vision injection bridge: BUILT, not yet flown.**
   `ev_bridge.py` + `droneflight ev-bridge` / `ev-report` are written, linted,
-  typed and tested (126 tests, ~96% cov) — but **everything below the unit tests
+  typed and tested (130 tests, ~96% cov) — but **everything below the unit tests
   is unverified until a VM session runs it.** Procedure: RUNBOOK §3b.
   - **Truth is Gazebo, never PX4.** `GazeboTruthSource` shells out to
     `gz topic -e --json-output` (model odometry, falling back to the world pose

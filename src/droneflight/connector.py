@@ -35,6 +35,35 @@ class ConnectorError(RuntimeError):
     """A transport/command error from the autopilot connector."""
 
 
+def not_ready_message(
+    timeout_s: float, local_position_ok: bool | None, home_position_ok: bool | None
+) -> str:
+    """Explain a readiness timeout in terms of *which* health flag never came.
+
+    "not ready within 30s" on its own sends you looking at the wrong thing. In a
+    GPS-denied setup EKF2 has no position at all until an external-vision stream
+    is fused, so a missing local position almost always means the EV bridge is
+    not running — which is invisible from here, because the bridge fails before
+    it ever reaches the autopilot.
+    """
+    if local_position_ok is None and home_position_ok is None:
+        return (
+            f"autopilot not ready within {timeout_s:.0f}s — no telemetry at all. "
+            "Check the MAVLink URL and that PX4 is up."
+        )
+    detail = f"local_position_ok={local_position_ok}, home_position_ok={home_position_ok}"
+    hint = ""
+    if not local_position_ok:
+        hint = (
+            " GPS-denied: EKF2 has no position until external vision is fused — start "
+            "`droneflight ev-bridge` first and wait for its est-pub readback to settle "
+            "(RUNBOOK §3b.3). If the bridge exited, its error is on its own console."
+        )
+    elif not home_position_ok:
+        hint = " Local position is good but home is not set; check the EKF2 global origin."
+    return f"autopilot not ready within {timeout_s:.0f}s ({detail}).{hint}"
+
+
 class FakeConnector:
     """Deterministic in-memory connector for testing the executor.
 

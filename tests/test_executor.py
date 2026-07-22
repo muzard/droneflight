@@ -84,3 +84,18 @@ async def test_night_non_covert_still_flies() -> None:
 def test_prepare_items_uses_mission_cruise_speed() -> None:
     items = prepare_items(_mission(3), FlightConfig())
     assert items[0].speed_ms == 6.0  # mission cruise speed honored
+
+
+def test_not_ready_message_names_the_missing_flag() -> None:
+    from droneflight.connector import not_ready_message
+
+    msg = not_ready_message(30.0, False, False)
+    assert "local_position_ok=False" in msg
+    assert "ev-bridge" in msg  # points at the actual cause in a GPS-denied setup
+
+    msg = not_ready_message(30.0, True, False)
+    assert "home is not set" in msg
+    assert "ev-bridge" not in msg
+
+    msg = not_ready_message(30.0, None, None)
+    assert "no telemetry at all" in msg

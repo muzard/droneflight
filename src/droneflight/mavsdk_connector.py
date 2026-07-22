@@ -15,7 +15,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
-from droneflight.connector import ConnectorError
+from droneflight.connector import ConnectorError, not_ready_message
 from droneflight.model import MissionItem
 
 
@@ -30,6 +30,8 @@ class MavsdkConnector:  # pragma: no cover - requires a live autopilot
 
         system = System()
         await system.connect(system_address=url)
+        local_ok: bool | None = None
+        home_ok: bool | None = None
         try:
             async with asyncio.timeout(ready_timeout_s):
                 async for state in system.core.connection_state():
@@ -37,10 +39,12 @@ class MavsdkConnector:  # pragma: no cover - requires a live autopilot
                         break
                 async for health in system.telemetry.health():
                     # GPS-denied: gate on local position, not global.
-                    if health.is_local_position_ok and health.is_home_position_ok:
+                    local_ok = health.is_local_position_ok
+                    home_ok = health.is_home_position_ok
+                    if local_ok and home_ok:
                         break
         except TimeoutError as exc:
-            raise ConnectorError(f"autopilot not ready within {ready_timeout_s}s") from exc
+            raise ConnectorError(not_ready_message(ready_timeout_s, local_ok, home_ok)) from exc
         self._system = system
 
     async def upload_mission(self, items: list[MissionItem]) -> None:

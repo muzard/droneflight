@@ -571,3 +571,38 @@ async def test_publish_rate_cannot_exceed_the_truth_rate() -> None:
     truth = [TruthSample(t_s=i * 0.1, east_m=0.0, north_m=0.0, up_m=1.0) for i in range(50)]
     stats, _ = await _run(ErrorInjector(DriftConfig()), truth, rate_hz=100.0)
     assert stats.published == 50  # forwards everything, invents nothing
+
+
+def test_wait_for_truth_topic_polls_until_gazebo_advertises_it() -> None:
+    """The model's odometry appears only after the model spawns — a startup race."""
+    from droneflight.ev_bridge import wait_for_truth_topic
+
+    calls = {"n": 0}
+    slept: list[float] = []
+
+    def lister() -> list[str]:
+        calls["n"] += 1
+        return ["/clock"] if calls["n"] < 3 else ["/clock", "/model/x500_0/odometry"]
+
+    topic = wait_for_truth_topic(timeout_s=10.0, poll_s=1.0, lister=lister, sleep=slept.append)
+    assert topic.topic == "/model/x500_0/odometry"
+    assert calls["n"] == 3
+    assert slept == [1.0, 1.0]
+
+
+def test_wait_for_truth_topic_gives_up_with_the_useful_error() -> None:
+    from droneflight.ev_bridge import wait_for_truth_topic
+
+    with pytest.raises(EvBridgeError, match="no ground-truth topic"):
+        wait_for_truth_topic(
+            timeout_s=2.0, poll_s=1.0, lister=lambda: ["/clock"], sleep=lambda _s: None
+        )
+
+
+def test_wait_for_truth_topic_returns_immediately_when_present() -> None:
+    from droneflight.ev_bridge import wait_for_truth_topic
+
+    slept: list[float] = []
+    topic = wait_for_truth_topic(lister=lambda: ["/model/x500_0/odometry"], sleep=slept.append)
+    assert topic.kind == "odometry"
+    assert slept == []

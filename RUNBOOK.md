@@ -151,7 +151,7 @@ MAVSDK_SERVER_ARCH=aarch64 pip install --force-reinstall --no-cache-dir mavsdk
 ls -l ~/PX4-Autopilot/build/px4_sitl_default/bin/px4   # the build actually produced a binary
 gz sim --versions                                      # Gazebo present
 python -c "import mavsdk; print('mavsdk ok')"
-pytest -q                                              # 126 passed => package is sane
+pytest -q                                              # 130 passed => package is sane
 droneflight validate --plan /path/to/mission.plan      # offline path works
 groups | grep -q dialout && echo "dialout ok" || echo "no dialout (fine for SITL)"
 ```
@@ -531,6 +531,14 @@ droneflight ev-bridge --plan ~/plans/ev_test.plan --url udp://:14541 \
 droneflight fly --plan ~/plans/ev_test.plan --url udp://:14540
 ```
 
+**If shell B exits immediately, that is your answer** — it fails *before* touching
+PX4, so the only trace is on its own console. The two common exits are `'gz' not
+on PATH` (venv/shell without Gazebo's environment) and `no ground-truth topic for
+model 'x500_0'` (started before Gazebo advertised it; the bridge now polls for
+`--wait-topic` seconds, default 30). A bridge that never connected looks, from
+PX4's side, exactly like `fly` hanging — because `fly` then waits 30 s for a
+position that never arrives.
+
 Shell B prints a line every 5 s of sim time:
 
 ```
@@ -593,7 +601,8 @@ something on a **non-degenerate plan** — the straight-line stub from
 |---|---|---|
 | `no ground-truth topic for model 'x500_0'` | model/world named differently | `gz topic -l`; pass `--model` / `--world` (the error prints what it saw) |
 | `est-pub` large or growing; `ekf2 vision data stopped` | message timestamp in the wrong clock domain | try `--timestamp epoch`, then `--timestamp sim` (default `none` = PX4 stamps on receipt) |
-| `fly` never gets past its readiness gate | no vision yet, or no global origin | start `ev-bridge` **first**; check it printed `EKF2 global origin set to …` |
+| `fly` never gets past its readiness gate | no vision yet, or no global origin | start `ev-bridge` **first**; check it printed `EKF2 global origin set to …`. The timeout now names the missing health flag |
+| `fly` times out ~30 s after connecting, ULog shows 0 EV samples | the bridge exited before connecting — its error is on ITS console | run the bridge alone first; `--dry-run` proves truth without PX4 |
 | `injected err` stays 0.0 | the vehicle has not moved, or truth is not updating | error accrues with distance flown; check `gz topic -e -t <topic>` by hand |
 | vehicle drifts off immediately in a straight line | frame error (ENU/NED swap) | `ev-bridge --dry-run` and compare published N/E against `gz topic` truth |
 | bridge and `fly` fight over the port | both on 14540 | second `mavlink start` instance (§3b.1); bridge on 14541 |

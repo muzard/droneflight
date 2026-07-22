@@ -217,6 +217,40 @@ def resolve_truth_topic(
     )
 
 
+def wait_for_truth_topic(
+    world: str = "default",
+    model: str = "x500_0",
+    *,
+    timeout_s: float = 30.0,
+    poll_s: float = 1.0,
+    gz_binary: str = "gz",
+    lister: Callable[[], list[str]] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> GazeboTopic:
+    """Wait for the ground-truth topic to appear, then resolve it.
+
+    Topic discovery is a startup *race*: Gazebo advertises the vehicle's odometry
+    only once the model is spawned, which is well after `gz sim` itself is up. A
+    one-shot check that exits on the first miss makes the bridge fail instantly
+    if it is started a few seconds early — and since it dies before connecting to
+    PX4, the visible symptom is `fly` timing out much later with no clue why.
+    Polling turns that race into a wait.
+    """
+    list_topics = lister if lister is not None else lambda: discover_gz_topics(gz_binary)
+    deadline = timeout_s
+    waited = 0.0
+    last: EvBridgeError | None = None
+    while True:
+        try:
+            return resolve_truth_topic(world, model, available=list_topics())
+        except EvBridgeError as exc:
+            last = exc
+        if waited >= deadline:
+            raise last
+        sleep(poll_s)
+        waited += poll_s
+
+
 class _JsonStreamSplitter:
     """Split a character stream into top-level JSON objects.
 
