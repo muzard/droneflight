@@ -35,8 +35,11 @@ from droneflight.executor import fly_mission, prepare_items
 from droneflight.model import FlightMission
 from droneflight.nav import (
     DriftConfig,
+    DropoutConfig,
+    DropoutModel,
     ErrorInjector,
     VtrnConfig,
+    YawDriftConfig,
     route_reference,
     simulate_corrected_navigation,
     simulate_navigation,
@@ -242,6 +245,11 @@ def _build_injector(args: argparse.Namespace, mission: FlightMission) -> ErrorIn
         reference,
         CorrectionConfig(attempt_interval_m=args.attempt_interval),
         correction_ramp_m=getattr(args, "fix_ramp", 0.0),
+        yaw=YawDriftConfig(
+            bias_deg=getattr(args, "yaw_bias", 0.0),
+            wander_deg_per_100m=getattr(args, "yaw_drift", 0.0),
+            seed=getattr(args, "yaw_seed", 3),
+        ),
     )
 
 
@@ -288,6 +296,8 @@ class _RecordSummary:
     report: CorridorReport
     scored: str  # which samples the corridor number covers
     excluded: str
+    ev_down: int = 0
+    max_yaw_error_deg: float = 0.0
 
 
 def _summarise_record(path: Path, mission: FlightMission, corridor_m: float) -> _RecordSummary:
@@ -319,6 +329,8 @@ def _summarise_record(path: Path, mission: FlightMission, corridor_m: float) -> 
         ),
         scored=scored,
         excluded=excluded,
+        ev_down=sum(1 for s in samples if s.ev_down),
+        max_yaw_error_deg=math.degrees(max(abs(s.yaw_error_rad) for s in samples)),
     )
 
 
@@ -347,6 +359,13 @@ def _ev_report(args: argparse.Namespace) -> int:
                 f"optical fixes: {r.accepted}/{r.attempts} accepted "
                 f"({r.accepted / r.attempts * 100:.0f}%), {r.blunders} stale blunders accepted"
             )
+        if r.ev_down:
+            print(
+                f"ev dropout: {r.ev_down}/{r.samples} samples with no vision published "
+                f"({(1 - r.ev_down / r.samples) * 100:.1f}% uptime)"
+            )
+        if r.max_yaw_error_deg:
+            print(f"yaw error: max {r.max_yaw_error_deg:.2f}°")
         _print_corridor(f"TRUE track vs plan [{r.scored}]", None, None, args.corridor, r.report)
         if r.excluded:
             print(f"  excluded samples in: {r.excluded}")
@@ -392,7 +411,20 @@ def _format_bridge_stats(stats: EvBridgeStats) -> list[str]:
             f"{stats.no_features} no-texture, {stats.low_confidence} low-conf, "
             f"{stats.gated_out} gated-out; {stats.corrupt_accepted} blunders slipped through"
         )
+    if stats.dropout_events or stats.dropout_suppressed:
+        lines.append(
+            f"ev dropout: {stats.dropout_events} lock losses, "
+            f"{stats.dropout_suppressed} publishes withheld "
+            f"({stats.ev_uptime * 100:.1f}% uptime)"
+        )
+    if stats.max_yaw_error_rad:
+        lines.append(f"yaw error: max {math.degrees(stats.max_yaw_error_rad):.2f}°")
     return lines
+
+
+# Any est-pub delta beyond this is a frame artefact, not a navigation number: the
+# whole AO is ~5 km across, so even total EV rejection cannot produce it.
+_EST_PROBE_SANE_M = 100_000.0
 
 
 def _live_monitor(interval_s: float = 5.0) -> Callable[[BridgeSample], None]:
@@ -413,10 +445,21 @@ def _live_monitor(interval_s: float = 5.0) -> Callable[[BridgeSample], None]:
             f"t={sample.t_s:7.1f}  truth E,N=({sample.truth_enu[0]:8.1f},"
             f"{sample.truth_enu[1]:8.1f})  injected err={math.hypot(*sample.error_en):6.1f} m"
         )
+        if sample.ev_down:
+            line += "  [EV DOWN]"
         if sample.estimate_ned is not None:
             n, e, _d = sample.estimate_ned
             delta = math.hypot(n - sample.published.north_m, e - sample.published.east_m)
-            line += f"  est-pub={delta:5.2f} m"
+            # Before EKF2 has an origin, position_velocity_ned reads out in a
+            # different frame and the delta comes back in the millions — measured
+            # at exactly 5421242.25 m on the first sample of all four SITL runs.
+            # Printing that verbatim sends operators debugging a non-problem, and
+            # the RUNBOOK tells them to watch this number, so name it instead.
+            line += (
+                "  est-pub=  (no EKF2 origin yet)"
+                if delta > _EST_PROBE_SANE_M
+                else f"  est-pub={delta:5.2f} m"
+            )
         else:
             line += "  est-pub=  n/a"
         print(line, flush=True)
@@ -527,6 +570,15 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
                 estimate_probe=None if args.dry_run else (lambda: estimate[0]),
                 mode_probe=None if args.dry_run else (lambda: mode[0]),
                 on_sample=_live_monitor(),
+                dropout=DropoutModel(
+                    DropoutConfig(
+                        mean_interval_m=args.dropout_interval,
+                        duration_s=args.dropout_duration,
+                        seed=args.dropout_seed,
+                    )
+                )
+                if args.dropout_interval > 0.0
+                else None,
             )
             stats = await bridge.run(
                 GazeboTruthSource(topic, gz_binary=args.gz), publisher, stop=stop
@@ -576,6 +628,27 @@ def _ev_bridge(args: argparse.Namespace) -> int:  # pragma: no cover - requires 
             else "NO absolute fixes (dead reckoning only — the control arm)"
         )
     )
+    # The run script's own banner is echoed to the terminal, not into the tee'd
+    # log, so this line is the only in-log record of how an arm was configured.
+    # Seeds included deliberately: a lost seed makes a run unreproducible.
+    print(
+        f"seeds: drift={args.seed}, fidelity={args.fidelity_seed}, "
+        f"dropout={args.dropout_seed}, yaw={args.yaw_seed}"
+    )
+    print(
+        "ev dropout: "
+        + (
+            f"every ~{args.dropout_interval:.0f} m for {args.dropout_duration:.1f} s"
+            if args.dropout_interval > 0.0
+            else "OFF (stream never interrupted)"
+        )
+        + " | yaw error: "
+        + (
+            f"{args.yaw_bias:+.1f}° bias, {args.yaw_drift:.2f}°/100 m drift"
+            if args.yaw_bias or args.yaw_drift
+            else "OFF (heading is ground truth)"
+        )
+    )
     return asyncio.run(_run_ev_bridge(args, mission, _build_injector(args, mission), topic))
 
 
@@ -602,12 +675,13 @@ def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live
     return 0 if result.completed else 1
 
 
-def app(argv: list[str] | None = None) -> int:
-    # Piping to `tee` makes stdout block-buffered while library logging goes to
-    # unbuffered stderr — so progress lines vanish and the run looks stalled.
-    with contextlib.suppress(AttributeError, ValueError):
-        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+def build_parser() -> argparse.ArgumentParser:
+    """The full CLI grammar.
 
+    Split out from :func:`app` so defaults can be asserted without running a
+    command — several of them (the acceptance-arm flags in particular) are load-
+    bearing for reproducing past flights.
+    """
     parser = argparse.ArgumentParser(prog="droneflight", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -702,6 +776,27 @@ def app(argv: list[str] | None = None) -> int:
     eb.add_argument("--forest-frac", type=float, default=0.4)
     eb.add_argument("--stale-frac", type=float, default=0.1)
     eb.add_argument("--fidelity-seed", type=int, default=1)
+    # Two error axes the acceptance flights never exercised: the vision stream was
+    # never interrupted, and heading was always ground truth. Both default to off,
+    # so an arm that does not ask for them reproduces the flown runs exactly.
+    eb.add_argument(
+        "--dropout-interval",
+        type=float,
+        default=0.0,
+        help="Mean METRES between vision lock losses (0 = never drop out).",
+    )
+    eb.add_argument(
+        "--dropout-duration", type=float, default=2.0, help="Seconds each lock loss lasts."
+    )
+    eb.add_argument("--dropout-seed", type=int, default=2, help="Lock-loss seed.")
+    eb.add_argument("--yaw-bias", type=float, default=0.0, help="Constant heading error (degrees).")
+    eb.add_argument(
+        "--yaw-drift",
+        type=float,
+        default=0.0,
+        help="Heading random-walk growth (degrees per 100 m).",
+    )
+    eb.add_argument("--yaw-seed", type=int, default=3, help="Yaw-drift seed.")
     eb.add_argument("--corridor", type=float, default=15.0, help="Corridor tolerance (m).")
     eb.add_argument("--duration", type=float, default=0.0, help="Stop after N s of sim time.")
     eb.add_argument("--record", type=Path, help="Write the run as JSONL for `ev-report`.")
@@ -763,7 +858,16 @@ def app(argv: list[str] | None = None) -> int:
     )
     f.set_defaults(func=_fly)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def app(argv: list[str] | None = None) -> int:
+    # Piping to `tee` makes stdout block-buffered while library logging goes to
+    # unbuffered stderr — so progress lines vanish and the run looks stalled.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+
+    args = build_parser().parse_args(argv)
     result: int = args.func(args)
     return result
 

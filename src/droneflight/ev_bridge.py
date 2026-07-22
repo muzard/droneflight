@@ -48,7 +48,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from droneflight.correction import Fix
 from droneflight.model import FlightMission
-from droneflight.nav import ErrorInjector, local_enu
+from droneflight.nav import DropoutModel, ErrorInjector, local_enu
 
 __all__ = [
     "BridgeSample",
@@ -581,6 +581,11 @@ class BridgeSample:
     # loiter. Without it a post-abort return-to-home — which beelines across the
     # planned route — is scored as navigation error and dominates the result.
     mode: str | None = None
+    # True when the vision stream was suppressed for this sample (lock loss). The
+    # sample is still recorded — a gap in the record would be indistinguishable
+    # from the bridge itself dying, which is the opposite of the thing under test.
+    ev_down: bool = False
+    yaw_error_rad: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -605,6 +610,10 @@ class BridgeSample:
             doc["fix"] = self.fix
         if self.mode is not None:
             doc["mode"] = self.mode
+        if self.ev_down:
+            doc["ev"] = "down"
+        if self.yaw_error_rad:
+            doc["yaw_err"] = round(self.yaw_error_rad, 5)
         return doc
 
 
@@ -623,11 +632,20 @@ class EvBridgeStats:
     low_confidence: int = 0
     gated_out: int = 0
     corrupt_accepted: int = 0
+    dropout_events: int = 0
+    dropout_suppressed: int = 0  # publishes withheld because EV had lost lock
+    max_yaw_error_rad: float = 0.0
     track_enu: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def fix_availability(self) -> float:
         return self.accepted / self.attempts if self.attempts else 0.0
+
+    @property
+    def ev_uptime(self) -> float:
+        """Fraction of due publishes that actually went out (1.0 = never dropped)."""
+        due = self.published + self.dropout_suppressed
+        return self.published / due if due else 1.0
 
 
 class TrackRecorder:
@@ -671,10 +689,15 @@ class EvBridge:
         estimate_probe: Callable[[], tuple[float, float, float] | None] | None = None,
         mode_probe: Callable[[], str | None] | None = None,
         on_sample: Callable[[BridgeSample], None] | None = None,
+        dropout: DropoutModel | None = None,
     ) -> None:
         self.injector = injector
         self.config = config or EvBridgeConfig()
         self.recorder = recorder
+        # Lock loss lives here rather than on the injector: it is a property of
+        # the *link* to the autopilot (does a message arrive?), not of how wrong
+        # the estimate is. Keeping them separate lets a run exercise either alone.
+        self.dropout = dropout
         # Diagnostic only: PX4's own estimate, logged so a run can be checked for
         # "is EKF2 actually fusing this?". It must never feed the injector.
         self.estimate_probe = estimate_probe
@@ -698,6 +721,7 @@ class EvBridge:
         # long-run average honest.
         next_pub_t = -math.inf
         t0: float | None = None
+        dist_since_pub = 0.0
 
         async for sample in truth.stream():
             if stop is not None and stop.is_set():
@@ -715,6 +739,7 @@ class EvBridge:
             if last_pos is not None:
                 step = math.hypot(sample.east_m - last_pos[0], sample.north_m - last_pos[1])
                 fix = self.injector.advance(step, sample.east_m, sample.north_m)
+                dist_since_pub += step
             last_pos = (sample.east_m, sample.north_m)
 
             err_e, err_n = self.injector.error
@@ -727,9 +752,23 @@ class EvBridge:
                 continue
             next_pub_t = sample.t_s + interval if next_pub_t == -math.inf else next_pub_t + interval
 
+            # Lock loss is stepped on the publish cadence, not the truth cadence,
+            # so a dropout lasts the same wall-clock time whatever the truth rate.
+            ev_down = self.dropout.step(dist_since_pub, sample.t_s) if self.dropout else False
+            dist_since_pub = 0.0
+
             pose = self._pose_for(sample, (err_e, err_n))
-            await publisher.publish(pose)
-            stats.published += 1
+            if ev_down:
+                # A real estimator that has lost tracking sends nothing at all.
+                # Publishing a stale or degraded pose instead would test a failure
+                # mode that does not exist.
+                stats.dropout_suppressed += 1
+            else:
+                await publisher.publish(pose)
+                stats.published += 1
+
+            yaw_err = self.injector.yaw_error_rad
+            stats.max_yaw_error_rad = max(stats.max_yaw_error_rad, abs(yaw_err))
 
             record = BridgeSample(
                 t_s=sample.t_s,
@@ -739,6 +778,8 @@ class EvBridge:
                 estimate_ned=self.estimate_probe() if self.estimate_probe else None,
                 fix=fix.outcome.value if fix else None,
                 mode=self.mode_probe() if self.mode_probe else None,
+                ev_down=ev_down,
+                yaw_error_rad=yaw_err,
             )
             if self.recorder is not None:
                 self.recorder.write(record)
@@ -754,6 +795,11 @@ class EvBridge:
         # the error model is 2D (see the module docstring).
         north, east, down = enu_to_ned(sample.east_m + err_e, sample.north_m + err_n, sample.up_m)
         roll, pitch, yaw = enu_flu_to_ned_frd_euler(*sample.euler_enu())
+        # Heading error is added in the NED/FRD frame the autopilot consumes, and
+        # wrapped, so a walked error never hands PX4 an out-of-range yaw. Roll and
+        # pitch stay truth: gravity observes them, so a real VIO does not lose them.
+        if self.injector.yaw_error_rad:
+            yaw = _wrap_pi(yaw + self.injector.yaw_error_rad)
         return VisionPose(
             north_m=north,
             east_m=east,
@@ -791,6 +837,8 @@ class EvBridge:
         stats.low_confidence = counts[FixOutcome.LOW_CONFIDENCE]
         stats.gated_out = counts[FixOutcome.GATED_OUT]
         stats.corrupt_accepted = counts[FixOutcome.ACCEPTED_CORRUPT]
+        if self.dropout is not None:
+            stats.dropout_events = self.dropout.events
 
 
 # --------------------------------------------------------------------------- #
@@ -890,6 +938,8 @@ def load_track(path: Path) -> list[BridgeSample]:
                 ),
                 fix=doc.get("fix"),
                 mode=doc.get("mode"),
+                ev_down=doc.get("ev") == "down",
+                yaw_error_rad=float(doc.get("yaw_err", 0.0)),
             )
         )
     return samples

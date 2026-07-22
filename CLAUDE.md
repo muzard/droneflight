@@ -15,9 +15,9 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter |
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
-| `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver) |
+| `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver), plus yaw drift and EV lock loss |
 | `correction.py` | **optical terrain-relative correction** — data-driven fixes over a spatially varying basemap; confidence floor + innovation gate + Kalman fuse |
-| `ev_bridge.py` | **external-vision injection** — Gazebo truth + injected error → PX4 `VISION_POSITION_ESTIMATE`; ENU→NED frames, track recording, corridor analysis |
+| `ev_bridge.py` | **external-vision injection** — Gazebo truth + injected error → PX4 `VISION_POSITION_ESTIMATE`; ENU→NED frames, EV dropout, track recording, corridor analysis |
 | `executor.py` + `connector.py` | connect→upload→arm→start→monitor, RTL on error (+ progress-stall watchdog); fake connector for tests |
 | `mavsdk_connector.py` | live PX4 adapter (⚠️ needs SITL; excluded from coverage, not unit-tested) |
 | `sitl_launch.py` | inject the plan's home into PX4 SITL (`PX4_HOME_*`) so a mission lands at the real AO, not Zurich |
@@ -37,7 +37,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 141 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 169 tests, ~96% cov
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -84,7 +84,9 @@ ruff check . && ruff format --check . && mypy --strict src && pytest -q # 141 te
 - `ev_bridge.py`'s **live** paths are unexercised: the MAVSDK `mocap` publish, the
   `SET_GPS_GLOBAL_ORIGIN` send, and the real `gz topic` subprocess (a fake `gz`
   binary covers the parsing and process plumbing, not Gazebo's actual output
-  format). Injected error is **horizontal only** — EV height and yaw are truth.
+  format). Injected position error is **horizontal only** — EV height is always
+  truth. Yaw is truth *by default* but can now be corrupted (`--yaw-bias` /
+  `--yaw-drift`); the yaw axis is built and unit-tested but **never flown**.
 - `correction.py` is a **fidelity/error emulator, not a matcher** — no real
   orthophoto/DSM, no feature extraction; the matchability/staleness fields are
   synthetic. Real numbers need the §6.3 bench (replay nadir imagery over real
@@ -147,10 +149,11 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   sim is stepping at all (`listener sensor_combined -n 1`, and
   `gz topic -e -t /world/planner_nocol/clock -n 3`).
 
-- 🎯 **Slice 3 — external-vision injection bridge: BUILT, not yet flown.**
-  `ev_bridge.py` + `droneflight ev-bridge` / `ev-report` are written, linted,
-  typed and tested (141 tests, ~96% cov) — but **everything below the unit tests
-  is unverified until a VM session runs it.** Procedure: RUNBOOK §3b.
+- ✅ **Slice 3 — external-vision injection bridge: FLOWN, acceptance complete
+  (2026-07-22).** `ev_bridge.py` + `droneflight ev-bridge` / `ev-report`, tested
+  offline (169 tests, ~96 % cov) **and now exercised in flight** — the three-arm
+  GPS-denied acceptance ran on the VM and the arms separated (table below).
+  **The MVP flies GPS-denied.** Procedure: RUNBOOK §3b, arms: §3c.
   - **Truth is Gazebo, never PX4.** `GazeboTruthSource` shells out to
     `gz topic -e --json-output` (model odometry, falling back to the world pose
     broadcast). PX4's own position is read *only* as a diagnostic readback
@@ -205,8 +208,9 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     | Injected error | max **9.0 m**, mean 3.6 m (22/27 fixes accepted) |
     | **True track vs plan, MISSION phase** | max **10.4 m**, mean 3.4 m — **0/10139 samples outside the 15 m corridor** |
 
-    So the VTRN arm **holds the corridor in real flight**. The `--no-vtrn` control
-    arm is still unrun, so the A/B is half done.
+    So the VTRN arm **holds the corridor in real flight** — but this run predates
+    the degenerate-basemap and fix-teleport fixes below, so it is superseded by
+    the three-arm acceptance. Kept for the watchdog/EKF2-lock numbers only.
   - ⚠️ **Score the MISSION phase only.** The whole-run number for the same flight
     is max 122.6 m — all of it the post-abort RTL, which beelines home across a
     tortuous route. `ev-bridge` now records PX4's flight mode per sample and
@@ -247,28 +251,130 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     So VTRN is **not** a reliable corridor guarantee: it fails 1 seed in 10 on a
     benign map and most of the time in a conflict zone. One flight is one seed.
 
-  *Acceptance — ⏭ **NEXT SESSION STARTS HERE**. Three arms, all UNRUN on the
-  fixed code. Full procedure, predictions and pitfalls: **RUNBOOK §3c**.*
+  - ✅ **ACCEPTANCE FLOWN — all three arms, 2026-07-22. The arms separate.**
+    `sitl/run_ev_arm.sh` on the VM, one plan (`plans/ev_test.plan`, 77 wp,
+    5.13 km, flat 30 m), `--seed 0 --fidelity-seed 1` pinned. All three
+    **completed** (`finished=True`, 153/154 items, ~5.16 km flown) — no watchdog
+    aborts, so `auto_progress_timeout_s` held. MISSION phase, 15 m corridor:
 
-  | Arm | Basemap | Predicted (seed 0) | Expect |
-  |---|---|---|---|
-  | A `vtrn` | 40 % forest / 10 % stale | max dev **15.0 m** | WITHIN (marginal) |
-  | B `novtrn` | none (dead reckoning) | max dev **106.4 m** | LEFT |
-  | C `conflict` | 70 % forest / 30 % stale | max dev **21.9 m** | LEFT |
+    | Arm | ULog | max dev | mean | endpoint | fixes | blund | predicted | verdict |
+    |---|---|---|---|---|---|---|---|---|
+    | A `vtrn` 40/10 | `sim-logs/14_53_15.ulg` | **11.8 m** | 4.0 m | 3.2 m | 28/62 (45 %) | 0 | 15.0 m | **WITHIN** |
+    | B `novtrn` control | `sim-logs/15_16_47.ulg` | **103.2 m** | 44.1 m | 103.2 m | — | — | 106.4 m | LEFT |
+    | C `conflict` 70/30 | `sim-logs/15_33_55.ulg` | **25.6 m** | 9.3 m | 8.8 m | 10/68 (15 %) | 0 | 21.9 m | LEFT |
 
-  Run each with `sitl/run_ev_arm.sh <arm> <plan>` (pins `--seed 0
-  --fidelity-seed 1` across arms — varying seeds between arms confounds the
-  comparison), then compare in one table:
-  `droneflight ev-report --plan … --record ev-vtrn.jsonl --record ev-novtrn.jsonl
-  --record ev-conflict.jsonl`. **The result only means something if the arms
-  disagree**; the report says so. Arm A sits exactly on the tolerance, so treat a
-  narrow pass/fail as noise — arm B is the one that must separate.
+    Records `sim-logs/ev-{vtrn,novtrn,conflict}.jsonl`; reproduce with
+    `droneflight ev-report --plan plans/ev_test.plan --record sim-logs/ev-vtrn.jsonl
+    --record sim-logs/ev-novtrn.jsonl --record sim-logs/ev-conflict.jsonl`.
 
-  *Still unbuilt, ranked (was going to be next):* **EV dropout injection** (real
-  VIO loses lock; the stream has never been interrupted, so the failsafe path is
-  untested) and **yaw-error injection** (heading is currently ground truth, so a
-  whole error axis is unexercised and it couples into position through the
-  controller). Then the tether plugin.
+  - 📐 **The offline Monte Carlo predicted the flights** (15.0/11.8, 106.4/103.2,
+    21.9/25.6 — all within ~4 m). So `nav.py` + `correction.py` are *predictive of
+    in-the-loop SITL*, not just self-consistent, which is what lets the 40-seed
+    study stand in for flights we cannot afford to run.
+  - 🔬 **Arm C failed by fix STARVATION, not by poisoning — the mechanism matters.**
+    Decline breakdown: **52/68 (76.5 %) `no_features`**, 3 `gated_out`,
+    3 `low_confidence`, **0 blunders accepted**. The innovation gate only had to
+    fire 3 times; the corridor breach came from canopy leaving nothing to match
+    against. So on this seed the `--forest-frac 0.7` knob did all the damage and
+    `--stale-frac 0.3` did almost none. This is the in-the-loop confirmation of
+    NAV-FIDELITY's "forest starves fixes" finding. **Next experiment should
+    separate the knobs** (70/10 vs 40/30) — they are currently varied together and
+    only one of them is demonstrably dangerous.
+  - ⚠️ **Seeds verified pinned, on evidence.** All three arms trace an identical
+    injected-error vector to 50 m — (−0.831, +0.53) m, bearing 147°, matching to
+    3 decimals — so the confound this experiment was designed to avoid is ruled
+    out by measurement, not by trusting the script.
+  - ⚠️ **Arm A is still one seed, and a lucky one.** 11.8 m nearly reproduces the
+    *invalidated* degenerate-basemap run (11.5 m), which is coincidence, not
+    vindication: the MC says 4/40 seeds breach at 40/10. **Do not quote arm A as
+    "VTRN holds the corridor."** It says: this route, this seed, this basemap held.
+  - 🐛 **Residual, unfixed: the fix-ramp did not eliminate EKF2 gate trips.**
+    Max published-pose step is down to **0.45 m** (A) / **0.75 m** (C) from 7.8 m,
+    but EV fusion is still rejected in **20 (A) / 22 (C) episodes, ~1.9 % of
+    samples** — against **1 episode / 2 samples** in arm B, which applies no fixes
+    at all. So the trips are still fix-induced and scale with correction size.
+    Not currently harmful (arm A held with 3 m margin); the ramp is an improvement,
+    not a cure.
+  - 🐛 **Residual, unfixed: an early fix can be worse than no fix.** Arm A's first
+    accepted fix drove error **0.99 m → 3.28 m** at ~100 m while the control sat at
+    1.98 m — the corrector fuses fixes whose own uncertainty exceeds current drift.
+    Net strongly positive over 5 km, but gating on *"does this fix beat my current
+    drift estimate?"* looks like cheap headroom.
+  - 📌 **Two traps when reading these ULogs.** `estimator_aid_src_ev_pos.test_ratio`
+    maxes at ~9.4e12 in **all three arms including the no-fix control** — a garbage
+    first sample, not an innovation; quote p99 (4.16 / 0.01 / 5.94). And all three
+    published at exactly **25.0 Hz**, not the 30 Hz `--rate` default or the 30.0 Hz
+    in the earlier table — dt is exactly 0.0400 s, so it is quantised somewhere
+    (Gazebo's odometry rate?), not VM starvation. Consistent across arms, so it
+    confounds nothing, but it is **unexplained**.
+  - 🛠 **ULogs can be scored without the bridge's JSONL.** PX4 logs
+    `vehicle_local_position_groundtruth` (= Gazebo truth), so feeding it through
+    `plan_track_enu`/`analyse_track` reproduces `ev-report` to **0.1 m** (arm A:
+    11.7 m from ULog vs 11.8 m from JSONL). Useful when a record is lost — but the
+    ULog cannot show fix availability or blunders, which live only in the JSONL.
+
+- 🆕 **EV dropout + yaw-error injection: BUILT (2026-07-22), not yet flown.**
+  The two axes the acceptance never touched. Both **default to off**, so the
+  three flown arms reproduce from the same command line — there is a test that
+  asserts exactly that.
+  - `nav.DropoutModel` (`--dropout-interval <m> --dropout-duration <s>`) — lock
+    loss as **silence**, not as a degraded pose: the bridge withholds the publish
+    entirely, because that is what a VIO that has lost tracking does. Onset is a
+    Poisson process in **distance** (reproducible across publish rates), duration
+    in **seconds** (re-acquisition is an estimator property). The sample is still
+    *recorded* with `ev:"down"` — dropping the record too would make a dropout
+    indistinguishable from the bridge dying. Drift keeps accruing while down.
+  - `nav.YawWalker` (`--yaw-bias <deg> --yaw-drift <deg/100 m>`) — heading error
+    added in the NED/FRD frame and wrapped; roll and pitch stay truth, since
+    gravity observes them. Its **own RNG**, so enabling it cannot shift the
+    position-drift draws (asserted bit-for-bit).
+  - Sized against the real flown truth track (open loop — this picks parameters,
+    it does **not** predict corridor deviation): `--dropout-interval 800` → 4
+    losses / 99.2 % uptime over 5.13 km; `500` → 6 / 98.2 %; `250 --dropout-duration 5`
+    → 15 / 92.7 %. `--yaw-drift 1.0` → 7.7° max heading error, `2.0` → 15.4°.
+  - **⏭ Arms are wired and ready to fly — `run_ev_arm.sh dropout | yaw` (and the
+    follow-on `dropout-long`). Procedure, predictions and what to watch:
+    RUNBOOK §3d.** Each adds one axis on top of the `vtrn` basemap, so the flown
+    `vtrn` arm (11.8 m) is their control and **no control re-flight is needed**.
+    Run them one at a time.
+  - 🔑 **The dropout pair is designed around EKF2's 5 s `EKF2_NOAID_TOUT`** (PX4
+    default; *not* set in `gps_denied_ekf2.params`, so confirm with
+    `param show EKF2_NOAID_TOUT` before flying). 3 s = under it → EKF2 should ride
+    through the gap on IMU. 6 s = over it → horizontal position goes invalid and
+    the **position-loss failsafe** fires — that failsafe is still live (only
+    `NAV_DLL_ACT` and `SIM_BAT_DRAIN` are neutralised), and it is the genuinely
+    untested path. For `dropout-long` the *failsafe behaviour is the result*, not
+    the corridor number.
+  - ⚠️ **The yaw arm cannot be judged from the console.** A heading error makes
+    the vehicle fly a rotated frame while still believing it is on route, so
+    `est-pub` stays near zero while the true track bows away. Only the corridor
+    number catches it — a clean-looking run means nothing here.
+
+- 🐛 **Found while building it: `DriftWalker`'s heading wander is a no-op at
+  bridge granularity.** Its per-step deviation scales with distance, but a random
+  walk needs **√distance** (variance adds, not deviation). At the bridge's ~0.24 m
+  steps the accumulated wander collapses to ~0, so injected drift is a **straight
+  line, not the "biased random walk" the docstring claims**. The flown control arm
+  proves it: exactly 1.98 / 3.99 / 5.99 / 8.00 m at 100/200/300/400 m on a constant
+  146.5° bearing. Position *magnitude* is barely affected (39.9 m vs 40.0 m over
+  2 km, since a frozen heading still accrues `rate × distance`) — it is the
+  *shape* that is wrong, and a coherent straight-line offset is far easier for
+  VTRN to correct than a wandering one. **Deliberately NOT fixed**: the three arms
+  and the 40-seed MC were all measured with it, and silently correcting it would
+  invalidate them. `YawWalker` uses the correct √ scaling; both behaviours are
+  pinned by tests (`test_yaw_walk_is_step_size_invariant`,
+  `test_drift_walker_heading_wander_is_step_size_dependent`). **Decide before the
+  next MC run**, since it changes what "2 % drift" means.
+
+- 🧹 **Adjacent fix from the logs:** the `est-pub` readback printed
+  **5421242.25 m** on the first sample of all four SITL runs (EKF2 has no origin
+  yet, so `position_velocity_ned` reads out in another frame). The RUNBOOK tells
+  operators to watch that number, so it now prints `(no EKF2 origin yet)` instead.
+  Also: `run_ev_arm.sh`'s arm/seed banner goes to the terminal, **not** into the
+  tee'd log, so the arm logs never recorded which seed produced them — the bridge
+  now prints seeds and both new axes into its own banner, which does get tee'd.
+
+  Full procedure and pitfalls for re-running the arms: **RUNBOOK §3c**.
 
 - ⚠️ **Workflow: the VM syncs by `git pull`** from `github.com/muzard/{droneplanner,droneflight}`.
   Both repos are cloned in the guest — droneflight is installed, droneplanner is
@@ -281,7 +387,10 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   **duplicate waypoint clusters** (0.2–1.0 m apart) — 77 waypoints, only ~25
   distinct. Wastes autopilot mission slots and makes logs noisy. Needs a
   minimum-spacing filter on the emitted waypoints.
-- ⏭ **Next build items:** **fly the EV bridge on the VM** (RUNBOOK §3b — it is
-  built but unflown, and that is the only thing that turns Slice 3 green), then
-  the **v0 tether disturbance plugin** (`sitl/`) to validate the speed policy
-  against payout physics.
+- ⏭ **Next build items:** **fly the dropout and yaw arms on the VM** (both are
+  built and unit-tested but unflown — the failsafe path and the yaw→position
+  coupling can only be seen in the loop), then the **v0 tether disturbance
+  plugin** (`sitl/`) to validate the speed policy against payout physics. Cheap
+  analysis wins meanwhile: re-run the MC with forest-frac and stale-frac varied
+  *separately* (the flown conflict arm showed only forest-frac doing damage), and
+  settle the `DriftWalker` √distance question above.

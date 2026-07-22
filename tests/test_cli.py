@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -386,3 +387,96 @@ def test_ev_report_reports_a_missing_record(tmp_path: Path) -> None:
     plan = tmp_path / "m.plan"
     _write_plan(plan)
     assert app(["ev-report", "--plan", str(plan), "--record", str(tmp_path / "nope.jsonl")]) == 2
+
+
+def test_live_monitor_names_the_pre_origin_readback_instead_of_printing_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Guard the 5,421,242 m first sample seen in all four SITL runs.
+
+    Before EKF2 has a global origin, `position_velocity_ned` reads out in another
+    frame and the est-pub delta comes back in the millions. The RUNBOOK tells
+    operators to watch this number, so printing it verbatim reliably starts a
+    hunt for a bug that is not there.
+    """
+    from droneflight.cli import _live_monitor
+    from droneflight.ev_bridge import BridgeSample, VisionPose
+
+    def sample(t: float, est: tuple[float, float, float]) -> BridgeSample:
+        return BridgeSample(
+            t_s=t,
+            truth_enu=(0.0, 0.0, 30.0),
+            error_en=(0.0, 0.0),
+            published=VisionPose(0.0, 0.0, -30.0, 0.0, 0.0, 0.0),
+            estimate_ned=est,
+        )
+
+    monitor = _live_monitor(interval_s=5.0)
+    monitor(sample(0.0, (-5089753.0, -1866623.125, -0.097)))  # the observed value
+    monitor(sample(6.0, (0.4, 0.1, -30.0)))  # settled
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert "no EKF2 origin yet" in lines[0]
+    assert "5421242" not in lines[0]
+    assert "est-pub= 0.41 m" in lines[1]
+
+
+def test_live_monitor_flags_ev_dropout(capsys: pytest.CaptureFixture[str]) -> None:
+    from droneflight.cli import _live_monitor
+    from droneflight.ev_bridge import BridgeSample, VisionPose
+
+    monitor = _live_monitor(interval_s=0.0)
+    monitor(
+        BridgeSample(
+            t_s=1.0,
+            truth_enu=(0.0, 0.0, 30.0),
+            error_en=(1.0, 0.0),
+            published=VisionPose(0.0, 0.0, -30.0, 0.0, 0.0, 0.0),
+            ev_down=True,
+        )
+    )
+    assert "[EV DOWN]" in capsys.readouterr().out
+
+
+def test_format_bridge_stats_reports_dropout_and_yaw() -> None:
+    from droneflight.cli import _format_bridge_stats
+    from droneflight.ev_bridge import EvBridgeStats
+
+    lines = _format_bridge_stats(
+        EvBridgeStats(
+            samples=100,
+            published=90,
+            dropout_events=3,
+            dropout_suppressed=10,
+            max_yaw_error_rad=math.radians(4.5),
+        )
+    )
+    joined = "\n".join(lines)
+    assert "3 lock losses, 10 publishes withheld (90.0% uptime)" in joined
+    assert "yaw error: max 4.50" in joined
+
+    # Silent when neither axis is enabled — the flown arms must not grow noise.
+    assert len(_format_bridge_stats(EvBridgeStats(samples=10, published=10))) == 2
+
+
+def test_build_injector_wires_the_yaw_axis(tmp_path: Path) -> None:
+    from droneflight.cli import _build_injector
+    from droneflight.plan_loader import load_qgc_plan
+
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    mission = load_qgc_plan(plan)
+
+    off = _build_injector(_ev_args(), mission)
+    on = _build_injector(_ev_args(yaw_bias=7.0), mission)
+    assert off.yaw_error_rad == 0.0
+    assert on.yaw_error_rad == pytest.approx(math.radians(7.0))
+
+
+def test_ev_bridge_parser_defaults_keep_both_new_axes_off() -> None:
+    """The acceptance arms must be reproducible from the same command line."""
+    from droneflight.cli import build_parser
+
+    args = build_parser().parse_args(["ev-bridge", "--plan", "x.plan"])
+    assert args.dropout_interval == 0.0
+    assert args.yaw_bias == 0.0
+    assert args.yaw_drift == 0.0

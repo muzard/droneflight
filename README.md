@@ -23,7 +23,8 @@ verifiable without hardware.
 | **Closed-loop forest sim** (`reactive.py`) | ✅ flies the route through trees; avoidance ON vs OFF |
 | **GPS-denied nav emulation** (`nav.py`) | ✅ VIO drift + VTRN correction (idealised + fidelity-limited) |
 | **Optical terrain-relative correction** (`correction.py`) | ✅ data-driven fixes over a spatially varying basemap; confidence + innovation gating |
-| **External-vision injection** (`ev_bridge.py`) | ✅ built + tested offline; ⚠️ **not yet flown** — Gazebo truth + injected error → PX4 EKF2 |
+| **External-vision injection** (`ev_bridge.py`) | ✅ Gazebo truth + injected error → PX4 EKF2; **flown GPS-denied**, 3-arm acceptance passed (2026-07-22) |
+| **EV dropout + yaw error** (`nav.py`) | ✅ built + unit-tested; ⚠️ **not yet flown** — `--dropout-interval`, `--yaw-bias`, `--yaw-drift` (all off by default) |
 | MAVSDK adapter (`mavsdk_connector.py`) | ⚠️ live path — runs against SITL, not unit-tested |
 | PX4 SITL + Gazebo tether model | ⏳ RUNBOOK + config; needs the Ubuntu sim host |
 | Real onboard perception (VIO/VTRN/LIO estimator) | later — separate effort |

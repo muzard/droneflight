@@ -39,7 +39,15 @@ from droneflight.ev_bridge import (
     resolve_truth_topic,
 )
 from droneflight.model import FlightMission, Waypoint
-from droneflight.nav import DriftConfig, ErrorInjector, _densify, route_reference
+from droneflight.nav import (
+    DriftConfig,
+    DropoutConfig,
+    DropoutModel,
+    ErrorInjector,
+    YawDriftConfig,
+    _densify,
+    route_reference,
+)
 
 # --------------------------------------------------------------------------- #
 # Frames
@@ -651,3 +659,186 @@ def test_correction_ramp_defaults_to_instant_so_offline_is_unchanged() -> None:
         DriftConfig(seed=1), route_reference(_mission(), seed=1, home_relative=True)
     )
     assert injector.correction_ramp_m == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# EV dropout and yaw error at the autopilot boundary
+#
+# Both axes were unexercised by the three acceptance flights: the vision stream
+# ran unbroken for 94,753 samples and heading was always ground truth. These
+# tests pin the boundary behaviour — what PX4 does or does not receive.
+# --------------------------------------------------------------------------- #
+
+
+def _dropout(interval_m: float, duration_s: float = 2.0, seed: int = 1) -> DropoutModel:
+    return DropoutModel(DropoutConfig(mean_interval_m=interval_m, duration_s=duration_s, seed=seed))
+
+
+async def test_dropout_withholds_publishes_but_still_records_every_sample() -> None:
+    """A lock loss must look like silence to PX4 — and like data to the analyst.
+
+    Dropping the record too would make a dropout indistinguishable from the
+    bridge itself dying, which is the opposite of the thing under test.
+    """
+    seen: list[BridgeSample] = []
+    bridge = EvBridge(
+        ErrorInjector(DriftConfig(rate=0.02, seed=3)),
+        EvBridgeConfig(rate_hz=0.0),
+        dropout=_dropout(50.0),
+        on_sample=seen.append,
+    )
+    pub = RecordingPublisher()
+    stats = await bridge.run(ReplayTruthSource(_straight_truth()), pub)
+
+    assert stats.dropout_events > 0
+    assert stats.dropout_suppressed > 0
+    assert len(seen) == stats.samples == 200  # every sample recorded
+    assert len(pub.poses) == stats.published < 200  # ...but not every one sent
+    assert stats.published + stats.dropout_suppressed == 200
+    assert sum(s.ev_down for s in seen) == stats.dropout_suppressed
+
+
+async def test_no_dropout_model_publishes_everything() -> None:
+    bridge = EvBridge(ErrorInjector(DriftConfig(seed=3)), EvBridgeConfig(rate_hz=0.0))
+    pub = RecordingPublisher()
+    stats = await bridge.run(ReplayTruthSource(_straight_truth()), pub)
+    assert stats.published == 200
+    assert stats.dropout_events == stats.dropout_suppressed == 0
+    assert stats.ev_uptime == 1.0
+
+
+async def test_ev_uptime_is_the_fraction_actually_sent() -> None:
+    from droneflight.ev_bridge import EvBridgeStats
+
+    assert EvBridgeStats(published=90, dropout_suppressed=10).ev_uptime == pytest.approx(0.9)
+    assert EvBridgeStats().ev_uptime == 1.0  # nothing due yet != 0% uptime
+
+
+async def test_dropout_does_not_freeze_the_error_model() -> None:
+    """Losing the link does not stop the world: drift keeps accruing while down.
+
+    If the injector only advanced on published samples, a dropout would look
+    like a pause in drift and the vehicle would come back with less error than
+    it should — flattering exactly the failure this axis exists to expose.
+    """
+    injector = ErrorInjector(DriftConfig(rate=0.02, seed=5))
+    bridge = EvBridge(injector, EvBridgeConfig(rate_hz=0.0), dropout=_dropout(30.0))
+    stats = await bridge.run(ReplayTruthSource(_straight_truth()), RecordingPublisher())
+
+    clean = ErrorInjector(DriftConfig(rate=0.02, seed=5))
+    clean_bridge = EvBridge(clean, EvBridgeConfig(rate_hz=0.0))
+    clean_stats = await clean_bridge.run(ReplayTruthSource(_straight_truth()), RecordingPublisher())
+
+    assert stats.dropout_suppressed > 0
+    assert stats.final_error_m == pytest.approx(clean_stats.final_error_m)
+    assert injector.distance_m == pytest.approx(clean.distance_m)
+
+
+async def test_dropout_off_reproduces_the_flown_runs_bit_for_bit() -> None:
+    """The three acceptance arms must still be reproducible after this change."""
+
+    async def poses(**kw: object) -> list[tuple[float, float, float, float]]:
+        bridge = EvBridge(
+            ErrorInjector(DriftConfig(rate=0.02, seed=0)), EvBridgeConfig(rate_hz=0.0), **kw
+        )  # type: ignore[arg-type]
+        pub = RecordingPublisher()
+        await bridge.run(ReplayTruthSource(_straight_truth()), pub)
+        return [(p.north_m, p.east_m, p.down_m, p.yaw_rad) for p in pub.poses]
+
+    assert await poses() == await poses(dropout=None)
+
+
+async def test_yaw_error_rotates_heading_only() -> None:
+    injector = ErrorInjector(DriftConfig(rate=0.0, seed=1), yaw=YawDriftConfig(bias_deg=12.0))
+    _stats, pub = await _run(injector, _straight_truth(), rate_hz=0.0)
+
+    clean = ErrorInjector(DriftConfig(rate=0.0, seed=1))
+    _clean_stats, clean_pub = await _run(clean, _straight_truth(), rate_hz=0.0)
+
+    a, b = pub.poses[-1], clean_pub.poses[-1]
+    assert (a.north_m, a.east_m, a.down_m) == (b.north_m, b.east_m, b.down_m)
+    assert a.roll_rad == b.roll_rad and a.pitch_rad == b.pitch_rad
+    assert a.yaw_rad - b.yaw_rad == pytest.approx(math.radians(12.0))
+
+
+async def test_published_yaw_stays_wrapped_under_a_large_heading_error() -> None:
+    """A walked heading error must never hand PX4 a yaw outside [-pi, pi]."""
+    injector = ErrorInjector(DriftConfig(rate=0.0, seed=1), yaw=YawDriftConfig(bias_deg=300.0))
+    _stats, pub = await _run(injector, _straight_truth(), rate_hz=0.0)
+    assert all(-math.pi <= p.yaw_rad <= math.pi for p in pub.poses)
+
+    # An identity ENU attitude is yaw = +pi/2 in NED, so 90 + 300 = 390 deg must
+    # come back as 30 deg — wrapped, not handed over as a 390 deg command.
+    clean = ErrorInjector(DriftConfig(rate=0.0, seed=1))
+    _clean_stats, clean_pub = await _run(clean, _straight_truth(), rate_hz=0.0)
+    assert clean_pub.poses[-1].yaw_rad == pytest.approx(math.pi / 2)
+    assert pub.poses[-1].yaw_rad == pytest.approx(math.radians(30.0))
+
+
+async def test_yaw_error_is_reported_in_stats_and_record() -> None:
+    injector = ErrorInjector(
+        DriftConfig(rate=0.02, seed=2), yaw=YawDriftConfig(wander_deg_per_100m=8.0, seed=1)
+    )
+    seen: list[BridgeSample] = []
+    bridge = EvBridge(injector, EvBridgeConfig(rate_hz=0.0), on_sample=seen.append)
+    stats = await bridge.run(ReplayTruthSource(_straight_truth()), RecordingPublisher())
+    assert stats.max_yaw_error_rad > 0.0
+    assert stats.max_yaw_error_rad == pytest.approx(max(abs(s.yaw_error_rad) for s in seen))
+
+
+def test_record_serialises_dropout_and_yaw_only_when_present() -> None:
+    from droneflight.ev_bridge import VisionPose
+
+    base = dict(
+        t_s=1.0,
+        truth_enu=(1.0, 2.0, 30.0),
+        error_en=(0.5, 0.5),
+        published=VisionPose(2.0, 1.5, -30.0, 0.0, 0.0, 0.1),
+    )
+    quiet = BridgeSample(**base).to_dict()  # type: ignore[arg-type]
+    assert "ev" not in quiet and "yaw_err" not in quiet
+
+    loud = BridgeSample(**base, ev_down=True, yaw_error_rad=0.25).to_dict()  # type: ignore[arg-type]
+    assert loud["ev"] == "down"
+    assert loud["yaw_err"] == pytest.approx(0.25)
+
+
+async def test_dropout_and_yaw_survive_a_record_round_trip(tmp_path: Path) -> None:
+    """A recorded run must still know it dropped out when `ev-report` reads it.
+
+    The bridge and the analyser are separated by a JSONL file, so a field that is
+    written but never parsed back is silently lost — which is how a dropout arm
+    would come back looking exactly like a clean one.
+    """
+    path = tmp_path / "run.jsonl"
+    injector = ErrorInjector(
+        DriftConfig(rate=0.02, seed=1), yaw=YawDriftConfig(wander_deg_per_100m=6.0, seed=2)
+    )
+    with TrackRecorder(path) as rec:
+        bridge = EvBridge(
+            injector,
+            EvBridgeConfig(rate_hz=0.0),
+            recorder=rec,
+            dropout=DropoutModel(DropoutConfig(mean_interval_m=60.0, duration_s=1.0, seed=1)),
+        )
+        stats = await bridge.run(ReplayTruthSource(_straight_truth()), RecordingPublisher())
+
+    back = load_track(path)
+    assert len(back) == stats.samples
+    assert sum(s.ev_down for s in back) == stats.dropout_suppressed > 0
+    assert max(abs(s.yaw_error_rad) for s in back) == pytest.approx(
+        stats.max_yaw_error_rad, abs=1e-5
+    )
+
+
+def test_load_track_defaults_the_new_fields_for_older_records(tmp_path: Path) -> None:
+    """The three flown acceptance records predate both fields — they must still load."""
+    path = tmp_path / "old.jsonl"
+    path.write_text(
+        '{"t":1,"truth":{"e":0,"n":0,"u":30},'
+        '"err":{"e":0,"n":0},"pub":{"n":0,"e":0,"d":-30,"yaw":0},"mode":"MISSION"}\n',
+        encoding="utf-8",
+    )
+    (sample,) = load_track(path)
+    assert sample.ev_down is False
+    assert sample.yaw_error_rad == 0.0

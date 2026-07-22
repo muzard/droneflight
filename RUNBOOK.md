@@ -626,21 +626,29 @@ involving the autopilot.
 
 ## 3c. The GPS-denied acceptance experiment (three arms)
 
-**Status: all three arms are UNRUN.** A 77/77 flight on 2026-07-22 completed
-within the corridor, but two defects found afterwards make it void as evidence
-(see CLAUDE.md): the reference basemap was silently degenerate, and VTRN fixes
-were teleported into the published pose. Both are fixed; the arms must be flown
-on the fixed code.
+**Status: ✅ all three arms FLOWN on the fixed code, 2026-07-22 — and they
+separated.** Measured (MISSION phase, 15 m corridor): A `vtrn` **11.8 m WITHIN**,
+B `novtrn` **103.2 m LEFT**, C `conflict` **25.6 m LEFT**. ULogs
+`sim-logs/{14_53_15,15_16_47,15_33_55}.ulg`, records
+`sim-logs/ev-{vtrn,novtrn,conflict}.jsonl`. Full analysis, mechanism and residual
+defects: CLAUDE.md → Slice 3. The procedure below is retained for re-running.
+
+*(An earlier 77/77 flight the same day is void as evidence — degenerate basemap
+plus teleported fixes, both since fixed.)*
 
 The three arms differ **only** in the basemap handed to the VTRN corrector.
 Everything else — plan, seeds, params, ramp — is held constant, so a difference
 in outcome can only come from the navigation.
 
-| Arm | Basemap | Offline prediction (seed 0) | Expected verdict |
-|---|---|---|---|
-| **A `vtrn`** | 40 % forest / 10 % stale | max dev **15.0 m**, 55/107 fixes | WITHIN (marginal!) |
-| **B `novtrn`** | none — dead reckoning | max dev **106.4 m**, no fixes | LEFT |
-| **C `conflict`** | 70 % forest / 30 % stale | max dev **21.9 m**, 25/107 fixes | LEFT |
+| Arm | Basemap | Offline prediction (seed 0) | **Measured 2026-07-22** | Verdict |
+|---|---|---|---|---|
+| **A `vtrn`** | 40 % forest / 10 % stale | max dev **15.0 m**, 55/107 fixes | max dev **11.8 m**, 28/62 fixes | **WITHIN** |
+| **B `novtrn`** | none — dead reckoning | max dev **106.4 m**, no fixes | max dev **103.2 m**, no fixes | LEFT |
+| **C `conflict`** | 70 % forest / 30 % stale | max dev **21.9 m**, 25/107 fixes | max dev **25.6 m**, 10/68 fixes | LEFT |
+
+Deviation prediction was good to ~4 m in all three arms. Absolute *attempt* counts
+differ (62–68 flown vs 107 offline) because the offline study samples fix
+opportunities on its own cadence — compare availability ratios, not raw counts.
 
 ⚠️ **Arm A is predicted at 15.0 m against a 15 m tolerance** — it is a coin-flip at
 this seed, and over 40 seeds it fails 4 times. Do not treat a narrow pass or fail
@@ -692,6 +700,95 @@ the navigation.
   In arm B it should grow monotonically to ~100 m.
 * `progress watchdog: 565s` at `fly` start — a fixed 60 s aborted a healthy flight
   at 41/77 before this was derived from the plan.
+
+## 3d. The error-axis arms (dropout, yaw) — ⏭ NEXT, both UNFLOWN
+
+The three arms above varied the **basemap**. These vary the **error axis**, and
+each adds exactly one on top of the `vtrn` basemap — so the already-flown
+`vtrn` arm (**max dev 11.8 m**, 30 923 samples, 100 % EV uptime, heading = truth)
+is their control. **No control re-flight is needed.**
+
+Run them **one at a time**. Dropout and yaw fail through completely different
+mechanisms; combining them repeats the forest/stale mistake, where two knobs
+moved together and only one turned out to be doing the damage.
+
+| Arm | Adds | Why this value | Expect |
+|---|---|---|---|
+| `dropout` | lock loss ~every 500 m for **3 s** | **under** EKF2's 5 s `EKF2_NOAID_TOUT` | rides through; ~6 losses, 98.2 % uptime; mission completes; corridor a little worse than 11.8 m |
+| `yaw` | **1.0 °/100 m** heading drift | reaches ~7.7 ° by 5.13 km — big enough to steer, small enough not to be absurd | mission completes; true track bows off the route as the controller flies a rotated frame |
+| `dropout-long` *(follow-on)* | lock loss ~every 500 m for **6 s** | **over** the 5 s timeout | EKF2 declares horizontal position invalid → **position-loss failsafe fires**. This is the genuinely untested path |
+
+⚠️ **The 5 s number is the whole design of this experiment.** `EKF2_NOAID_TOUT`
+is *not* in `configs/px4/gps_denied_ekf2.params`, so PX4's 5 s default applies.
+Confirm it before flying — if this build differs, the 3 s and 6 s arms stop
+meaning "under" and "over" and the pair tests nothing:
+
+```bash
+# at pxh>
+param show EKF2_NOAID_TOUT
+```
+
+⚠️ **Only two failsafes are neutralised** (`NAV_DLL_ACT=0`, `SIM_BAT_DRAIN=0` in
+`sitl_bringup.params`). The **position-loss failsafe is live**, which is exactly
+why `dropout-long` is worth flying — and why `dropout` at 3 s should *not* trip it.
+
+### Running them
+
+Same three-pane flow as §3c — restart SITL per arm, re-add the endpoint:
+
+```bash
+# pane A — SITL
+./sitl/run_sitl.sh ~/drone/plans/ev_test.plan ~/drone/PX4-Autopilot
+#   at pxh>:   mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541
+#   confirm:   param show EKF2_GPS_CTRL      -> 0
+#   confirm:   param show EKF2_NOAID_TOUT    -> 5000000 (see above)
+
+# pane B — the arm. Wait for `est-pub` lines before starting pane C.
+./sitl/run_ev_arm.sh dropout ~/drone/plans/ev_test.plan ~/logs
+
+# pane C — fly it
+droneflight fly --plan ~/drone/plans/ev_test.plan --url udpin://0.0.0.0:14540 \
+    2>&1 | tee ~/logs/fly-dropout.log
+```
+
+Then repeat with `yaw`. Seeds stay pinned (`--seed 0 --fidelity-seed 1`), and the
+bridge now prints them into the tee'd log, so each run records what produced it.
+
+### What to watch — different from §3c
+
+* **`[EV DOWN]`** in the bridge's monitor line: the stream is being withheld.
+  Absent for the whole run means the dropout never fired — check the banner says
+  `ev dropout: every ~500 m for 3.0 s` rather than `OFF`.
+* **`est-pub` climbing during a gap, then snapping back** — EKF2 dead-reckoning on
+  IMU while vision is absent. It should recover; if it does not, the 3 s arm is
+  behaving like the 6 s one and the timeout is not what we think.
+* **The bridge's closing summary** now reports `ev dropout: N lock losses, M
+  publishes withheld (X% uptime)` and `yaw error: max D°`.
+* For `yaw`: the vehicle will fly a *heading-rotated* path but still believe it is
+  on route, so **`est-pub` stays near 0 while the true track bows away** — the
+  error is invisible in the readback by construction. Only the corridor number
+  catches it. This is the one arm where a clean-looking console means nothing.
+* For `dropout-long`: watch pane C for the failsafe. Note **what PX4 actually
+  does** (descend / land / hold) — that behaviour is the result, not the corridor
+  number, and the run may legitimately never complete the mission.
+
+### Reading them
+
+Each arm is scored against the flown `vtrn` record, not against each other:
+
+```bash
+droneflight ev-report --plan ~/drone/plans/ev_test.plan \
+    --record ~/logs/ev-vtrn.jsonl \
+    --record ~/logs/ev-dropout.jsonl \
+    --record ~/logs/ev-yaw.jsonl
+```
+
+`ev-report` reports EV uptime and max yaw error per record, so a run that
+silently had its axis disabled is visible rather than being read as a null result.
+
+⚠️ **Endpoint deviation is meaningless if `dropout-long` failsafes mid-route** —
+the report flags an incomplete route, but check `finished=` in the ULog before
+quoting any number from that arm.
 
 ## 4. Custom tether model (required build item)
 

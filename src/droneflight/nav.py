@@ -55,6 +55,50 @@ class VtrnConfig:
     residual_error_m: float = 2.0  # bounded error left after a fix
 
 
+@dataclass(frozen=True)
+class YawDriftConfig:
+    """Heading error of a GPS-denied estimator.
+
+    Yaw is the weak axis of a visual-inertial estimate: gravity observes roll and
+    pitch, but nothing observes heading, so it walks freely. Quoted per 100 m
+    rather than per second so the model stays reproducible whatever rate the
+    caller steps it at — the same reason :class:`DriftWalker` is distance-driven.
+
+    All-zero by default, which makes the yaw layer an exact no-op: existing
+    callers of :class:`ErrorInjector` keep their bit-identical results.
+    """
+
+    bias_deg: float = 0.0  # constant misalignment, present from the first sample
+    wander_deg_per_100m: float = 0.0  # random-walk growth of the heading error
+    seed: int = 0
+
+    @property
+    def active(self) -> bool:
+        return self.bias_deg != 0.0 or self.wander_deg_per_100m != 0.0
+
+
+@dataclass(frozen=True)
+class DropoutConfig:
+    """External-vision lock loss — the stream stops, rather than degrading.
+
+    Real VIO does not fade out; it loses tracking and publishes nothing until it
+    re-acquires. Onset is a Poisson process in **distance** (reproducible across
+    publish rates); duration is in **seconds**, because re-acquisition time is a
+    property of the estimator, not of how far the vehicle flew. The mixed units
+    are deliberate.
+
+    ``mean_interval_m = 0`` disables the layer entirely.
+    """
+
+    mean_interval_m: float = 0.0  # mean distance between lock losses (0 = never)
+    duration_s: float = 2.0  # how long each loss lasts
+    seed: int = 0
+
+    @property
+    def active(self) -> bool:
+        return self.mean_interval_m > 0.0
+
+
 class DriftWalker:
     """Incremental VIO/LIO drift — the stateful core of the drift model.
 
@@ -116,9 +160,13 @@ class ErrorInjector:
         config: CorrectionConfig | None = None,
         *,
         correction_ramp_m: float = 0.0,
+        yaw: YawDriftConfig | None = None,
     ) -> None:
         self.config = config or CorrectionConfig()
         self.reference = reference
+        # Heading error, off unless asked for. Its own RNG, so enabling it cannot
+        # shift the horizontal drift draws (see YawWalker).
+        self._yaw = YawWalker(yaw) if yaw is not None and yaw.active else None
         # Distance over which an accepted fix is bled into the reported error
         # instead of applied in one step. 0 = instant (the offline default).
         #
@@ -143,6 +191,11 @@ class ErrorInjector:
         return self._walker.error
 
     @property
+    def yaw_error_rad(self) -> float:
+        """Current heading error, radians. 0.0 when the yaw layer is off."""
+        return self._yaw.error_rad if self._yaw is not None else 0.0
+
+    @property
     def attempts(self) -> int:
         return sum(self.counts.values())
 
@@ -161,6 +214,8 @@ class ErrorInjector:
         if distance_m <= 0.0:
             return None
         self._walker.advance(distance_m)
+        if self._yaw is not None:
+            self._yaw.advance(distance_m)
         self._bleed_pending(distance_m)
         self.distance_m += distance_m
         if self.reference is None:
@@ -196,6 +251,107 @@ class ErrorInjector:
         ex, ey = self._walker.error
         self._walker.set_error((ex + px * frac, ey + py * frac))
         self._pending = (px * (1.0 - frac), py * (1.0 - frac))
+
+
+class YawWalker:
+    """Heading error that accrues with distance flown.
+
+    Kept separate from :class:`DriftWalker` — and drawing from its **own** RNG —
+    so that switching the yaw layer on cannot perturb the horizontal drift
+    sequence. Without that separation, adding a yaw axis would silently change
+    every existing position result, and the offline/online parity the whole
+    experiment rests on would break.
+    """
+
+    def __init__(self, config: YawDriftConfig, rng: random.Random | None = None) -> None:
+        self.config = config
+        self._rng = rng if rng is not None else random.Random(config.seed)
+        self._error = math.radians(config.bias_deg)
+        self.distance_m = 0.0
+
+    @property
+    def error_rad(self) -> float:
+        """Current heading error (estimate minus truth), radians, unwrapped."""
+        return self._error
+
+    def advance(self, distance_m: float) -> float:
+        """Accrue heading drift over ``distance_m`` and return the new error.
+
+        The per-step deviation scales with **sqrt** of distance, not distance.
+        That is what makes a random walk step-size invariant: variance adds, so
+        it must be variance that is proportional to distance. Scaling the
+        *deviation* linearly instead makes total variance proportional to
+        ``sum(d_i**2)``, which collapses toward zero as the caller steps more
+        finely — the walk quietly stops walking.
+
+        This is not hypothetical: :class:`DriftWalker` scales its heading wander
+        linearly, and at the bridge's ~0.24 m steps its heading is effectively
+        frozen. The flown control arm shows it — injected error of exactly
+        1.98/3.99/5.99/8.00 m at 100/200/300/400 m on a constant 146.5 deg
+        bearing, a straight line rather than the documented biased walk. That
+        model is left alone because the acceptance was measured with it; this
+        one is written correctly from the start.
+        """
+        if distance_m <= 0.0:
+            return self._error
+        self.distance_m += distance_m
+        if self.config.wander_deg_per_100m:
+            self._error += self._rng.gauss(
+                0.0, math.radians(self.config.wander_deg_per_100m) * math.sqrt(distance_m / 100.0)
+            )
+        return self._error
+
+
+class DropoutModel:
+    """Whether the external-vision estimate is available at this instant.
+
+    Stateful and deterministic. Onset is drawn as an exponential in travelled
+    distance; once a dropout starts it runs for ``duration_s`` of *simulator*
+    time, and the next onset is only scheduled after the current one clears (so
+    dropouts never overlap, which is what a single estimator does).
+    """
+
+    def __init__(self, config: DropoutConfig, rng: random.Random | None = None) -> None:
+        self.config = config
+        self._rng = rng if rng is not None else random.Random(config.seed)
+        self._distance_m = 0.0
+        self._next_onset_m: float | None = None
+        self._down_until_t: float | None = None
+        self.events = 0
+        self.samples_down = 0
+
+    @property
+    def down(self) -> bool:
+        return self._down_until_t is not None
+
+    def _schedule(self) -> None:
+        self._next_onset_m = self._distance_m + self._rng.expovariate(
+            1.0 / self.config.mean_interval_m
+        )
+
+    def step(self, distance_m: float, t_s: float) -> bool:
+        """Advance by ``distance_m`` at sim time ``t_s``; return True if EV is down."""
+        if not self.config.active:
+            return False
+        self._distance_m += max(0.0, distance_m)
+        if self._next_onset_m is None:
+            self._schedule()
+
+        if self._down_until_t is not None:
+            if t_s >= self._down_until_t:
+                self._down_until_t = None
+                self._schedule()
+            else:
+                self.samples_down += 1
+                return True
+
+        assert self._next_onset_m is not None
+        if self._distance_m >= self._next_onset_m:
+            self._down_until_t = t_s + self.config.duration_s
+            self.events += 1
+            self.samples_down += 1
+            return True
+        return False
 
 
 @dataclass(frozen=True)
