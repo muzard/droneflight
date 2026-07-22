@@ -232,3 +232,59 @@ def test_build_injector_no_vtrn_is_the_dead_reckoning_arm(tmp_path: Path) -> Non
         without.advance(10.0, 0.0, 0.0)
     assert with_vtrn.attempts > 0
     assert without.attempts == 0
+
+
+def _write_terrain_plan(path: Path) -> None:
+    """A plan whose relative altitudes dip below home, as terrain-following does."""
+    doc = {
+        "fileType": "Plan",
+        "version": 1,
+        "mission": {
+            "cruiseSpeed": 6.0,
+            "plannedHomePosition": [46.95, 15.0, 124.7],
+            "items": [
+                {"type": "SimpleItem", "command": 16, "params": [0, 0, 0, None, 46.95, 15.0, 30.0]},
+                {
+                    "type": "SimpleItem",
+                    "command": 16,
+                    "params": [0, 0, 0, None, 46.96, 15.0, -41.9],
+                },
+                {"type": "SimpleItem", "command": 22, "params": [0, 0, 0, None, 46.95, 15.0, 5.0]},
+            ],
+        },
+    }
+    path.write_text(json.dumps(doc))
+
+
+def test_validate_warns_about_waypoints_below_home(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan = tmp_path / "t.plan"
+    _write_terrain_plan(plan)
+    assert app(["validate", "--plan", str(plan)]) == 0
+    out = capsys.readouterr().out
+    assert "1/2 waypoints are BELOW the home point" in out
+    assert "underground" in out
+
+
+def test_flatten_plan_rewrites_only_nav_waypoints(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from droneflight.plan_loader import load_qgc_plan
+
+    plan, out = tmp_path / "t.plan", tmp_path / "flat.plan"
+    _write_terrain_plan(plan)
+    assert app(["flatten-plan", "--plan", str(plan), "--out", str(out), "--alt", "30"]) == 0
+    assert "flattened 2 waypoints" in capsys.readouterr().out
+
+    assert [w.alt_agl_m for w in load_qgc_plan(out).waypoints] == [30.0, 30.0]
+    # The non-waypoint item (command 22 = TAKEOFF) is left alone.
+    doc = json.loads(out.read_text())
+    assert doc["mission"]["items"][2]["params"][6] == 5.0
+    assert doc["mission"]["plannedHomePosition"] == [46.95, 15.0, 124.7]
+
+
+def test_flatten_plan_rejects_a_plan_with_no_waypoints(tmp_path: Path) -> None:
+    plan, out = tmp_path / "t.plan", tmp_path / "flat.plan"
+    plan.write_text(json.dumps({"fileType": "Plan", "mission": {"items": []}}))
+    assert app(["flatten-plan", "--plan", str(plan), "--out", str(out)]) == 2

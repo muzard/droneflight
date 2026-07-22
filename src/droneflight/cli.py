@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import signal
@@ -38,7 +39,12 @@ from droneflight.nav import (
     simulate_corrected_navigation,
     simulate_navigation,
 )
-from droneflight.plan_loader import PlanLoadError, load_qgc_plan
+from droneflight.plan_loader import (
+    PlanLoadError,
+    flatten_plan_altitudes,
+    load_plan_document,
+    load_qgc_plan,
+)
 from droneflight.sensors import SensorSelectionError, select_sensor_mode
 from droneflight.sitl_launch import format_env_exports, px4_home_env
 
@@ -68,6 +74,19 @@ def _validate(args: argparse.Namespace) -> int:
     print(f"sensor mode: {sensor.mode.value} (covert={sensor.covert})")
     for warning in sensor.warnings:
         print(f"  warning: {warning}")
+
+    alts = [w.alt_agl_m for w in mission.waypoints]
+    print(f"altitude (relative to home): {min(alts):.1f} .. {max(alts):.1f} m")
+    below = sum(1 for a in alts if a < 0.0)
+    if below:
+        # Relative-to-home altitudes go negative wherever the terrain drops away
+        # from the launch point — correct over real terrain, underground in PX4's
+        # flat default.sdf. See `flatten-plan`.
+        print(
+            f"  warning: {below}/{len(alts)} waypoints are BELOW the home point "
+            f"(min {min(alts):.1f} m). Correct over real terrain; in a FLAT sim "
+            f"world they are underground — use `droneflight flatten-plan` first."
+        )
     return 0
 
 
@@ -159,6 +178,23 @@ def _sitl_env(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(format_env_exports(px4_home_env(mission)))
+    return 0
+
+
+def _flatten_plan(args: argparse.Namespace) -> int:
+    """Rewrite a plan to a constant altitude — flat-world SITL testing only."""
+    try:
+        doc = load_plan_document(args.plan)
+        doc, changed = flatten_plan_altitudes(doc, args.alt)
+    except PlanLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    args.out.write_text(json.dumps(doc, indent=4), encoding="utf-8")
+    print(f"flattened {changed} waypoints to {args.alt:.1f} m above home -> {args.out}")
+    print(
+        "  ⚠️  terrain-following is GONE from this plan. It is for PX4's flat "
+        "default.sdf only — never fly it over real terrain."
+    )
     return 0
 
 
@@ -458,6 +494,16 @@ def app(argv: list[str] | None = None) -> int:
     )
     se.add_argument("--plan", type=Path, required=True)
     se.set_defaults(func=_sitl_env)
+
+    fp = sub.add_parser(
+        "flatten-plan",
+        help="Rewrite a plan to a constant altitude for PX4's FLAT world (destroys "
+        "terrain-following).",
+    )
+    fp.add_argument("--plan", type=Path, required=True)
+    fp.add_argument("--out", type=Path, required=True)
+    fp.add_argument("--alt", type=float, default=30.0, help="Altitude above home (m).")
+    fp.set_defaults(func=_flatten_plan)
 
     eb = sub.add_parser(
         "ev-bridge",

@@ -151,7 +151,7 @@ MAVSDK_SERVER_ARCH=aarch64 pip install --force-reinstall --no-cache-dir mavsdk
 ls -l ~/PX4-Autopilot/build/px4_sitl_default/bin/px4   # the build actually produced a binary
 gz sim --versions                                      # Gazebo present
 python -c "import mavsdk; print('mavsdk ok')"
-pytest -q                                              # 68 passed => package is sane
+pytest -q                                              # 119 passed => package is sane
 droneflight validate --plan /path/to/mission.plan      # offline path works
 groups | grep -q dialout && echo "dialout ok" || echo "no dialout (fine for SITL)"
 ```
@@ -222,7 +222,7 @@ cp ~/droneplanner/demo_ao/worlds/planner_terrain.sdf \
 **The `.plan`** is a build artifact — copy it across:
 
 ```bash
-scp <mac>:/path/to/droneplanner/out/mission.plan  ~/plans/    # from the VM, or scp from the Mac
+scp <mac>:/path/to/DroneAutomation/plans/ev_test.plan ~/plans/   # from the VM, or scp from the Mac
 ```
 
 For a *fixed* SITL regression plan that should travel with the repo, note
@@ -414,6 +414,27 @@ box (Track B).
 Use the **flat `default.sdf`**. Terrain is parked (§2b) and irrelevant here: the
 error is injected, not sensed from the ground.
 
+### 3b.0 ⚠️ Flatten the plan first (or it flies underground)
+
+A terrain-following plan is relative **to home**, so wherever the ground drops
+away from the launch point its altitudes go *negative* — the demo AO route dips to
+**−41.9 m**. That is correct over real terrain and suicidal in a flat world, where
+"below home" is underground. The mission would fail on the land detector for
+reasons that have nothing to do with navigation.
+
+`flatten-plan` keeps the horizontal route — the turns and corridor the concealment
+planner chose, which is what the EV experiment measures — and removes the vertical
+confound:
+
+```bash
+droneflight flatten-plan --plan out_demo/mission.plan --out ~/plans/ev_test.plan --alt 30
+droneflight validate     --plan ~/plans/ev_test.plan     # expect "30.0 .. 30.0 m", no warning
+```
+
+`validate` now prints the altitude range and warns when waypoints sit below home,
+so this cannot silently reach SITL again. **Never fly a flattened plan over real
+terrain** — terrain-following is gone from it.
+
 ### 3b.1 Two MAVLink endpoints
 
 `droneflight fly` binds `udp://:14540`, so the bridge needs its own endpoint —
@@ -448,14 +469,14 @@ lock.
 
 ```bash
 # shell A — PX4 SITL at the plan's home, flat world
-./sitl/run_sitl.sh ~/plans/mission.plan ~/PX4-Autopilot
+./sitl/run_sitl.sh ~/plans/ev_test.plan ~/PX4-Autopilot
 
 # shell B — the vision stream (VTRN fixes ON)
-droneflight ev-bridge --plan ~/plans/mission.plan --url udp://:14541 \
+droneflight ev-bridge --plan ~/plans/ev_test.plan --url udp://:14541 \
     --record ~/logs/ev-vtrn.jsonl
 
 # shell C — once shell B shows est-pub settling near 0, fly the mission
-droneflight fly --plan ~/plans/mission.plan --url udp://:14540
+droneflight fly --plan ~/plans/ev_test.plan --url udp://:14540
 ```
 
 Shell B prints a line every 5 s of sim time:
@@ -497,9 +518,9 @@ twice, changing only the fixes:
 
 ```bash
 # arm A — VTRN fixes ON (should hold the corridor)
-droneflight ev-bridge --plan ~/plans/mission.plan --record ~/logs/ev-vtrn.jsonl
+droneflight ev-bridge --plan ~/plans/ev_test.plan --record ~/logs/ev-vtrn.jsonl
 # arm B — dead reckoning only (should wander out)
-droneflight ev-bridge --plan ~/plans/mission.plan --no-vtrn \
+droneflight ev-bridge --plan ~/plans/ev_test.plan --no-vtrn \
     --record ~/logs/ev-novtrn.jsonl
 ```
 
@@ -507,7 +528,7 @@ Each run prints the corridor result on the **true** (Gazebo) track at the end, a
 `--record` keeps the track for later:
 
 ```bash
-droneflight ev-report --plan ~/plans/mission.plan --record ~/logs/ev-novtrn.jsonl
+droneflight ev-report --plan ~/plans/ev_test.plan --record ~/logs/ev-novtrn.jsonl
 ```
 
 Pass = arm A `WITHIN corridor`, arm B `LEFT the corridor`. ⚠️ It only means
@@ -588,7 +609,7 @@ the `FlightResult` is printed once and discarded. Nothing is written to a file.
 Capture it yourself:
 
 ```bash
-droneflight fly --plan ~/plans/mission.plan --url udp://:14540 2>&1 | tee ~/logs/fly-$(date +%F-%H%M).log
+droneflight fly --plan ~/plans/ev_test.plan --url udp://:14540 2>&1 | tee ~/logs/fly-$(date +%F-%H%M).log
 ```
 
 Or log a whole tmux pane continuously:
