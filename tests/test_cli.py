@@ -525,3 +525,50 @@ def test_ev_report_table_shows_uptime_and_yaw(
     assert "5.7" in out  # 0.1 rad of yaw, in degrees
     # And the reader is warned not to read a flat corridor as "no effect".
     assert "near-blind to yaw" in out
+
+
+def test_tether_check_reports_policy_validation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)
+    rc = app(["tether-check", "--plan", str(plan)])
+    out = capsys.readouterr().out
+    assert rc in (0, 1)
+    assert "tether v0" in out
+    assert "no policy (flat cruise)" in out
+    assert "speed policy" in out
+
+
+def test_tether_check_flags_a_break_and_exits_nonzero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A reversal plan plus a tiny break budget: flat cruise must SNAP.
+    doc = {
+        "fileType": "Plan",
+        "version": 1,
+        "mission": {
+            "cruiseSpeed": 6.0,
+            "plannedHomePosition": [46.90, 15.0, 30.0],
+            "items": [
+                {"type": "SimpleItem", "command": 16, "params": [0, 0, 0, None, 46.90, 15.0, 30.0]},
+                {
+                    "type": "SimpleItem",
+                    "command": 16,
+                    "params": [0, 0, 0, None, 46.9018, 15.0, 30.0],
+                },
+                {
+                    "type": "SimpleItem",
+                    "command": 16,
+                    "params": [0, 0, 0, None, 46.9002, 15.0, 30.0],
+                },
+            ],
+        },
+    }
+    plan = tmp_path / "rev.plan"
+    plan.write_text(json.dumps(doc))
+    rc = app(["tether-check", "--plan", str(plan), "--break-tension", "1.0"])
+    out = capsys.readouterr().out
+    assert "SNAP" in out
+    assert "prevents" in out  # the policy saves what flat cruise would break
+    assert rc == 0  # policy arm stays within the limit even though flat cruise does not

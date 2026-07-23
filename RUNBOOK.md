@@ -807,7 +807,36 @@ silently had its axis disabled is visible rather than being read as a null resul
 the report flags an incomplete route, but check `finished=` in the ULog before
 quoting any number from that arm.
 
-## 3e. `dropout-long`, magnetometer denied — ⏭ NEXT, UNFLOWN
+## 3e. `dropout-long`, magnetometer denied — ✅ FLOWN 2026-07-22
+
+**Result (`sim-logs/21_16_45.ulg`): the position-loss failsafe fired at all 6
+gaps and the aircraft rode through — mission COMPLETED 77/77.** Each 6 s gap
+crossed `EKF2_NOAID_TOUT`, PX4 entered DESCEND for ~2.7 s, then resumed
+AUTO_MISSION when vision returned. Two findings:
+
+* 🔴 **Failsafe action is DESCEND at 0.7 m/s — wrong direction for a NOE
+  fiber-layer.** ~2.2 m given up per gap, ~13 m cumulative, toward the ground.
+  Same class as the Slice-1 RTL-to-61 m defect; the action must be a deliberate
+  choice (hold, not sink). Flagged, not changed.
+* 🔵 **Heading was BETTER mag-denied (1.88°) than the 3 s mag-on arm (12.40°)** —
+  the earlier excursion was the EV↔mag handoff, not the EV loss. **Confirmed
+  single-variable by arms F and G (flown same day):** F (`22_32_36.ulg`, 6 s gaps,
+  mag ON) = **11.77°**; G (`22_54_38.ulg`, no dropout, mag denied) = 2.19° = arm A.
+  So mag denial is harmless with continuous EV and only helps at a dropout.
+  Residual caveat: SITL gyro is low-drift, so the coast may be worse on real
+  hardware.
+
+⚠️ **F/G filename mixup (identify by ULog `EKF2_MAG_TYPE`, not by name):** F's
+bridge record is a 15 s stub — score F from `22_32_36.ulg`. And **arm G
+overwrote `ev-vtrn.jsonl`** — the arm-A acceptance record is gone locally (use
+`14_53_15.ulg`); rename before re-running the acceptance table.
+
+Full analysis: CLAUDE.md → Slice 3. **Only follow-up left: the failsafe-action
+experiment** (position-loss action → hold, not DESCEND).
+
+The procedure below is retained for re-runs.
+
+### Original plan (as flown)
 
 The honest worst case, and the run that should finally make something break.
 Two things change at once versus the flown 3 s `dropout` arm:
@@ -908,6 +937,56 @@ not just convention here — it is load-bearing. If arming fails, check
   fusing and the run does not test what it claims to.
 * ⚠️ **If the mission aborts, the corridor and endpoint numbers are meaningless.**
   Check `finished=` in the ULog before quoting either.
+
+## 3f. Failsafe-action experiment — make the dropout descent disappear — ⏭ NEXT
+
+The `dropout-long` arms proved the position-loss failsafe descends at 0.7 m/s
+during each 6 s gap (~2.2 m lost per gap, ~13 m over 6). This run removes that,
+and it is the one **program-level fix** left in the EV series rather than another
+measurement.
+
+**The fix is the no-aiding TIMEOUT, not the failsafe action.** A multirotor with
+no position estimate cannot hold XY — "descend vs hold" is a false choice, because
+the vehicle no longer knows where it is. The correct lever is to stop treating a
+*brief* gap as position loss: `configs/px4/dropout_tolerant.params` raises
+`EKF2_NOAID_TOUT` 5 s → **8 s**, just above the 6.1 s injected gap, so EKF2 coasts
+on the IMU through the dropout, keeps position valid, and never trips the failsafe.
+
+⚠️ **This is a deliberate tradeoff.** A longer timeout also delays the failsafe on
+a *genuine* (permanent) vision loss — the aircraft dead-reckons blind for up to
+8 s before reacting. 8 s covers our transient with margin; do not inflate it.
+
+### Running it
+
+Standard GPS-denied stack (mag on is fine — this is the altitude axis, independent
+of the heading↔mag result), plus the tolerance file, flown as `dropout-long`:
+
+```bash
+droneflight px4-params \
+    --file configs/px4/gps_denied_ekf2.params \
+    --file configs/px4/sitl_bringup.params \
+    --file configs/px4/dropout_tolerant.params
+#   paste into pxh, reboot, then confirm:
+#     param show EKF2_NOAID_TOUT     -> 8000000
+
+./sitl/run_ev_arm.sh dropout-long ~/drone/plans/ev_test.plan ~/logs/failsafe
+droneflight fly --plan ~/drone/plans/ev_test.plan --url udpin://0.0.0.0:14540 \
+    2>&1 | tee ~/logs/failsafe/fly.log
+```
+
+### What to watch — this is a clean before/after
+
+* **Zero DESCEND episodes.** `nav_state` should stay AUTO_MISSION straight
+  through every gap. Against the baseline (`22_32_36.ulg` / `21_16_45.ulg`, 6
+  DESCENDs each) that is the whole result.
+* **Flat altitude.** Ground-truth `-z` should hold ~30 m across the gaps instead
+  of sawtoothing down ~2.2 m. Cumulative altitude given up → ~0.
+* **`xy_valid` stays true** through the 6 s gaps (it went false ~10 % of samples
+  before). If it still goes false, the timeout did not take — re-check the param.
+* ⚠️ **Confirm a gap still LONGER than 8 s does fail safe.** The point is
+  tolerance to transients, not disabling the failsafe. A quick way: one
+  `--dropout-duration 10` gap should still descend. If nothing ever fails safe,
+  `NOAID_TOUT` is too high.
 
 ## 4. Custom tether model (required build item)
 

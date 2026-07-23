@@ -144,6 +144,55 @@ def _nav(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tether_check(args: argparse.Namespace) -> int:
+    """Validate the tether-safe speed policy against the v0 payout-tension model.
+
+    Runs the mission's payout tension twice — at the policy speeds and at flat
+    cruise — so the whole point of the policy (slow through bends so the fiber
+    survives) becomes a number with a pass/fail against the break tension.
+    """
+    from droneflight.speed_policy import SpeedPolicy
+    from droneflight.tether import TetherConfig, analyse_tether
+
+    try:
+        mission = load_qgc_plan(args.plan)
+    except PlanLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    config = TetherConfig(break_tension_n=args.break_tension, back_tension_n=args.back_tension)
+    policy = SpeedPolicy(
+        cruise_speed_ms=mission.cruise_speed_ms,
+        min_speed_ms=args.min_speed,
+        slow_above_deg=args.slow_above,
+        reversal_deg=args.reversal_deg,
+    )
+    with_policy = analyse_tether(mission, config, policy=policy)
+    no_policy = analyse_tether(mission, config, policy=None)
+
+    print(
+        f"tether v0: break {config.break_tension_n:.1f} N, back-tension "
+        f"{config.back_tension_n:.1f} N, cruise {mission.cruise_speed_ms:.1f} m/s"
+    )
+    for label, rep in (("no policy (flat cruise)", no_policy), ("speed policy", with_policy)):
+        peak = rep.peak
+        assert peak is not None  # a loaded mission always has >=1 waypoint
+        verdict = (
+            "WITHIN break limit" if rep.within_limit else f"{len(rep.breaks)} waypoint(s) SNAP"
+        )
+        print(
+            f"  {label:<24}: max {rep.max_tension_n:5.2f} N "
+            f"({peak.load_fraction * 100:3.0f}% of break) at wp{peak.index} "
+            f"(bend {peak.deflection_deg:.0f}°, {peak.speed_ms:.1f} m/s) — {verdict}"
+        )
+    if no_policy.breaks and with_policy.within_limit:
+        print(
+            f"  → the policy prevents {len(no_policy.breaks)} fiber break(s) the flat-cruise "
+            "profile would cause."
+        )
+    return 0 if with_policy.within_limit else 1
+
+
 def _simfly(args: argparse.Namespace) -> int:
     from droneflight.reactive import ForestFlightConfig, fly_through_forest, scatter_forest
 
@@ -729,6 +778,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     n.add_argument("--fidelity-seed", type=int, default=1, help="Seed for the fidelity patches.")
     n.set_defaults(func=_nav)
+
+    t = sub.add_parser(
+        "tether-check", help="Validate the speed policy against the v0 payout-tension model."
+    )
+    t.add_argument("--plan", type=Path, required=True)
+    t.add_argument("--break-tension", type=float, default=2.0, help="Fiber break tension (N).")
+    t.add_argument("--back-tension", type=float, default=0.5, help="Spool back-tension (N).")
+    t.add_argument("--min-speed", type=float, default=1.0, help="Speed-policy floor (m/s).")
+    t.add_argument("--slow-above", type=float, default=30.0, help="Bend (deg) to start slowing.")
+    t.add_argument(
+        "--reversal-deg", type=float, default=150.0, help="Bend (deg) treated as reversal."
+    )
+    t.set_defaults(func=_tether_check)
 
     s = sub.add_parser("simfly", help="Closed-loop forest-flight sim (avoidance ON vs OFF).")
     s.add_argument("--plan", type=Path, required=True)

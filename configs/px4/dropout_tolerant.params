@@ -1,0 +1,47 @@
+# PX4 parameters to make a TRANSIENT external-vision dropout survivable WITHOUT
+# the position-loss failsafe descending toward the ground.
+# Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
+#
+# Apply ON TOP OF gps_denied_ekf2.params + sitl_bringup.params (mag on or off):
+#   droneflight px4-params --file configs/px4/gps_denied_ekf2.params \
+#                          --file configs/px4/sitl_bringup.params \
+#                          --file configs/px4/dropout_tolerant.params
+# then paste the `param set` lines into pxh and `reboot`.
+#
+# WHY THIS EXISTS
+# The 2026-07-22 `dropout-long` arms (6 s EV gaps) measured the position-loss
+# failsafe firing at EVERY gap: EKF2 hit EKF2_NOAID_TOUT (5 s), declared
+# horizontal position invalid, and commander entered DESCEND at MPC_LAND_SPEED
+# (0.7 m/s) — giving up ~2.2 m of altitude per gap, ~13 m cumulative, TOWARD the
+# canopy. For a nap-of-the-earth fiber-layer that is the wrong direction and a
+# CFIT/concealment hazard (same class as the Slice-1 RTL-to-61 m default).
+#
+# THE FIX IS THE TIMEOUT, NOT THE ACTION.
+# A multirotor with no position estimate genuinely cannot hold XY — so "descend"
+# vs "hold" is a false choice: the failsafe actions are all "come down" because
+# the vehicle no longer knows where it is. The correct lever is to STOP TREATING A
+# BRIEF GAP AS POSITION LOSS. Raising EKF2_NOAID_TOUT above the longest expected
+# transient dropout lets EKF2 coast on the IMU through the gap, keep position
+# "valid", and never trip the failsafe — which is exactly what a real VIO stack
+# does when it briefly loses tracking. During the flown 6 s gaps EKF2's own
+# position error grew only ~0.7 m over baseline, so an 8 s inertial coast is cheap.
+#
+# ⚠️ THIS IS A TRADEOFF, SET DELIBERATELY. A longer no-aiding timeout also delays
+# the failsafe on a GENUINE (permanent) vision loss — the aircraft dead-reckons
+# blind for up to NOAID_TOUT before reacting. 8 s is chosen to cover the 6.1 s
+# dropouts we inject with margin while still failsafing within ~8 s of a real loss.
+# Do NOT raise it to tens of seconds "to be safe": that is the opposite of safe.
+# Set it to just above your worst expected transient, no higher.
+
+# No-aiding timeout: 8 s (was 5 s default). Just above the 6.1 s injected gap.
+1	1	EKF2_NOAID_TOUT	8000000	6
+
+# --- SECONDARY LEVER (leave commented unless the timeout proves insufficient) ---
+# If a gap ever DOES exceed the timeout and position goes invalid, COM_POS_LOW_ACT
+# governs the reaction on this build (default 3). Its enum has changed across PX4
+# releases, so DO NOT set it blindly — check the value list first:
+#       param info COM_POS_LOW_ACT      # or QGC > Parameters
+# and pick the least-aggressive option that still recovers (typically Warning or
+# Hold-altitude, not Land). Then add a line here with the verified value + type 6.
+# Deliberately omitted rather than guessed — a wrong enum silently changes the
+# failsafe behaviour, which is the one thing this experiment is trying to measure.

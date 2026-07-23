@@ -11,7 +11,8 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 |---|---|
 | `plan_loader.py` | QGC `.plan` → `FlightMission` (the droneplanner boundary) |
 | `sensors.py` | passive-optical / passive-thermal / active-lidar tradeoff |
-| `speed_policy.py` | slow through turns/reversals (protect the fiber) |
+| `speed_policy.py` | slow through turns/reversals (protect the fiber); consolidates duplicate-waypoint clusters so a turn is seen at its true angle |
+| `tether.py` | **v0 payout-tension model** — back-tension + airborne-span drag + turn/reversal load; validates the speed policy against a break budget (`tether-check`) |
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter |
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
@@ -21,7 +22,7 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `executor.py` + `connector.py` | connect→upload→arm→start→monitor, RTL on error (+ progress-stall watchdog); fake connector for tests |
 | `mavsdk_connector.py` | live PX4 adapter (⚠️ needs SITL; excluded from coverage, not unit-tested) |
 | `sitl_launch.py` | inject the plan's home into PX4 SITL (`PX4_HOME_*`) so a mission lands at the real AO, not Zurich |
-| `config.py`, `cli.py` | config + `validate` / `nav` / `simfly` / `sitl-env` / `px4-params` / `flatten-plan` / `ev-bridge` / `ev-report` / `fly` commands |
+| `config.py`, `cli.py` | config + `validate` / `nav` / `tether-check` / `simfly` / `sitl-env` / `px4-params` / `flatten-plan` / `ev-bridge` / `ev-report` / `fly` commands |
 
 ## Run / test
 ```bash
@@ -30,6 +31,7 @@ cd /Users/arttu/Claude/Projects/DroneAutomation/droneflight
 droneflight validate --plan ../droneplanner/out/mission.plan            # offline: policies + sensor mode
 droneflight nav      --plan .../mission.plan                            # VIO vs idealised vs optical VTRN
 droneflight nav      --plan .../mission.plan --forest-frac 0.7 --stale-frac 0.3  # conflict-zone basemap
+droneflight tether-check --plan .../mission.plan                        # payout tension: speed policy vs flat cruise
 droneflight simfly   --plan .../mission.plan --density 25               # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan .../mission.plan --drift-rate 0.02 --vtrn-interval 150
 eval "$(droneflight sitl-env --plan .../mission.plan)"                  # PX4 SITL home = plan home
@@ -37,7 +39,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 172 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 185 tests, ~96% cov
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -127,6 +129,13 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   the fiber off the laydown route. This aircraft is designed to fly with no GCS,
   so `NAV_DLL_ACT` and RTL altitude must be deliberate design choices, not
   defaults. `configs/px4/sitl_bringup.params` neutralises them for testing.
+  **A second instance of this same class surfaced 2026-07-22** — the
+  *position-loss* failsafe descends at land speed during a vision dropout (Slice 3,
+  `dropout-long`). Both are autopilot defaults that abandon the NOE profile; the
+  program needs a deliberate failsafe policy, not just these patches. The dropout
+  case has a prepared fix (`configs/px4/dropout_tolerant.params`, RUNBOOK §3f):
+  raise the no-aiding timeout so a brief gap is coasted through, not failsafed —
+  because without a position estimate the vehicle cannot hold, only come down.
 - ⏸️ **Slice 2 PARKED (2026-07-21) — terrain world, not on the critical path.**
   `droneplanner gz-world` injects the planned DTM into PX4's `default.sdf`
   (RUNBOOK §2b). It **loads and flies**, but the vehicle **tumbles once it
@@ -263,8 +272,11 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     | B `novtrn` control | `sim-logs/15_16_47.ulg` | **103.2 m** | 44.1 m | 103.2 m | — | — | 106.4 m | LEFT |
     | C `conflict` 70/30 | `sim-logs/15_33_55.ulg` | **25.6 m** | 9.3 m | 8.8 m | 10/68 (15 %) | 0 | 21.9 m | LEFT |
 
-    Records `sim-logs/ev-{vtrn,novtrn,conflict}.jsonl`; reproduce with
-    `droneflight ev-report --plan plans/ev_test.plan --record sim-logs/ev-vtrn.jsonl
+    Records `sim-logs/ev-{novtrn,conflict}.jsonl` — but ⚠️ **`ev-vtrn.jsonl` (arm A)
+    was later overwritten by arm G and is gone**; score arm A from its ULog
+    (`14_53_15.ulg`) via `scratchpad/ulg_arms.py`, which reproduces it to 0.1 m
+    (11.7 vs 11.8). `ev-report` for B and C still works:
+    `droneflight ev-report --plan plans/ev_test.plan
     --record sim-logs/ev-novtrn.jsonl --record sim-logs/ev-conflict.jsonl`.
 
   - 📐 **The offline Monte Carlo predicted the flights** (15.0/11.8, 106.4/103.2,
@@ -363,12 +375,14 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     vision, so a lock loss removes the only heading observation while 3 s of
     inertial dead reckoning barely dents position. **The dropout arm was a bigger
     yaw disturbance (12.4°) than the deliberate yaw arm (6.1°).**
-  - ⚠️ **That heading recovery leans on a magnetometer that reads perfect truth.**
-    During gaps EKF2 falls back to 3D mag fusion — `cs_mag_3d` goes **0.0 % →
-    39.4 %**. In SITL the mag is uncorrupted, so 12.4° is a **best case**. A covert
-    GPS-denied platform near ferrous structure, power lines or deliberate
-    interference has no such anchor. A mag-denied dropout variant
-    (`EKF2_MAG_TYPE`) is the honest version of this test.
+  - ⚠️ **I read that backwards — the magnetometer was the *cause* of the 12.4°,
+    not the cure. Corrected by the mag-denied run below.** During gaps EKF2 falls
+    back to 3D mag fusion (`cs_mag_3d` 0.0 % → 39.4 %), and I wrote that 12.4° was
+    therefore a *best case* that mag denial would worsen. The flown `dropout-long`
+    arm — **longer** 6 s gaps, mag **denied** — instead held heading to **1.88°**.
+    Doubling the gap while removing the mag made heading 6× *better*, so the 12.4°
+    excursion was the EV↔mag handoff, not the loss of EV heading. See the
+    dropout-long entry for the measured reversal and its caveats.
   - 🎯 **Where heading error actually hurts this system is camera pointing, which
     nothing models.** The nadir VTRN camera and the forward avoidance FOV are both
     body-fixed, so 12° of heading error swings both. `correction.py` has no
@@ -380,26 +394,94 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     It previously showed them only in single-record mode, so these two arms first
     read as an ambiguous null — an arm whose axis never fired was indistinguishable
     from one that fired and changed nothing.
-  - **⏭ NEXT: `dropout-long` (6 s) with the magnetometer DENIED** — wired as
-    `run_ev_arm.sh dropout-long` plus `configs/px4/mag_denied.params`. Crosses
-    EKF2's 5 s `EKF2_NOAID_TOUT` (→ position-loss failsafe, still live) *and*
-    removes the truth-perfect mag fallback, leaving EV as the only heading
-    observation. **Procedure, revert steps and the read-the-result rule:
-    RUNBOOK §3e.**
-    - ⚠️ **Two variables move at once.** Decided in advance: if it breaks, that
-      is a real worst-case result reported as "6 s gaps *with no magnetometer*";
-      if it survives, nothing is attributable and the two isolating runs (6 s
-      with mag; no-dropout without mag) become required. A clean combined run is
-      **not** "dropout-long is fine".
-    - ⚠️ **`EKF2_MAG_TYPE`'s enum has moved across PX4 releases** — verify 5 =
-      None on the build, or the mag keeps fusing and the run tests nothing.
-    - ⚠️ **Those params persist across SITL restarts** (`param reset
-      EKF2_MAG_TYPE SYS_HAS_MAG EKF2_MAG_CHECK` afterwards) — otherwise every
-      later arm is silently mag-denied and no longer comparable to anything
-      flown before 2026-07-22.
-    - ⚠️ **Expect arming to be the first failure:** with no mag, EV yaw is the
-      only heading EKF2 can align against, so the bridge-before-fly ordering is
-      load-bearing rather than conventional.
+  - ✅ **`dropout-long` (6 s) + magnetometer DENIED FLOWN 2026-07-22
+    (`sim-logs/21_16_45.ulg`, `ev-dropout-long.jsonl`, mag-denied).** Configuration
+    verified from the ULog: **6 gaps of exactly 6.0–6.1 s**, `cs_mag_3d` and
+    `cs_mag_hdg` **0.0 % everywhere** (mag genuinely off). Three findings, in order
+    of importance:
+    - 🟢 **The position-loss failsafe fired at every gap — and the aircraft rode
+      through it.** Each 6 s gap crossed `EKF2_NOAID_TOUT`; `xy_valid` went false
+      (~10 % of samples), PX4 entered **DESCEND** for ~2.7 s, then **recovered to
+      AUTO_MISSION the instant vision returned**. Mission **COMPLETED 77/77**. So
+      the failsafe is transient-tolerant: a dropout shorter than the descent-to-
+      ground is survivable, not an abort.
+    - 🟠 **This is the first arm to move the corridor: max dev 19.6 m, LEFT**
+      (vs 12.2 m for the 3 s dropout that stayed WITHIN). During each invalid
+      window PX4 stops holding cross-track and the true track drifts out — so
+      cross-track responds to *position-validity loss*, not to the vision
+      degradation the 3 s and yaw arms applied. Consistent with "the metric is
+      near-blind to everything except an actual position-hold break".
+    - 🔴 **…but the failsafe action is DESCEND at `MPC_LAND_SPEED` (0.7 m/s), which
+      is the wrong direction for this aircraft.** Each event gave up **~2.2 m of
+      altitude (~13 m cumulative over 6)** — toward the canopy/ground for a
+      nap-of-the-earth fiber-layer. This is the **same class of program-level
+      failsafe defect as the Slice-1 RTL-to-61 m finding**: an autopilot default
+      that discards the concealment/CFIT profile. The action needs to be a
+      deliberate choice (hold heading + altitude and coast on IMU, not sink).
+      Flagged, **not** silently changed — it is a design decision, like `NAV_DLL_ACT`.
+    - 🔵 **The heading reversal — now CONFIRMED single-variable by arms F and G
+      (flown 2026-07-22).** MISSION-phase in-gap heading error, holding the 6 s
+      gap fixed and toggling only the magnetometer:
+
+      | Run | ULog | dropout | mag | in-gap heading |
+      |---|---|---|---|---|
+      | dropout (3 s) | `19_30_04` | 3 s | ON | 12.40° |
+      | dropout-long | `21_16_45` | 6 s | **DENIED** | **1.88°** |
+      | **F** dropout-long | `22_32_36` | 6 s | **ON** | **11.77°** |
+
+      F vs `21_16_45` is the clean test — identical 6 s gaps, mag the only
+      difference — and the mag-on run is **6× worse** (11.77° vs 1.88°). So the
+      excursion is the **EV↔mag handoff**, not the loss of EV heading: when EV
+      drops, EKF2 transiently fuses a magnetometer whose inferred heading
+      disagrees with the EV frame. With the mag denied it coasts on the gyro and
+      barely moves. **This overturns last session's "the mag is the anchor / 12.4°
+      is a best case" claim outright.**
+      - **Arm G (`vtrn`, mag denied, `22_54_38`) supplies the null baseline:**
+        no dropout, heading **2.19°** — indistinguishable from arm A's mag-on
+        ~2.3°. So the magnetometer is *harmless when EV is continuous* and only
+        hurts at a dropout. That is the whole shape of the finding: mag denial
+        costs nothing except where it removes the bad handoff, where it helps.
+      - ⚠️ **Residual caveat:** SITL gyro is low-drift, so the 1.88° coast is a
+        gyro best-case; real gyro bias over a 6 s coast could erode it. The mag
+        attribution, though, is now solid.
+    - 📐 **Corridor confirms the failsafe (not heading) owns cross-track.** F
+      (mag-on) left the corridor at **20.3 m**, right beside the mag-denied
+      dropout-long's 19.6 m — mag state moved cross-track by <1 m. Both 6 s arms
+      leave (~20 m) and both shorter/no-dropout arms stay (≤12.2 m), so the
+      corridor responds to the **position-loss failsafe**, cleanly independent of
+      the heading axis. The two effects are fully separated: **heading ↔ mag,
+      corridor ↔ failsafe.**
+    - ✅ **Arming was NOT the first failure (predicted it would be).** With EV yaw
+      as the sole heading source I expected yaw-alignment to block arming; it did
+      not — `cs_yaw_align` reached 100 % and the vehicle armed and flew. The two
+      tiny logs in the folder (`21_16_24.ulg` 9 s, `21_42_23.ulg` 30 s, both
+      never-armed) are SITL boot restarts bracketing the real run, not failed
+      arming attempts.
+    - ⚠️ **Log provenance — the F/G session scrambled two filenames (verified by
+      ULog params, not trusted by name):**
+      - **F = `22_32_36.ulg`** (mag ON, 6×6 s gaps, 6 DESCENDs, 77/77). Its
+        *bridge record is gone* — `ev-dropout-long.jsonl` is a 15 s / 452-sample
+        stub from a superseded 22:55 bridge start. **Score F from the ULog only.**
+      - **G = `22_54_38.ulg`** (`MAG_TYPE=5`, mag 0 %, no injected dropout,
+        11.7 m WITHIN). The 57.6 s EV gap in it is the bridge-restart outage and
+        is **pre-mission** (@45 s, mission starts 120 s), so it does not touch the
+        score.
+      - 🔴 **`ev-vtrn.jsonl` was OVERWRITTEN by arm G** (now 31 651 samples /
+        1055 s / t0=103, was arm A's 30 923 / 1031 s / t0=348). The arm-A
+        acceptance *record* is gone locally — recoverable only as `14_53_15.ulg`.
+        **Any future `ev-report --record ev-vtrn.jsonl` now silently scores G as
+        arm A.** Rename the local copy (e.g. `ev-G-vtrn-magdenied.jsonl`) before
+        re-running the acceptance table.
+    - ⏭ **Only remaining follow-up, now PREPARED (not yet flown): the
+      failsafe-tolerance experiment** — `configs/px4/dropout_tolerant.params`,
+      RUNBOOK §3f. **The fix is the no-aiding TIMEOUT, not the action:** a
+      multirotor with no position estimate cannot hold XY, so "descend vs hold" is
+      a false choice — the lever is to stop treating a *brief* gap as position
+      loss. Raises `EKF2_NOAID_TOUT` 5 s → 8 s (just above the 6.1 s gap) so EKF2
+      coasts on IMU through the dropout and never trips the failsafe. Expected: 0
+      DESCEND episodes, flat altitude, `xy_valid` stays true. Tradeoff, set
+      deliberately: a longer timeout also delays the failsafe on a *genuine* vision
+      loss, so 8 s covers the transient and no more. The reversal itself is closed.
   - 🔑 **The dropout pair is designed around EKF2's 5 s `EKF2_NOAID_TOUT`** (PX4
     default; *not* set in `gps_denied_ekf2.params`, so confirm with
     `param show EKF2_NOAID_TOUT` before flying). 3 s = under it → EKF2 should ride
@@ -448,14 +530,46 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   **A stale VM has caused three false "bugs"** — pull after every push, and if
   behaviour contradicts the code, check `git log --oneline -1` on both ends
   before debugging. See RUNBOOK §1.6.
-- 🐛 **Known planner defect (unfixed):** the kinematic fillet pass emits
-  **duplicate waypoint clusters** (0.2–1.0 m apart) — 77 waypoints, only ~25
-  distinct. Wastes autopilot mission slots and makes logs noisy. Needs a
-  minimum-spacing filter on the emitted waypoints.
-- ⏭ **Next build items:** **fly the dropout and yaw arms on the VM** (both are
-  built and unit-tested but unflown — the failsafe path and the yaw→position
-  coupling can only be seen in the loop), then the **v0 tether disturbance
-  plugin** (`sitl/`) to validate the speed policy against payout physics. Cheap
-  analysis wins meanwhile: re-run the MC with forest-frac and stale-frac varied
-  *separately* (the flown conflict arm showed only forest-frac doing damage), and
-  settle the `DriftWalker` √distance question above.
+- 🐛 **Known planner defect (unfixed upstream) — now with a measured teeth:** the
+  kinematic fillet pass emits **duplicate waypoint clusters** (0.2–1.0 m apart) —
+  77 waypoints, only ~25 distinct. Beyond wasting mission slots, it **silently
+  defeated per-waypoint turn analysis**: on `ev_test.plan` a real turn spread
+  across the cluster reads as **8° raw vs 16° after 2 m consolidation**, so the
+  tether-safe speed policy (which keys off per-waypoint deflection) under-fired.
+  `speed_policy.py` and `tether.py` now **consolidate to ≥2 m vertices first**; the
+  planner still wants a minimum-spacing filter on emission.
+
+- ✅ **Tether v0 model BUILT (`tether.py`, `tether-check`) — the offline half of
+  the required tether build item.** Payout tension = back-tension + **airborne-span
+  drag** + turn/reversal load; validates the speed policy against a break budget
+  (a reversal at cruise = 2.11 N snaps a 2 N fiber, the policy's slowdown → 0.76 N
+  survives). Three things worth knowing:
+  - 🔧 **The spec's "drag ∝ paid-out length" is wrong for a LAYING drone** and I
+    did not implement it literally. Taken at face value it put peak tension at the
+    final waypoint (34 N over 5 km, straight leg) where the policy does nothing —
+    the tell. The laid fiber is deposited, not towed, so only the **airborne span**
+    (~flight altitude) drags. Documented in the module header; a refinement of the
+    Tech-Selection §7 hand-wave.
+  - 📊 **On the flown plan the tether is SLACK, not binding:** peak **0.79 N =
+    40 % of a conservative 2 N budget**, at cruise, and the route is too smooth
+    (max 16° bend) to need slowing. So on these concealment routes the speed
+    policy is *inactive and unneeded* — the fiber constraint isn't what shapes
+    them. The policy earns its keep only on reversal-heavy routes (proven in the
+    unit test, not on this plan).
+  - ⚠️ **Calibration is un-benched** (Tech-Selection §7). Coefficients are
+    order-of-magnitude; trust the *comparisons* (policy on/off, leg vs reversal),
+    not the absolute newtons. And a real fiber-break mechanism is **still
+    unmodeled**: a snag that couples the **drone's** mass (kg) into the line
+    dwarfs the fiber's own momentum and breaks it at any flight speed — that is a
+    planning/avoidance problem, not a speed one (see [[tether-v0]]).
+
+- ⏭ **Next build items (updated):**
+  - **The Gazebo C++ tether wrench plugin** (`sitl/`, needs the VM) — the
+    in-the-loop half: apply `drag_tension_n` as a back-pull wrench on the airframe
+    each step and watch control/altitude, mirroring how `ev_bridge` followed
+    `nav.py`. The Python model is the reference it must match.
+  - **The failsafe-tolerance run** (`configs/px4/dropout_tolerant.params`,
+    RUNBOOK §3f) — prepared, unflown.
+  - Cheap offline wins: re-run the MC with forest-frac and stale-frac varied
+    *separately* (the flown conflict arm showed only forest-frac doing damage),
+    and settle the `DriftWalker` √distance question above.

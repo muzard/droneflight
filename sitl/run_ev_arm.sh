@@ -61,6 +61,16 @@ mkdir -p "$OUTDIR"
 RECORD="$OUTDIR/ev-$ARM.jsonl"
 LOG="$OUTDIR/ev-$ARM.log"
 
+# Refuse to silently clobber an existing record. Two runs into the same OUTDIR
+# with the same arm name is exactly how the F/G session overwrote the arm-A
+# acceptance record (ev-vtrn.jsonl) and left a 15 s stub in place of a full
+# flight. Pass a fresh OUTDIR per arm, or set EV_ARM_FORCE=1 to overwrite.
+if [[ -s "$RECORD" && "${EV_ARM_FORCE:-0}" != "1" ]]; then
+  echo "error: $RECORD already exists ($(wc -c <"$RECORD") bytes)." >&2
+  echo "       Use a different record-dir, or EV_ARM_FORCE=1 to overwrite." >&2
+  exit 3
+fi
+
 # Every arm shares one drift seed and one fidelity seed. Changing them between
 # arms would confound the comparison: a different seed is a different weather
 # system, and the whole point is that only the arm's own variable differs.
