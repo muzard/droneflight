@@ -340,12 +340,52 @@ magnetic field the EKF yaw diverges and the vehicle tumbles. The generator also
 sets `<world name>` to the output **file stem** — mismatch there makes PX4 hang
 forever on *"Waiting for Gazebo world..."*.
 
-### ⚠️ Known open bug — terrain worlds tumble on translation
+### 🔧 Terrain worlds tumble on translation — ROOT-CAUSED AND FIXED (2026-07-23), verify on the VM
 
-The vehicle spawns correctly, climbs perfectly, then **tumbles as soon as it
-translates** (`Attitude failure (roll)`, roll → 180°, land detector latches,
-mission stalls). Reproducible with any heightmap present; the flat `default.sdf`
-flies fine.
+**The vehicle was spawning buried inside the heightmap.** Gazebo uses a DEM's
+**raw elevations**, not a rescale into `<size>`'s z — the `AABB max z = 150.32`
+clue was the DEM's max *elevation*, not the `110.32` relief we passed. The old
+model-pose offset therefore put the terrain surface under home at world
+`z = min_elev` (**+40 m** real DEM, **+125 m** with `--flat`) while PX4 spawns the
+vehicle at `z = 0`. Sitting in permanent collision penetration looks like a clean
+hover and then flings the airframe the moment it translates.
+
+⚠️ **The old `--flat` bisection was misleading** — the flat world buried it
+*deeper*, so "flat tumbles too, therefore not slope/normals, therefore the
+heightmap itself" was the same bug measured twice.
+
+**Fixed** in `droneplanner/io/gzworld.py` by handing Gazebo a **zero-based DEM**
+(`normalise_dem`), which makes raw-vs-rescaled interpretations identical. Details:
+`droneflight/CLAUDE.md` → Slice 2.
+
+**To verify here:**
+
+```bash
+# regenerate — this now writes <out>_dem.tif NEXT TO the .sdf
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan \
+    --base-world $PX4_DIR/Tools/simulation/gz/worlds/default.sdf \
+    --out worlds/planner_terrain.sdf --dem-path /home/<user>/worlds/planner_terrain_dem.tif
+# copy BOTH files to the VM, then:
+cp worlds/planner_terrain.sdf $PX4_DIR/Tools/simulation/gz/worlds/
+PX4_GZ_WORLD=planner_terrain ./sitl/run_sitl.sh <plan> $PX4_DIR
+```
+
+⚠️ **Copy the `_dem.tif` too**, and make `--dem-path` match where it will live on
+the VM — the SDF references it by absolute path. A missing DEM loads an empty
+heightmap.
+
+Check, in order:
+1. `gz model -m terrain -p` vs a height query — the surface under home must be at
+   **z ≈ 0**. **Do not** infer this from PX4's local z: PX4 zeroes its local
+   origin at the spawn point, so `z = 0` at rest is tautological (that circular
+   reading is what hid this bug for two sessions).
+2. Vehicle rests *on* the surface, not in it — no contact jitter at idle.
+3. Then **fly a translation**. Tumble gone = fixed.
+
+*Historical (what the tumble looked like):* the vehicle spawned correctly, climbed
+perfectly, then tumbled as soon as it translated (`Attitude failure (roll)`,
+roll → 180°, land detector latches, mission stalls). Reproducible with any
+heightmap present; the flat `default.sdf` flew fine.
 
 **Already eliminated, with ULog evidence — do not re-investigate:**
 
@@ -938,7 +978,25 @@ not just convention here — it is load-bearing. If arming fails, check
 * ⚠️ **If the mission aborts, the corridor and endpoint numbers are meaningless.**
   Check `finished=` in the ULog before quoting either.
 
-## 3f. Failsafe-action experiment — make the dropout descent disappear — ⏭ NEXT
+## 3f. Failsafe-tolerance experiment — ✅ FLOWN 2026-07-23, it worked
+
+**Result (`sim-logs/failsafe/15_02_03.ulg`, `EKF2_NOAID_TOUT=8 s`): the descents
+are gone.** Same 6 EV gaps of 6.0 s, but **0 DESCEND episodes** (was 6),
+**`xy_valid` never went false** (was ~10 % of mission samples), altitude held flat
+(no ~2.2 m sawtooth), mission **COMPLETED 77/77**. Raising the no-aiding timeout
+above the gap length let EKF2 coast the 6 s on IMU without ever declaring position
+invalid, so the position-loss failsafe never armed.
+
+⚠️ **The tradeoff is real and measured.** Coasting the full 6 s grew EKF2's
+position error to **22.8 m in-gap** (mean 5.2 m; 11.1 m outside gaps), and the
+true-track corridor was **24.5 m LEFT** — *worse* than the descent baseline's
+20.3 m. So the fix removes the CFIT/altitude hazard (the point) but does not keep
+the corridor: a 6 s EV dropout exceeds what bounded nav holds to 15 m whichever
+failsafe response you pick. Net for a NOE fiber-layer: **not descending toward the
+canopy is the right call**, and the residual horizontal excursion recovers when EV
+returns. Set the timeout to just cover the expected transient — 8 s here — no more.
+
+*The experiment as originally planned:*
 
 The `dropout-long` arms proved the position-loss failsafe descends at 0.7 m/s
 during each 6 s gap (~2.2 m lost per gap, ~13 m over 6). This run removes that,
@@ -990,11 +1048,145 @@ droneflight fly --plan ~/drone/plans/ev_test.plan --url udpin://0.0.0.0:14540 \
 
 ## 4. Custom tether model (required build item)
 
-No standard sim models a **trailing fiber** (Technology-Selection §4.2). Approximate
-it first as a **drag + back-tension disturbance force** on the airframe
-(magnitude ∝ paid-out length and speed), added as a Gazebo plugin/wrench, to
-study payout effects on flight and validate the speed policy. A full catenary
-cable model is a later refinement.
+No standard sim models a **trailing fiber** (Technology-Selection §4.2), so v0
+approximates it as a **drag + back-tension disturbance force** on the airframe,
+applied as a Gazebo wrench. Sources: `sitl/tether_plugin/` (its README covers
+layout and rationale); requirements and acceptance: `sitl/TETHER_PLUGIN.md`.
+
+⚠️ Magnitude is **not** ∝ paid-out length as the spec assumed — only the
+**airborne span** (~flight altitude) is in the airflow, because the laid fiber is
+deposited, not towed. See the `tether.py` header.
+
+### 4.1 Status before you start
+
+**Written and Mac-tested, never compiled against Gazebo.** The physics
+(`tether_math.hpp`) is bit-exact against `tether.py` and covered by 24 tests that
+run on the Mac; `TetherPlugin.cc` was written from the gz-sim8 docs without a
+compiler. **Budget the first VM session for build errors**, not for results.
+
+### 4.2 Build + install (VM)
+
+```bash
+cd ~/droneflight/sitl/tether_plugin
+cmake -B build -S . && cmake --build build -j     # needs gz-sim8 + gz-plugin2 dev
+./install_tether_plugin.sh ~/PX4-Autopilot         # patches the x500 MODEL sdf
+```
+
+`install_tether_plugin.sh` is idempotent, saves `model.sdf.orig`, and reverts
+exactly with `--remove`. It patches
+`$PX4_DIR/Tools/simulation/gz/models/x500/model.sdf` — **not** the world SDF:
+`make px4_sitl gz_x500` spawns the vehicle into the world at runtime, so a world
+file has no x500 to attach to and a `<plugin>` block there is a silent no-op.
+
+`run_sitl.sh` puts `tether_plugin/build` on `GZ_SIM_SYSTEM_PLUGIN_PATH` when it
+exists and prints whether it did.
+
+### 4.3 ⚠️ Confirm it loaded, every run
+
+Gazebo does **not** fail on an unresolved system plugin, so a no-tether run is
+otherwise indistinguishable from a tether run. Two checks, in order of authority:
+
+1. **The CSV exists and has a header.** This is the reliable one: the file is
+   created in `Configure`, so its presence proves the plugin loaded *and* parsed
+   its parameters. Use an **absolute path** — Gazebo's cwd is PX4's build
+   directory, not where you launched from, so a relative `DRONEFLIGHT_TETHER_CSV`
+   lands somewhere surprising.
+   ```bash
+   head -2 /home/$USER/tether-on.csv     # two '#' lines = loaded, with its coefficients
+   ```
+2. **The console banner** — `[tether] ENABLED on x500/base_link -- back_tension_n=0.5 ...`
+   ⚠️ This is a `gzmsg`, which Gazebo prints only at **verbosity ≥ 3**. If PX4
+   launches the server quieter than that, the banner is absent on a perfectly
+   healthy run. **Absence of the banner is not evidence of failure — absence of
+   the CSV is.** If you want the banner to be dependable, either raise Gazebo's
+   verbosity or promote that one line to `gzerr` in `TetherPlugin.cc`.
+
+⚠️ **Kill stray `gz sim`/`ruby` processes between runs.** PX4 attaches to an
+already-running simulator (§2b says the same thing about world selection), and
+the plugin reads `DRONEFLIGHT_TETHER_*` **once, in `Configure`**. So a stale
+server silently reuses the *previous* arm's settings and your A/B becomes two
+copies of the same arm. The CSV header records what the plugin actually read —
+**score the arm from `enabled=` in the file, never from the command you typed.**
+
+### 4.4 Bring-up: prove the force reaches the physics
+
+A logged tension is not an applied one. Before any real experiment, confirm the
+wrench actually lands, using a magnitude too large to miss:
+
+```bash
+# absurd span -> ~27 N at 6 m/s, >1 g on a ~2 kg x500: it should visibly lose the route
+DRONEFLIGHT_TETHER_CSV=$HOME/tether-huge.csv ./run_sitl.sh <plan> ~/PX4-Autopilot
+#   ...with <airborne_span_m>4000</airborne_span_m> in the x500 model SDF
+```
+
+| `airborne_span_m` | drag @6 m/s | total | ≈ tilt to hold it | expect |
+|---|---|---|---|---|
+| 40 (default) | 0.26 N | 0.76 N | ~2.2° | near the noise floor |
+| 400 | 2.65 N | 3.15 N | ~9° | clearly visible in the ULog |
+| 4000 | 26.5 N | 27.0 N | can't hold | dragged off route / mission fails |
+
+**If 4000 changes nothing, `AddWorldForce` is not landing** — the plugin is
+logging a force it never applies, which is the one failure mode that looks
+completely healthy from the CSV. Fix that before trusting any smaller number.
+(Note the force only exists once the vehicle has *translated*: in a pure vertical
+climb there is no horizontal travel direction and the pull is zero by design.)
+
+Then walk it back to the default span and confirm a normal mission still
+completes — a NaN or runaway force would show as a sim that flies worse, not as
+an error message.
+
+### 4.5 The A/B (acceptance §2)
+
+Same SDF for both arms; only the environment changes, so nothing is edited
+between runs and the arms cannot silently differ in anything else:
+
+```bash
+# shell A — tether ON
+DRONEFLIGHT_TETHER_ENABLED=1 DRONEFLIGHT_TETHER_CSV=~/tether-on.csv ./run_sitl.sh <plan> ~/PX4-Autopilot
+# ...then the usual `droneflight fly` in shell B (§3)
+
+# shell A — control
+DRONEFLIGHT_TETHER_ENABLED=0 DRONEFLIGHT_TETHER_CSV=~/tether-off.csv ./run_sitl.sh <plan> ~/PX4-Autopilot
+```
+
+A disabled run still loads and still logs, recording `enabled=0` in its CSV
+header — a control arm must be identifiable from its own artifacts (the F/G
+session in §3d is the cautionary tale).
+
+### 4.6 Scoring
+
+```bash
+droneflight tether-plugin-check --log ~/tether-on.csv
+```
+
+Re-derives every logged tension from `tether.py`. **Exit 0 = EXACT**: the in-loop
+force *is* the offline model. Exit 1 = DIVERGED — stop and reconcile
+`tether_math.hpp` with `tether.py` before scoring any flight. It also prints the
+applied peak as a fraction of the break budget and the logged (uninjected) turn
+transient.
+
+For the attitude bias, compare `vehicle_attitude` roll/pitch between arms over a
+straight leg.
+
+### 4.7 What to expect — and what would be a false negative
+
+**0.76 N on a ~2 kg x500 is ~0.04 g, about 2.2° of steady tilt**, which PX4 trims
+out. Acceptance §2 may measure a difference near the noise floor. That is a
+legitimate finding — *the fiber does not meaningfully disturb this airframe at
+cruise* — but it is **not** evidence the plugin works. Distinguish the two:
+
+- **Parity (§4.5) is what proves the plugin works.** It is independent of whether
+  the force is large enough to see.
+- To show the disturbance is *real*, **sweep `airborne_span_m`** (40 → 400 in the
+  SDF) and confirm the attitude bias scales with it and with `v²`. A scaling law
+  is far stronger evidence than one A/B at a magnitude the controller can hide.
+
+Acceptance §3 (speed policy in the loop) is **blocked on a route, not on the
+plugin**: `plans/ev_test.plan` bends ≤16°, so the policy never engages and
+`tether-check` already reports the tether slack there. It needs a turn-rich plan
+— the same gap as the flat-world caveat.
+
+A full catenary / lumped-segment cable model is a later refinement (v1).
 
 ## 5. HITL & beyond
 

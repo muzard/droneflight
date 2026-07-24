@@ -11,17 +11,21 @@ uploaded mission lands at the real AO instead of PX4's Zurich default — the
 number-one first-flight trap. Run it **on the Ubuntu VM** (untested from macOS;
 the home-injection logic it calls is unit-tested).
 
-## Trailing-fiber tether model (required build item)
+## `tether_plugin/` — trailing-fiber disturbance (required build item)
 
 No off-the-shelf sim models a drone paying out a fiber (Technology-Selection §4.2),
 so this is a build item, staged in complexity:
 
-1. **v0 — disturbance force.** A Gazebo system plugin that applies a drag +
-   back-tension wrench to the airframe, magnitude ∝ paid-out length × speed. Enough
-   to study payout effects on flight and to validate `speed_policy` (slow through
-   turns) in the loop.
+1. **v0 — disturbance force.** ✍️ **Written (2026-07-24), not yet compiled or
+   flown** — needs the VM. A Gazebo Harmonic system plugin applying a
+   back-tension + airborne-span-drag wrench to the airframe, opposite to travel.
+   Its physics is bit-exact against [`tether.py`](../src/droneflight/tether.py)
+   and tested on the Mac; the Gazebo glue is unverified. See
+   [`tether_plugin/README.md`](tether_plugin/README.md) and
+   [`TETHER_PLUGIN.md`](TETHER_PLUGIN.md).
+   ⚠️ Note the magnitude is **not** ∝ paid-out length as the spec assumed —
+   only the airborne span drags, because the laid fiber is deposited, not towed.
 2. **v1 — lumped-segment cable.** A chain of links/joints trailing the vehicle for
-   catenary/sag behavior and ground/vegetation contact.
+   catenary/sag behavior and ground/vegetation contact. Not started.
 
-The plugin sources belong here once written; keep them out of the shippable
-flight package (sim-only).
+Sim-only: keep it out of the shippable flight package.

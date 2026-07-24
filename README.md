@@ -26,7 +26,8 @@ verifiable without hardware.
 | **External-vision injection** (`ev_bridge.py`) | ✅ Gazebo truth + injected error → PX4 EKF2; **flown GPS-denied**, 3-arm acceptance passed (2026-07-22) |
 | **EV dropout + yaw error** (`nav.py`) | ✅ built + **flown** (2026-07-22) — `--dropout-interval`, `--yaw-bias`, `--yaw-drift` (all off by default); neither moved cross-track, both moved EKF2 heading |
 | MAVSDK adapter (`mavsdk_connector.py`) | ⚠️ live path — runs against SITL, not unit-tested |
-| PX4 SITL + Gazebo tether model | ⏳ RUNBOOK + config; needs the Ubuntu sim host |
+| **Tether payout model** (`tether.py`) | ✅ offline v0 — back-tension + airborne-span drag + turn load, validated against a break budget |
+| **Gazebo tether wrench plugin** (`sitl/tether_plugin/`) | ✍️ written + Mac-tested (physics bit-exact vs `tether.py`); **not yet compiled or flown** — needs the Ubuntu sim host |
 | Real onboard perception (VIO/VTRN/LIO estimator) | later — separate effort |
 
 ## Usage
@@ -39,6 +40,8 @@ droneflight nav      --plan out/mission.plan --forest-frac 0.7 --stale-frac 0.3 
 droneflight simfly   --plan out/mission.plan --density 25          # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan out/mission.plan --drift-rate 0.02 --vtrn-interval 150
 eval "$(droneflight sitl-env --plan out/mission.plan)"            # set PX4 SITL home = plan home
+droneflight tether-check --plan out/mission.plan                   # payout tension: speed policy vs flat cruise
+droneflight tether-plugin-check --log tether-on.csv                # Gazebo plugin log vs the model (parity gate)
 droneflight ev-report --plan out/mission.plan --record run.jsonl   # corridor stats of a recorded EV run
 droneflight fly      --plan out/mission.plan --url udpin://0.0.0.0:14540    # live: execute on PX4/SITL
 
@@ -47,7 +50,8 @@ droneflight ev-bridge --plan out/mission.plan --url udpin://0.0.0.0:14541 --reco
 droneflight ev-bridge --plan out/mission.plan --no-vtrn             # the dead-reckoning control arm
 ```
 
-`validate`, `nav`, `simfly`, and `ev-report` are fully offline (kinematic, no
+`validate`, `nav`, `simfly`, `tether-check`, `tether-plugin-check`, and
+`ev-report` are fully offline (kinematic, no
 autopilot); `fly` needs a running PX4 (SITL or hardware) reachable at `--url`, and
 `ev-bridge` needs Gazebo **and** PX4 — see [RUNBOOK.md](RUNBOOK.md) §3b, which also
 covers the second MAVLink endpoint and the EKF2 global origin.

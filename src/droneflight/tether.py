@@ -51,8 +51,9 @@ the real output. Real numbers need payout-hardware bench data (Tech-Selection §
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from itertools import pairwise
+from pathlib import Path
 
 from droneflight.model import FlightMission
 from droneflight.speed_policy import (
@@ -261,3 +262,225 @@ def analyse_tether(
             )
         )
     return TetherReport(loads=tuple(loads), config=config)
+
+
+# --------------------------------------------------------------------------- #
+# In-the-loop half: reading back what the Gazebo plugin actually applied
+# --------------------------------------------------------------------------- #
+#
+# ``sitl/tether_plugin/`` mirrors the model above in C++ so PX4 SITL can feel the
+# payout disturbance. The mirror is only trustworthy if something checks it, so
+# the plugin logs every tension it applies at full precision and the functions
+# below re-derive those numbers from *this* module and diff them. That is the
+# acceptance gate in TETHER_PLUGIN.md: the in-loop force must BE the model, not
+# a second copy of it that quietly drifts.
+
+
+class TetherLogError(ValueError):
+    """A plugin CSV that cannot be read as one."""
+
+
+@dataclass(frozen=True)
+class PluginLogRow:
+    """One logged physics sample from the Gazebo plugin."""
+
+    t_s: float
+    x_m: float
+    y_m: float
+    z_m: float
+    vx_ms: float
+    vy_ms: float
+    speed_ms: float
+    drag_n: float
+    tension_n: float
+    lateral_accel_ms2: float
+    deflection_deg: float
+    turn_n: float
+    fx_n: float
+    fy_n: float
+    moving: bool
+
+
+@dataclass(frozen=True)
+class PluginLog:
+    """A parsed plugin CSV, including the coefficients it recorded in its header.
+
+    The header matters as much as the rows: it is what makes a log self-
+    describing, so a run can be scored months later without trusting a shell
+    script's memory of which parameters it passed.
+    """
+
+    rows: tuple[PluginLogRow, ...]
+    config: TetherConfig
+    speed_floor_ms: float
+    enabled: bool
+    link: str
+
+
+def _parse_header_params(text: str) -> dict[str, str]:
+    return dict(
+        token.split("=", 1) for token in text.split() if "=" in token and not token.startswith("=")
+    )
+
+
+def parse_plugin_log(path: Path) -> PluginLog:
+    """Read a ``log_csv`` written by the Gazebo tether plugin."""
+    config_names = {f.name for f in fields(TetherConfig)}
+    params: dict[str, str] = {}
+    rows: list[PluginLogRow] = []
+    header_seen = False
+
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            params.update(_parse_header_params(line[1:]))
+            continue
+        if not header_seen:
+            header_seen = True  # the column-name row
+            continue
+        parts = line.split(",")
+        if len(parts) != 15:
+            raise TetherLogError(f"{path}: expected 15 columns, got {len(parts)}: {line[:60]}")
+        try:
+            values = [float(p) for p in parts]
+        except ValueError as exc:
+            raise TetherLogError(f"{path}: non-numeric row: {line[:60]}") from exc
+        rows.append(
+            PluginLogRow(
+                t_s=values[0],
+                x_m=values[1],
+                y_m=values[2],
+                z_m=values[3],
+                vx_ms=values[4],
+                vy_ms=values[5],
+                speed_ms=values[6],
+                drag_n=values[7],
+                tension_n=values[8],
+                lateral_accel_ms2=values[9],
+                deflection_deg=values[10],
+                turn_n=values[11],
+                fx_n=values[12],
+                fy_n=values[13],
+                moving=values[14] != 0.0,
+            )
+        )
+
+    if not rows:
+        raise TetherLogError(f"{path}: no data rows — did the plugin load? (look for '[tether]')")
+
+    try:
+        # Only the fields TetherConfig shares with the plugin; break_tension_n and
+        # warn_fraction are analysis-only and the plugin never sees them.
+        config = TetherConfig(
+            **{k: float(v) for k, v in params.items() if k in config_names},
+        )
+    except (ValueError, TypeError) as exc:
+        raise TetherLogError(f"{path}: bad parameter header: {exc}") from exc
+
+    return PluginLog(
+        rows=tuple(rows),
+        config=config,
+        speed_floor_ms=float(params.get("speed_floor_ms", 0.3)),
+        enabled=params.get("enabled", "1") not in ("0", "false"),
+        link=params.get("link", "?"),
+    )
+
+
+@dataclass(frozen=True)
+class PluginParity:
+    """How far the in-loop plugin drifted from this module, and what it applied.
+
+    ``exact`` is the gate. The errors are not tolerances that happen to be small:
+    the C++ mirrors this module's association order, so anything other than
+    identically zero means the two implementations have genuinely diverged.
+
+    ``max_force_error_n`` is deliberately **not** part of ``exact``: it compares
+    a re-normalised vector magnitude against a scalar, so a few ULP is expected
+    on any heading that is not axis-aligned. It catches a wrong-direction or
+    wrong-magnitude wrench, not drift.
+    """
+
+    samples: int
+    moving_samples: int
+    max_drag_error_n: float
+    max_tension_error_n: float
+    max_turn_error_n: float
+    max_force_error_n: float
+    bad_static_samples: int
+    peak_tension_n: float
+    mean_tension_n: float
+    peak_turn_n: float
+    peak_speed_ms: float
+
+    @property
+    def exact(self) -> bool:
+        return (
+            self.max_drag_error_n == 0.0
+            and self.max_tension_error_n == 0.0
+            and self.max_turn_error_n == 0.0
+            and self.bad_static_samples == 0
+        )
+
+    def load_fraction(self, break_tension_n: float) -> float:
+        return self.peak_tension_n / break_tension_n
+
+
+def check_plugin_parity(log: PluginLog) -> PluginParity:
+    """Re-derive every logged tension from this module and diff it.
+
+    Scored on the **moving** samples: those are the ones with a speed-dependent
+    tension, and "at a commanded steady speed the logged tension equals
+    ``drag_tension_n(speed)``" is the acceptance criterion. Below the speed floor
+    the plugin has no velocity heading to work from, so it applies either pure
+    back-tension (line out, hovering) or nothing at all (never left the pad) —
+    anything else there is counted as a defect rather than diffed.
+    """
+    config = log.config
+    drag_err = tension_err = turn_err = force_err = 0.0
+    bad_static = 0
+    moving = 0
+    tension_sum = 0.0
+    peak_tension = peak_turn = peak_speed = 0.0
+
+    for row in log.rows:
+        tension_sum += row.tension_n
+        peak_tension = max(peak_tension, row.tension_n)
+        peak_turn = max(peak_turn, row.turn_n)
+        peak_speed = max(peak_speed, row.speed_ms)
+
+        # The turn term is a logged diagnostic, not an applied force, but it is
+        # still this module's function and must still agree.
+        turn_err = max(
+            turn_err,
+            abs(row.turn_n - turn_tension_n(config, row.speed_ms, row.deflection_deg)),
+        )
+
+        if row.moving:
+            moving += 1
+            expected_drag = drag_tension_n(config, row.speed_ms)
+            drag_err = max(drag_err, abs(row.drag_n - expected_drag))
+            tension_err = max(
+                tension_err, abs(row.tension_n - (config.back_tension_n + expected_drag))
+            )
+        elif row.tension_n not in (0.0, config.back_tension_n):
+            bad_static += 1
+
+        # The wrench magnitude must be the tension: a direction bug would leave
+        # every scalar above correct while pulling the wrong way.
+        force_err = max(force_err, abs(math.hypot(row.fx_n, row.fy_n) - row.tension_n))
+
+    return PluginParity(
+        samples=len(log.rows),
+        moving_samples=moving,
+        max_drag_error_n=drag_err,
+        max_tension_error_n=tension_err,
+        max_turn_error_n=turn_err,
+        max_force_error_n=force_err,
+        bad_static_samples=bad_static,
+        peak_tension_n=peak_tension,
+        mean_tension_n=tension_sum / len(log.rows),
+        peak_turn_n=peak_turn,
+        peak_speed_ms=peak_speed,
+    )

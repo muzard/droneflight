@@ -1,0 +1,38 @@
+<!-- Trailing-fiber tether disturbance (droneflight v0).
+     Paste this immediately before the closing </model> of PX4's x500 model SDF
+     ($PX4_DIR/Tools/simulation/gz/models/x500/model.sdf), or let
+     install_tether_plugin.sh do it. All values below are the defaults, spelled
+     out so a run is self-documenting; delete any tag to inherit it.
+
+     NOTE ON PLACEMENT: this goes in the *model* SDF, not the world SDF. PX4's
+     `make px4_sitl gz_x500` spawns the vehicle into whatever world is selected,
+     so the world file does not contain an x500 to attach to — putting the block
+     there loads nothing and fails silently.
+
+     A/B without editing this file:
+       DRONEFLIGHT_TETHER_ENABLED=0   force the force off (still loads and logs)
+       DRONEFLIGHT_TETHER_CSV=<path>  per-arm log path
+-->
+<plugin filename="TetherPlugin" name="droneflight::TetherPlugin">
+  <link_name>base_link</link_name>
+
+  <!-- Mirrors droneflight.tether.TetherConfig — do not retune one side only.
+       tests/test_tether_plugin.py asserts the two default sets are identical. -->
+  <fiber_diameter_m>0.00025</fiber_diameter_m>
+  <drag_coefficient>1.2</drag_coefficient>
+  <air_density_kg_m3>1.225</air_density_kg_m3>
+  <!-- Drag acts on the AIRBORNE SPAN (~flight altitude), not total paid-out
+       length: the laid fiber is deposited, not towed. -->
+  <airborne_span_m>40.0</airborne_span_m>
+  <back_tension_n>0.5</back_tension_n>
+
+  <!-- Turn diagnostic only; v0 injects the steady back-pull, not the transient. -->
+  <payout_inertia_kg>0.15</payout_inertia_kg>
+  <coupling_length_m>8.0</coupling_length_m>
+
+  <speed_floor_ms>0.3</speed_floor_ms>
+
+  <enabled>true</enabled>
+  <log_csv></log_csv>
+  <log_period_s>0.1</log_period_s>
+</plugin>

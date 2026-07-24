@@ -193,6 +193,69 @@ def _tether_check(args: argparse.Namespace) -> int:
     return 0 if with_policy.within_limit else 1
 
 
+def _tether_plugin_check(args: argparse.Namespace) -> int:
+    """Score a Gazebo tether-plugin CSV against the offline model (TETHER_PLUGIN.md §1).
+
+    The acceptance gate for the in-loop plugin: every tension it applied is
+    re-derived here from ``tether.py`` and diffed. Anything but an exact match
+    means the sim was flying a different tether model than the one the offline
+    studies were measured against.
+    """
+    from droneflight.tether import TetherLogError, check_plugin_parity, parse_plugin_log
+
+    try:
+        log = parse_plugin_log(args.log)
+    except (OSError, TetherLogError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    parity = check_plugin_parity(log)
+    budget = args.break_tension
+    duration_s = log.rows[-1].t_s - log.rows[0].t_s
+
+    print(
+        f"tether plugin log: {parity.samples} samples over {duration_s:.0f} s on {log.link} "
+        f"({parity.moving_samples} moving)"
+    )
+    if not log.enabled:
+        print(
+            "  ⚠️  plugin was DISABLED for this run — no force was applied. "
+            "This is the control arm, not a tether run."
+        )
+    print(
+        f"  config: back {log.config.back_tension_n:.3f} N, span "
+        f"{log.config.airborne_span_m:.1f} m, Cd {log.config.drag_coefficient:.2f}, "
+        f"d {log.config.fiber_diameter_m * 1000:.3f} mm, floor {log.speed_floor_ms:.2f} m/s"
+    )
+    print(
+        f"  applied: peak {parity.peak_tension_n:.4f} N "
+        f"({parity.load_fraction(budget) * 100:.0f}% of a {budget:.1f} N budget), "
+        f"mean {parity.mean_tension_n:.4f} N, at up to {parity.peak_speed_ms:.2f} m/s"
+    )
+    print(f"  turn transient (logged, not injected): peak {parity.peak_turn_n:.4f} N")
+    print(
+        f"  parity vs tether.py: drag {parity.max_drag_error_n:.3g} N, "
+        f"tension {parity.max_tension_error_n:.3g} N, turn {parity.max_turn_error_n:.3g} N, "
+        f"|F| {parity.max_force_error_n:.3g} N"
+    )
+
+    if parity.exact:
+        print("  → EXACT: the in-loop force is the offline model, not a copy of it.")
+    else:
+        print(
+            "  → DIVERGED: the plugin is applying a different model. Re-check "
+            "tether_math.hpp against tether.py before scoring any flight with it."
+        )
+        if parity.bad_static_samples:
+            print(
+                f"     ({parity.bad_static_samples} sub-floor samples were neither 0 N nor "
+                "back-tension)"
+            )
+    if parity.peak_tension_n > budget:
+        print(f"  ⚠️  peak exceeded the {budget:.1f} N break budget — the fiber would snap.")
+    return 0 if parity.exact else 1
+
+
 def _simfly(args: argparse.Namespace) -> int:
     from droneflight.reactive import ForestFlightConfig, fly_through_forest, scatter_forest
 
@@ -791,6 +854,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--reversal-deg", type=float, default=150.0, help="Bend (deg) treated as reversal."
     )
     t.set_defaults(func=_tether_check)
+
+    tp = sub.add_parser(
+        "tether-plugin-check",
+        help="Score a Gazebo tether-plugin CSV against the offline model (parity gate).",
+    )
+    tp.add_argument("--log", type=Path, required=True, help="CSV written by the plugin's log_csv.")
+    tp.add_argument("--break-tension", type=float, default=2.0, help="Fiber break tension (N).")
+    tp.set_defaults(func=_tether_plugin_check)
 
     s = sub.add_parser("simfly", help="Closed-loop forest-flight sim (avoidance ON vs OFF).")
     s.add_argument("--plan", type=Path, required=True)

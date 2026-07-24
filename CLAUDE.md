@@ -12,7 +12,7 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `plan_loader.py` | QGC `.plan` → `FlightMission` (the droneplanner boundary) |
 | `sensors.py` | passive-optical / passive-thermal / active-lidar tradeoff |
 | `speed_policy.py` | slow through turns/reversals (protect the fiber); consolidates duplicate-waypoint clusters so a turn is seen at its true angle |
-| `tether.py` | **v0 payout-tension model** — back-tension + airborne-span drag + turn/reversal load; validates the speed policy against a break budget (`tether-check`) |
+| `tether.py` | **v0 payout-tension model** — back-tension + airborne-span drag + turn/reversal load; validates the speed policy against a break budget (`tether-check`); also **parses + scores the Gazebo plugin's log** (`tether-plugin-check`) |
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter |
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
@@ -22,7 +22,8 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `executor.py` + `connector.py` | connect→upload→arm→start→monitor, RTL on error (+ progress-stall watchdog); fake connector for tests |
 | `mavsdk_connector.py` | live PX4 adapter (⚠️ needs SITL; excluded from coverage, not unit-tested) |
 | `sitl_launch.py` | inject the plan's home into PX4 SITL (`PX4_HOME_*`) so a mission lands at the real AO, not Zurich |
-| `config.py`, `cli.py` | config + `validate` / `nav` / `tether-check` / `simfly` / `sitl-env` / `px4-params` / `flatten-plan` / `ev-bridge` / `ev-report` / `fly` commands |
+| `config.py`, `cli.py` | config + `validate` / `nav` / `tether-check` / `tether-plugin-check` / `simfly` / `sitl-env` / `px4-params` / `flatten-plan` / `ev-bridge` / `ev-report` / `fly` commands |
+| `sitl/tether_plugin/` | **Gazebo C++ wrench plugin (v0)** — physics bit-exact vs `tether.py`; ✍️ written, **not yet compiled or flown** |
 
 ## Run / test
 ```bash
@@ -32,6 +33,7 @@ droneflight validate --plan ../droneplanner/out/mission.plan            # offlin
 droneflight nav      --plan .../mission.plan                            # VIO vs idealised vs optical VTRN
 droneflight nav      --plan .../mission.plan --forest-frac 0.7 --stale-frac 0.3  # conflict-zone basemap
 droneflight tether-check --plan .../mission.plan                        # payout tension: speed policy vs flat cruise
+droneflight tether-plugin-check --log tether-on.csv                     # Gazebo plugin log vs the model (exact-parity gate)
 droneflight simfly   --plan .../mission.plan --density 25               # forest flight: avoidance ON vs OFF
 droneflight simfly   --plan .../mission.plan --drift-rate 0.02 --vtrn-interval 150
 eval "$(droneflight sitl-env --plan .../mission.plan)"                  # PX4 SITL home = plan home
@@ -97,6 +99,36 @@ ruff check . && ruff format --check . && mypy --strict src && pytest -q # 185 te
   unbuilt and lives on the droneplanner side (see its SHORTFALLS cross-cutting note).
 - `mavsdk_connector.py` live path is untested without an autopilot.
 
+## ⚠️ Every SITL result so far is a FLAT-WORLD "happy path" (read this before quoting any of them)
+All of it — Slice 1, the three-arm acceptance, dropout/yaw, mag-denied
+`dropout-long`, the failsafe-tolerance run — flew **`plans/ev_test.plan`: a
+constant-30 m plan over PX4's default *flat ground plane*** (`default.sdf`), with a
+**synthetic** VTRN basemap (`correction.py`'s matchability/staleness are generated
+fields, not real orthophoto/DSM). The world has **no terrain, no obstacles, no
+features**. So what the campaign has actually validated is the **plumbing and the
+error models' effects** — EV injection, EKF2 fusion, ENU↔NED frames, the global-
+origin handshake, the progress watchdog, failsafe behaviour, and how injected
+drift/dropout/yaw move the estimate — *not* flight through a real environment.
+
+What remains **completely unflown** because the world is benign:
+- **Terrain-following** and the altitude-frame CFIT fix — regression-tested
+  offline only; the Gazebo terrain world (Slice 2) is parked (tumbles on
+  translation), so no relief has ever been flown.
+- **Obstacle avoidance in the loop** — `reactive.py` is a *kinematic* dodge; PX4
+  SITL has had no trees to avoid. Perception + avoidance vs real geometry is
+  untouched (and real perception needs the RTX box, Track B).
+- **VTRN over real features** — texture/forest starvation is *modelled*, never
+  matched against real imagery; the §6.3 bench is unbuilt.
+- **The tether speed policy over real turns** — the flown route is too smooth
+  (≤16° bends), so the policy has never engaged in flight (see `tether.py`).
+- **Concealment/viewshed** — no line-of-sight or cover exists in an empty world.
+
+**Bottom line: "it flies GPS-denied" means "the injection pipeline flies a smooth
+route over flat ground." The hard parts — terrain, obstacles, features — are the
+next campaign, and they need a non-degenerate world (unblock Slice 2's terrain
+tumble, add obstacle models, feed a feature-rich basemap). Treat every corridor
+number to date as a floor that real terrain can only make worse.**
+
 ## SITL bring-up plan (in progress — phased, per user)
 Goal: an MVP on the **Mac's Ubuntu VM** — PX4 SITL flies a planner `.plan`,
 GPS-denied via *injected* external-vision error (not real perception). Real
@@ -136,27 +168,43 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   case has a prepared fix (`configs/px4/dropout_tolerant.params`, RUNBOOK §3f):
   raise the no-aiding timeout so a brief gap is coasted through, not failsafed —
   because without a position estimate the vehicle cannot hold, only come down.
-- ⏸️ **Slice 2 PARKED (2026-07-21) — terrain world, not on the critical path.**
-  `droneplanner gz-world` injects the planned DTM into PX4's `default.sdf`
-  (RUNBOOK §2b). It **loads and flies**, but the vehicle **tumbles once it
-  translates**. Parked deliberately: it only adds *in-the-loop* confirmation of
-  terrain-following, and the prize it was chasing — the altitude-frame CFIT bug —
-  is already fixed and regression-tested. **The EV bridge does not need it.**
+- 🔧 **Slice 2 — terrain world: root-caused and FIXED in code 2026-07-23, awaiting
+  VM verification.** `droneplanner gz-world` injects the planned DTM into PX4's
+  `default.sdf` (RUNBOOK §2b). It loaded and flew but **tumbled once it
+  translated**.
 
-  *Established by measurement (don't re-investigate — see RUNBOOK §2b table):*
-  heightmap loads (`terrain` in `gz model --list`, 160×160 is fine); terrain
-  placement correct near home; hover control sound (18 s climb at 0.2°); physics
-  timing clean (4.00 ms median step, 0 gaps >50 ms); world config now inherited
-  from PX4. Bisection: a **flat** DEM tumbles too (557 m) — so not slope/normals.
-  Datum is **unverified** (the earlier "confirmed" claim was circular — PX4 zeroes
-  local z at spawn); ODE reports `AABB max z = 150.32` (DEM max elevation) vs the
-  110.32 relief passed as `<size>`, which would put the surface ~40 m high and is
-  the most promising thread.
+  **Cause: the vehicle spawned BURIED.** Gazebo uses a DEM's **raw elevation
+  values**, not a rescale into `<size>`'s z — ODE's `AABB max z = 150.32` was the
+  demo DEM's max *elevation*, not the `110.32` relief we passed. With the old
+  offset `-(home_elev − min_elev)` the terrain surface under home landed at world
+  `z = min_elev` instead of 0:
 
-  *Resume point:* fly `planner_nocol` (visual-only terrain + ground_plane, built
-  and pushed). Currently blocked on `ekf2 missing data` — first check whether the
-  sim is stepping at all (`listener sensor_combined -n 1`, and
-  `gz topic -e -t /world/planner_nocol/clock -n 3`).
+  | world | home | DEM min | surface at home | vehicle |
+  |---|---|---|---|---|
+  | real DEM | 124.68 | 40.00 | **+40.0 m** | buried 40 m |
+  | `--flat` diagnostic | 124.68 | 124.68 | **+124.7 m** | buried 125 m |
+
+  PX4 spawns at world z = 0, so the vehicle sat inside the heightmap in permanent
+  collision penetration — which reads as a *stable hover* and then flings it the
+  instant it translates. ⚠️ **This also invalidates the old `--flat` bisection**
+  ("a flat DEM tumbles too → not slope/normals → it's the heightmap itself"): the
+  flat world was buried *deeper*, so that run measured the same bug twice, not a
+  second one.
+
+  **Fix (`droneplanner/io/gzworld.py`): hand Gazebo a zero-based DEM.**
+  `normalise_dem()` subtracts the minimum elevation, so the written DEM spans
+  `0 .. relief` and the raw-vs-rescaled interpretations become numerically
+  identical — the datum no longer depends on a Gazebo behaviour we cannot pin
+  down from the Mac. `gz-world` now emits `<out>_dem.tif` next to the world and
+  points the SDF at it; `size.z` stays the relief; the pose offset is unchanged.
+  Also floors a degenerate `relief = 0` (a truly flat DEM gave `<size … 0>`).
+  Guarded by `surface_z_at_home()` == 0.0 across four home/DEM combinations.
+
+  *Still to do — verify on the VM (RUNBOOK §2b):* regenerate the world, copy the
+  **new `_dem.tif` alongside the `.sdf`**, and confirm the vehicle rests on the
+  surface rather than in it — compare `gz model -m terrain -p` against a height
+  query, **never** PX4's local z (it is zeroed at spawn, so it is tautological).
+  Then fly a translation and see whether the tumble is gone.
 
 - ✅ **Slice 3 — external-vision injection bridge: FLOWN, acceptance complete
   (2026-07-22).** `ev_bridge.py` + `droneflight ev-bridge` / `ev-report`, tested
@@ -472,16 +520,23 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
         **Any future `ev-report --record ev-vtrn.jsonl` now silently scores G as
         arm A.** Rename the local copy (e.g. `ev-G-vtrn-magdenied.jsonl`) before
         re-running the acceptance table.
-    - ⏭ **Only remaining follow-up, now PREPARED (not yet flown): the
-      failsafe-tolerance experiment** — `configs/px4/dropout_tolerant.params`,
-      RUNBOOK §3f. **The fix is the no-aiding TIMEOUT, not the action:** a
-      multirotor with no position estimate cannot hold XY, so "descend vs hold" is
-      a false choice — the lever is to stop treating a *brief* gap as position
-      loss. Raises `EKF2_NOAID_TOUT` 5 s → 8 s (just above the 6.1 s gap) so EKF2
-      coasts on IMU through the dropout and never trips the failsafe. Expected: 0
-      DESCEND episodes, flat altitude, `xy_valid` stays true. Tradeoff, set
-      deliberately: a longer timeout also delays the failsafe on a *genuine* vision
-      loss, so 8 s covers the transient and no more. The reversal itself is closed.
+    - ✅ **Failsafe-tolerance experiment FLOWN 2026-07-23 — it worked**
+      (`sim-logs/failsafe/15_02_03.ulg`, `EKF2_NOAID_TOUT=8 s` via
+      `configs/px4/dropout_tolerant.params`). Same 6×6 s gaps, but **0 DESCEND
+      episodes** (was 6), **`xy_valid` never false** (was ~10 %), altitude flat,
+      77/77. Raising the no-aiding timeout above the gap let EKF2 coast on IMU
+      without declaring position invalid, so the failsafe never armed. **The fix
+      is the TIMEOUT, not the action** — a multirotor with no position estimate
+      cannot hold XY, so "descend vs hold" was a false choice; the lever is to
+      stop treating a *brief* gap as position loss.
+      - ⚠️ **Measured tradeoff:** coasting the full 6 s grew EKF2 error to
+        **22.8 m in-gap** and the corridor to **24.5 m LEFT** — *worse* than the
+        descent baseline's 20.3 m. So it removes the CFIT/altitude hazard (the
+        point) but does **not** hold the corridor: a 6 s dropout exceeds bounded
+        nav's 15 m whichever failsafe you pick. Not descending toward the canopy
+        is still the right call for a NOE layer, and the excursion recovers when
+        EV returns. Set the timeout to just cover the transient (8 s), no more —
+        it also delays the failsafe on a *genuine* permanent loss.
   - 🔑 **The dropout pair is designed around EKF2's 5 s `EKF2_NOAID_TOUT`** (PX4
     default; *not* set in `gps_denied_ekf2.params`, so confirm with
     `param show EKF2_NOAID_TOUT` before flying). 3 s = under it → EKF2 should ride
@@ -564,12 +619,54 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     planning/avoidance problem, not a speed one (see [[tether-v0]]).
 
 - ⏭ **Next build items (updated):**
-  - **The Gazebo C++ tether wrench plugin** (`sitl/`, needs the VM) — the
-    in-the-loop half: apply `drag_tension_n` as a back-pull wrench on the airframe
-    each step and watch control/altitude, mirroring how `ev_bridge` followed
-    `nav.py`. The Python model is the reference it must match.
-  - **The failsafe-tolerance run** (`configs/px4/dropout_tolerant.params`,
-    RUNBOOK §3f) — prepared, unflown.
+  - **🌍 A non-flat world — the biggest gap.** Every SITL result is flat-world
+    happy path (see the caveat section above). Unblock Slice 2's terrain tumble,
+    add obstacle models, feed a feature-rich basemap — then re-fly the campaign
+    over relief + obstacles + features. This is the real next campaign, not a
+    tweak.
+  - ✍️ **Gazebo C++ tether wrench plugin — WRITTEN 2026-07-24, NOT COMPILED, NOT
+    FLOWN.** Sources in [`sitl/tether_plugin/`](sitl/tether_plugin/README.md);
+    requirements/acceptance in [`sitl/TETHER_PLUGIN.md`](sitl/TETHER_PLUGIN.md);
+    VM procedure in RUNBOOK §4. What is and isn't verified:
+    - ✅ **The physics is bit-exact against `tether.py`, proven on the Mac.**
+      `tether_math.hpp` is Gazebo-free and mirrors the Python's association
+      order; `tether_probe.cc` evaluates it from stdin and
+      `tests/test_tether_plugin.py` diffs 3 parameter sets × 9 speeds × 10
+      deflections with **`==`, not a tolerance**. A test also asserts the two
+      *default* coefficient sets are identical, so retuning one side fails the
+      build. A ULP-tampering test proves the gate has teeth.
+    - ✅ **The log format is testable off the VM too.** `tether_log.hpp` holds the
+      CSV writer, so the C++ produces byte-real logs on the Mac that
+      `tether.parse_plugin_log` / `check_plugin_parity` score. Acceptance §1 is
+      therefore **runnable now**: `droneflight tether-plugin-check --log <csv>`,
+      exit 1 on any divergence.
+    - ⚠️ **`TetherPlugin.cc` has never seen a compiler** — written against the
+      gz-sim8 API from docs, no `gz-sim8` headers on the M4. Expect the first VM
+      build to surface signature errors. Everything behind that interface is
+      tested; the glue is entity lookup + `AddWorldForce` and nothing else, by
+      design (logic that migrates into it becomes untestable).
+    - 🔧 **Corrected a requirement while building:** TETHER_PLUGIN.md said to put
+      the `<plugin>` block in the **world** SDF. Wrong — `make px4_sitl gz_x500`
+      spawns the vehicle into the world at runtime, so no world file contains an
+      x500 to attach to, and a block placed there **loads nothing and reports
+      nothing**. It goes in the x500 *model* SDF;
+      `sitl/tether_plugin/install_tether_plugin.sh` patches it idempotently
+      (`--remove` reverts to byte-identical).
+    - ⚠️ **Expect acceptance §2 to be near-null, and don't read that as failure.**
+      0.76 N on a ~2 kg x500 is ~0.04 g / ~2.2° of tilt, which PX4 trims out.
+      Parity (§1) is what proves the plugin works; §2 measures whether the fiber
+      *matters*. Sweep `airborne_span_m` (40 → 400) so the evidence is a scaling
+      law, not one A/B at a magnitude the controller can hide.
+    - ⛔ **Acceptance §3 (speed policy in the loop) is blocked on a route, not on
+      the plugin** — `plans/ev_test.plan` bends ≤16°, so the policy never fires
+      and `tether-check` already calls the tether slack there. Needs a turn-rich
+      plan; same gap as the flat-world caveat.
+    - 🧪 **A/B is one env var, not an SDF edit:** `DRONEFLIGHT_TETHER_ENABLED=0|1`
+      and `DRONEFLIGHT_TETHER_CSV=<path>`. A disabled run still loads and still
+      logs `enabled=0`, so a control arm is identifiable from its own artifacts —
+      the lesson from the F/G filename scramble. **No `[tether]` line in the
+      console = the plugin did not load; do not score that run.**
+  - ✅ Failsafe-tolerance run — flown (RUNBOOK §3f).
   - Cheap offline wins: re-run the MC with forest-frac and stale-frac varied
     *separately* (the flown conflict arm showed only forest-frac doing damage),
     and settle the `DriftWalker` √distance question above.

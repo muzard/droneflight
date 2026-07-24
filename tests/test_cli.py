@@ -572,3 +572,80 @@ def test_tether_check_flags_a_break_and_exits_nonzero(
     assert "SNAP" in out
     assert "prevents" in out  # the policy saves what flat cruise would break
     assert rc == 0  # policy arm stays within the limit even though flat cruise does not
+
+
+def _write_tether_plugin_log(path: Path, *, enabled: int = 1, span: float = 40.0) -> None:
+    """A CSV in the Gazebo plugin's log format — see sitl/tether_plugin/."""
+    from droneflight.tether import TetherConfig, drag_tension_n
+
+    config = TetherConfig(airborne_span_m=span)
+    rows = []
+    for i in range(20):
+        drag = drag_tension_n(config, 6.0)
+        tension = config.back_tension_n + drag
+        rows.append(
+            f"{i / 10!r},0.0,0.0,30.0,6.0,0.0,6.0,{drag!r},{tension!r},0.0,0.0,0.0,"
+            f"{-tension!r},0.0,1"
+        )
+    path.write_text(
+        "\n".join(
+            [
+                f"# droneflight tether plugin v0 enabled={enabled} link=x500/base_link",
+                "# fiber_diameter_m=0.00025 drag_coefficient=1.2 air_density_kg_m3=1.225 "
+                "airborne_span_m=40.0 back_tension_n=0.5 payout_inertia_kg=0.15 "
+                "coupling_length_m=8.0 speed_floor_ms=0.3",
+                "t_s,x_m,y_m,z_m,vx_ms,vy_ms,speed_ms,drag_n,tension_n,"
+                "lateral_accel_ms2,deflection_deg,turn_n,fx_n,fy_n,moving",
+                *rows,
+            ]
+        )
+        + "\n"
+    )
+
+
+def test_tether_plugin_check_passes_a_faithful_log(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = tmp_path / "tether.csv"
+    _write_tether_plugin_log(log)
+    rc = app(["tether-plugin-check", "--log", str(log)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "EXACT" in out
+    assert "20 samples" in out
+    assert "0.7646" in out  # the applied peak, back-tension + drag at cruise
+
+
+def test_tether_plugin_check_fails_a_divergent_log(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Built with a 60 m airborne span, logged a header claiming 40 m: the flight
+    was disturbed by a model nobody analysed. Must exit non-zero."""
+    log = tmp_path / "tether.csv"
+    _write_tether_plugin_log(log, span=60.0)
+    rc = app(["tether-plugin-check", "--log", str(log)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "DIVERGED" in out
+
+
+def test_tether_plugin_check_flags_a_disabled_control_arm(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = tmp_path / "tether.csv"
+    _write_tether_plugin_log(log, enabled=0)
+    app(["tether-plugin-check", "--log", str(log)])
+    assert "DISABLED" in capsys.readouterr().out
+
+
+def test_tether_plugin_check_reports_a_break(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = tmp_path / "tether.csv"
+    _write_tether_plugin_log(log)
+    app(["tether-plugin-check", "--log", str(log), "--break-tension", "0.5"])
+    assert "would snap" in capsys.readouterr().out
+
+
+def test_tether_plugin_check_missing_log(tmp_path: Path) -> None:
+    assert app(["tether-plugin-check", "--log", str(tmp_path / "nope.csv")]) == 2

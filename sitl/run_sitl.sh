@@ -49,6 +49,19 @@ fi
 # Place the SITL vehicle at the plan's home, not PX4's Zurich default.
 eval "$(droneflight sitl-env --plan "$PLAN")"
 echo "PX4 SITL home: $PX4_HOME_LAT, $PX4_HOME_LON @ ${PX4_HOME_ALT} m (HEADLESS=$HEADLESS)"
+# Tether plugin (tether_plugin/): if it has been built, put it on Gazebo's
+# system-plugin path so the <plugin> block in the x500 model SDF resolves. Not
+# built = not on the path = the block loads nothing, which Gazebo reports but
+# does not treat as an error — hence the explicit banner either way.
+TETHER_BUILD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tether_plugin/build"
+if [[ -d "$TETHER_BUILD" ]]; then
+  export GZ_SIM_SYSTEM_PLUGIN_PATH="${GZ_SIM_SYSTEM_PLUGIN_PATH:+$GZ_SIM_SYSTEM_PLUGIN_PATH:}$TETHER_BUILD"
+  echo "tether: plugin path $TETHER_BUILD (DRONEFLIGHT_TETHER_ENABLED=${DRONEFLIGHT_TETHER_ENABLED:-1}${DRONEFLIGHT_TETHER_CSV:+, csv=$DRONEFLIGHT_TETHER_CSV})"
+  echo "        confirm it actually loaded: look for a '[tether] ENABLED ...' line below."
+else
+  echo "tether: plugin NOT built (no $TETHER_BUILD) — flying without payout disturbance."
+fi
+
 if [[ -n "${PX4_GZ_WORLD:-}" ]]; then
   echo "world: $PX4_GZ_WORLD"
 else
