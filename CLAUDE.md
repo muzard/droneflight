@@ -200,11 +200,43 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
   Also floors a degenerate `relief = 0` (a truly flat DEM gave `<size … 0>`).
   Guarded by `surface_z_at_home()` == 0.0 across four home/DEM combinations.
 
-  *Still to do — verify on the VM (RUNBOOK §2b):* regenerate the world, copy the
-  **new `_dem.tif` alongside the `.sdf`**, and confirm the vehicle rests on the
-  surface rather than in it — compare `gz model -m terrain -p` against a height
-  query, **never** PX4's local z (it is zeroed at spawn, so it is tautological).
-  Then fly a translation and see whether the tumble is gone.
+  ✅ **Datum CONFIRMED on the VM (2026-07-24) — the vehicle now rests on the
+  terrain.** The proof is the *attitude*, not the height: a vehicle resting on a
+  heightmap takes the terrain's local slope, and the demo AO's DEM gradient at
+  home (dz/dy = 0.0197 → **1.13°**) matches the measured vehicle roll
+  (−0.019224 rad → **1.10°**) to 2 %. It settled at z = −0.007 m (≈7 mm of ODE
+  contact penetration).
+  ⚠️ **The z value is NOT a discriminator** — PX4 spawns at the world origin, so
+  `z ≈ 0` either way, resting or buried. An earlier note here predicted "z ≈ +0.2"
+  from a guess about the x500's model frame; that was wrong (its origin is at
+  ground level, not the body). Score this on roll vs DEM gradient.
+
+  ✅ **SLICE 2 IS DONE — the terrain world flies (2026-07-24,
+  `sim-logs/terrain/17_12_10.ulg`).** World confirmed loaded from the console
+  (`Starting gazebo with world: …/planner_terrain.sdf`, no URI errors). The
+  vehicle flew **51/77 waypoints (~2/3 of a 5 km route) over real relief** with
+  altitude tracking terrain from +29 m to −42 m — where it previously **tumbled
+  on the first translation**. The tumble is gone; the buried-spawn diagnosis was
+  right.
+
+  🔴 **…and on its very first real-terrain flight it found a planner CFIT defect
+  that flat-world SITL could never have found.** The run ended at 51/77: the
+  aircraft flew into the ground at t=482 s and the watchdog aborted 565 s later.
+  Not a tumble, not the world — a **descent-profile mismatch**. The plan is
+  correct at every vertex *and* along every leg under linear altitude
+  interpolation (min 22.4 m AGL), but PX4 descends toward the next waypoint's
+  altitude **at its own vertical rate**, front-loading it:
+
+  | leg wp50→51, 765 m, −40.5 m | at 17 % along the leg |
+  |---|---|
+  | linear interp (planner's assumption) | +14.4 m → **27.0 m AGL** |
+  | PX4 actual | −11.9 m → **0.8 m AGL** → impact |
+
+  Full analysis, the worst-case re-scoring (3 legs underground) and fix options
+  are in **`droneplanner/SHORTFALLS.md` item 0** — it is a planner defect, not a
+  flight-stack one. This is the clearest possible vindication of the flat-world
+  caveat: the first flight over relief broke the aircraft in a way 8 flat
+  campaigns could not.
 
 - ✅ **Slice 3 — external-vision injection bridge: FLOWN, acceptance complete
   (2026-07-22).** `ev_bridge.py` + `droneflight ev-bridge` / `ev-report`, tested

@@ -57,7 +57,7 @@ expected, and it is what the pytest suite exercises.
 ## Install into PX4
 
 ```bash
-./install_tether_plugin.sh ~/PX4-Autopilot
+./install_tether_plugin.sh ~/drone/PX4-Autopilot
 ```
 
 Idempotent; keeps a pristine copy at `model.sdf.orig`; `--remove` reverts it
@@ -68,15 +68,23 @@ x500 to attach to and a `<plugin>` block placed there is a silent no-op.
 `run_sitl.sh` adds `build/` to `GZ_SIM_SYSTEM_PLUGIN_PATH` automatically when it
 exists, and prints whether it did.
 
-**Always confirm the plugin loaded** before scoring a run — the console must
-show:
+**Always confirm the plugin loaded** before scoring a run. An unresolved plugin
+does not stop the sim, so a no-tether run otherwise looks exactly like a tether
+run. The **CSV file existing** is the reliable check (it is created in
+`Configure`); the console banner
 
 ```
 [tether] ENABLED on x500/base_link -- back_tension_n=0.5 airborne_span_m=40 ...
 ```
 
-An unresolved plugin does not stop the sim. A run with no `[tether]` line is a
-no-tether run wearing a tether label.
+is a `gzmsg` and only prints at Gazebo verbosity ≥ 3 — its absence is *not*
+evidence of failure. RUNBOOK §4.3.
+
+**Then prove the force actually reaches the physics** before any experiment: set
+`airborne_span_m` to 4000 (~27 N at 6 m/s, >1 g on a ~2 kg x500) and confirm the
+vehicle visibly loses the route. A logged tension is not an applied one, and a
+force that is computed but never applied looks perfectly healthy in the CSV.
+RUNBOOK §4.4.
 
 ## Running an A/B
 

@@ -67,8 +67,22 @@ just want to see a mission fly.
 
 **(a) Source build — recommended**
 
+⚠️ **Where PX4 lives — set this once.** Every command below assumes
+`~/drone/PX4-Autopilot`, which is where it is on this VM. The scripts
+(`run_sitl.sh`, `install_tether_plugin.sh`) take the dir as an argument but also
+honour `PX4_AUTOPILOT_DIR`, so set it once and stop passing paths:
+
+```bash
+echo 'export PX4_AUTOPILOT_DIR=~/drone/PX4-Autopilot' >> ~/.bashrc && source ~/.bashrc
+```
+
+A wrong PX4 path cost a session: the docs said `~/PX4-Autopilot` while the VM had
+`~/drone/PX4-Autopilot`, so a generated world embedded an unreachable DEM URI and
+Gazebo refused to load the world.
+
 ```bash
 sudo apt update && sudo apt install -y git
+mkdir -p ~/drone && cd ~/drone
 git clone https://github.com/PX4/PX4-Autopilot.git --recursive
 cd PX4-Autopilot && bash ./Tools/setup/ubuntu.sh    # installs deps + Gazebo
 # log out/in (or reboot) so group/env changes apply, then:
@@ -89,7 +103,7 @@ fix is to make one environment satisfy both:
 
 ```bash
 . ~/venv/bin/activate
-pip install -r ~/PX4-Autopilot/Tools/setup/requirements.txt
+pip install -r ~/drone/PX4-Autopilot/Tools/setup/requirements.txt
 ```
 
 Use the requirements file, **not** `pip install empy` — PX4 pins `empy==3.3.4`
@@ -148,7 +162,7 @@ MAVSDK_SERVER_ARCH=aarch64 pip install --force-reinstall --no-cache-dir mavsdk
 ### 1.5 Verify before flying
 
 ```bash
-ls -l ~/PX4-Autopilot/build/px4_sitl_default/bin/px4   # the build actually produced a binary
+ls -l ~/drone/PX4-Autopilot/build/px4_sitl_default/bin/px4   # the build actually produced a binary
 gz sim --versions                                      # Gazebo present
 python -c "import mavsdk; print('mavsdk ok')"
 pytest -q                                              # 141 passed => package is sane
@@ -280,7 +294,7 @@ mission flies hundreds of km away (or is rejected). `sitl/run_sitl.sh` does this
 by injecting `PX4_HOME_*` from `droneflight sitl-env`:
 
 ```bash
-./sitl/run_sitl.sh /path/to/mission.plan ~/PX4-Autopilot   # x500 quad, home = plan home
+./sitl/run_sitl.sh /path/to/mission.plan ~/drone/PX4-Autopilot   # x500 quad, home = plan home
 # equivalently, by hand:
 #   eval "$(droneflight sitl-env --plan /path/to/mission.plan)"
 #   cd PX4-Autopilot && make px4_sitl gz_x500
@@ -313,8 +327,8 @@ droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan \
                       --out demo_ao/worlds/planner_terrain.sdf
 
 # copy the .sdf AND the .tif it references to the VM (§1.6), then:
-cp planner_terrain.sdf ~/PX4-Autopilot/Tools/simulation/gz/worlds/
-./sitl/run_sitl.sh ~/plans/mission.plan ~/PX4-Autopilot planner_terrain   # world = arg 3
+cp planner_terrain.sdf ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
+./sitl/run_sitl.sh ~/plans/mission.plan ~/drone/PX4-Autopilot planner_terrain   # world = arg 3
 ```
 
 ⚠️ **Pass the world as arg 3.** If it is omitted, PX4 silently loads its **flat**
@@ -375,12 +389,27 @@ the VM — the SDF references it by absolute path. A missing DEM loads an empty
 heightmap.
 
 Check, in order:
-1. `gz model -m terrain -p` vs a height query — the surface under home must be at
-   **z ≈ 0**. **Do not** infer this from PX4's local z: PX4 zeroes its local
-   origin at the spawn point, so `z = 0` at rest is tautological (that circular
-   reading is what hid this bug for two sessions).
-2. Vehicle rests *on* the surface, not in it — no contact jitter at idle.
+1. `gz model -m terrain -p` — pose z must be the computed offset (**−84.681** for
+   the demo AO).
+2. `gz model -m x500_0 -p` — **read the ROLL, not the z.** ⚠️ The z is *not* a
+   discriminator: PX4 spawns the vehicle at the world origin, so `z ≈ 0` whether
+   it is resting on a surface at 0 **or** buried under one at +40. The attitude is
+   what proves contact: a vehicle resting on a heightmap takes the terrain's local
+   slope. Compare against the DEM's own gradient at home:
+
+   | | value |
+   |---|---|
+   | DEM gradient at home (demo AO) | dz/dy = 0.0197 → **1.13°** |
+   | measured vehicle roll (2026-07-24) | −0.019224 rad → **1.10°** |
+
+   A 2 % match = the heightmap collision is live, correctly placed, and the
+   vehicle is on top of it. A buried vehicle does not sit calmly at the local
+   slope angle.
 3. Then **fly a translation**. Tumble gone = fixed.
+
+**Do not** infer any of this from PX4's local z: PX4 zeroes its local origin at
+the spawn point, so `z = 0` at rest is tautological — that circular reading is
+what hid this bug for two sessions.
 
 *Historical (what the tumble looked like):* the vehicle spawned correctly, climbed
 perfectly, then tumbled as soon as it translated (`Attitude failure (roll)`,
@@ -569,7 +598,7 @@ lock.
 
 ```bash
 # shell A — PX4 SITL at the plan's home, flat world
-./sitl/run_sitl.sh ~/plans/ev_test.plan ~/PX4-Autopilot
+./sitl/run_sitl.sh ~/plans/ev_test.plan ~/drone/PX4-Autopilot
 
 # shell B — the vision stream (VTRN fixes ON)
 droneflight ev-bridge --plan ~/plans/ev_test.plan --url udpin://0.0.0.0:14541 \
@@ -1069,7 +1098,7 @@ compiler. **Budget the first VM session for build errors**, not for results.
 ```bash
 cd ~/droneflight/sitl/tether_plugin
 cmake -B build -S . && cmake --build build -j     # needs gz-sim8 + gz-plugin2 dev
-./install_tether_plugin.sh ~/PX4-Autopilot         # patches the x500 MODEL sdf
+./install_tether_plugin.sh ~/drone/PX4-Autopilot         # patches the x500 MODEL sdf
 ```
 
 `install_tether_plugin.sh` is idempotent, saves `model.sdf.orig`, and reverts
@@ -1115,7 +1144,7 @@ wrench actually lands, using a magnitude too large to miss:
 
 ```bash
 # absurd span -> ~27 N at 6 m/s, >1 g on a ~2 kg x500: it should visibly lose the route
-DRONEFLIGHT_TETHER_CSV=$HOME/tether-huge.csv ./run_sitl.sh <plan> ~/PX4-Autopilot
+DRONEFLIGHT_TETHER_CSV=$HOME/tether-huge.csv ./run_sitl.sh <plan> ~/drone/PX4-Autopilot
 #   ...with <airborne_span_m>4000</airborne_span_m> in the x500 model SDF
 ```
 
@@ -1142,11 +1171,11 @@ between runs and the arms cannot silently differ in anything else:
 
 ```bash
 # shell A — tether ON
-DRONEFLIGHT_TETHER_ENABLED=1 DRONEFLIGHT_TETHER_CSV=~/tether-on.csv ./run_sitl.sh <plan> ~/PX4-Autopilot
+DRONEFLIGHT_TETHER_ENABLED=1 DRONEFLIGHT_TETHER_CSV=~/tether-on.csv ./run_sitl.sh <plan> ~/drone/PX4-Autopilot
 # ...then the usual `droneflight fly` in shell B (§3)
 
 # shell A — control
-DRONEFLIGHT_TETHER_ENABLED=0 DRONEFLIGHT_TETHER_CSV=~/tether-off.csv ./run_sitl.sh <plan> ~/PX4-Autopilot
+DRONEFLIGHT_TETHER_ENABLED=0 DRONEFLIGHT_TETHER_CSV=~/tether-off.csv ./run_sitl.sh <plan> ~/drone/PX4-Autopilot
 ```
 
 A disabled run still loads and still logs, recording `enabled=0` in its CSV
@@ -1216,7 +1245,7 @@ setup varies by hypervisor — worth doing once the basic loop is green, not bef
 PX4 writes a full **ULog** flight log to the simulated SD card:
 
 ```
-~/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/<time>.ulg
+~/drone/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/<time>.ulg
 ```
 
 This is the authoritative record — EKF state, position estimates, setpoints, mode
@@ -1265,7 +1294,7 @@ tmux capture-pane -t px4:0.0 -p -S -5000 > ~/logs/px4-console.log
 # on the Mac — DroneAutomation/sim-logs/ sits outside both git repos
 DROP=/Users/arttu/Claude/Projects/DroneAutomation/sim-logs
 scp <vm>:'~/logs/*.log' $DROP/
-scp <vm>:'~/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/*.ulg' $DROP/
+scp <vm>:'~/drone/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/*.ulg' $DROP/
 ```
 
 Decode a `.ulg` on the Mac with `pip install pyulog` → `ulog_info x.ulg`,
