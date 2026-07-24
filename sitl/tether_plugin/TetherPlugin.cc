@@ -110,7 +110,15 @@ void TetherPlugin::Configure(const gz::sim::Entity &_entity,
   // Echo the configuration unconditionally, including when disabled: an arm
   // that logs nothing is indistinguishable from a plugin that failed to load,
   // and that ambiguity has already cost this program one confusing A/B.
-  gzmsg << "[tether] " << (enabled ? "ENABLED" : "DISABLED (no force applied)") << " on "
+  //
+  // gzWARN, not gzmsg, deliberately. `gzmsg` is Gazebo's INFO channel
+  // (verbosity >= 3) and PX4 launches Gazebo below that, so this banner was
+  // INVISIBLE on a working run — which cost a session chasing a plugin that had
+  // loaded correctly all along. It is not a warning semantically; it is a
+  // load-confirmation that has to survive the default verbosity. The periodic
+  // per-sample line in PreUpdate stays `gzmsg` so it cannot spam.
+  // The authoritative check is the CSV header (`enabled=`), not this line.
+  gzwarn << "[tether] " << (enabled ? "ENABLED" : "DISABLED (no force applied)") << " on "
         << this->model.Name(_ecm) << "/" << linkName << " -- back_tension_n="
         << this->params.back_tension_n << " airborne_span_m=" << this->params.airborne_span_m
         << " drag_coefficient=" << this->params.drag_coefficient << " fiber_diameter_m="
@@ -130,7 +138,7 @@ void TetherPlugin::Configure(const gz::sim::Entity &_entity,
     {
       tether::WriteCsvHeader(this->csv, this->params, enabled,
                              this->model.Name(_ecm) + "/" + linkName);
-      gzmsg << "[tether] logging to " << csvPath << "\n";
+      gzwarn << "[tether] logging to " << csvPath << "\n";  // see the banner note above
     }
   }
 }

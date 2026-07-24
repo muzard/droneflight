@@ -1124,11 +1124,14 @@ otherwise indistinguishable from a tether run. Two checks, in order of authority
    head -2 /home/$USER/tether-on.csv     # two '#' lines = loaded, with its coefficients
    ```
 2. **The console banner** — `[tether] ENABLED on x500/base_link -- back_tension_n=0.5 ...`
-   ⚠️ This is a `gzmsg`, which Gazebo prints only at **verbosity ≥ 3**. If PX4
-   launches the server quieter than that, the banner is absent on a perfectly
-   healthy run. **Absence of the banner is not evidence of failure — absence of
-   the CSV is.** If you want the banner to be dependable, either raise Gazebo's
-   verbosity or promote that one line to `gzerr` in `TetherPlugin.cc`.
+   **Fixed 2026-07-24: it is now a `gzwarn`, so it prints at PX4's default
+   verbosity.** It was a `gzmsg` (Gazebo INFO, verbosity ≥ 3) which PX4 runs
+   below, so a healthy run printed *nothing* while every failure path (`gzerr`)
+   printed normally — the absence looked exactly like a failure and cost a
+   session chasing a plugin that had loaded correctly all along.
+   ⚠️ On any build predating that fix, **absence of the banner is not evidence of
+   failure — absence of the CSV is.** Rebuild the plugin to get the visible
+   banner; check (1) either way.
 
 ⚠️ **Kill stray `gz sim`/`ruby` processes between runs.** PX4 attaches to an
 already-running simulator (§2b says the same thing about world selection), and

@@ -77,8 +77,12 @@ run. The **CSV file existing** is the reliable check (it is created in
 [tether] ENABLED on x500/base_link -- back_tension_n=0.5 airborne_span_m=40 ...
 ```
 
-is a `gzmsg` and only prints at Gazebo verbosity ≥ 3 — its absence is *not*
-evidence of failure. RUNBOOK §4.3.
+**is now a `gzwarn`, so it prints at PX4's default Gazebo verbosity.** It used to
+be a `gzmsg` (INFO, verbosity ≥ 3), which PX4 runs below — so a correctly loaded
+plugin printed *nothing* while every failure path (`gzerr`) printed normally, and
+its absence looked exactly like a failure. That cost a session. On any build
+before 2026-07-24, treat a missing banner as uninformative and check the CSV.
+RUNBOOK §4.3.
 
 **Then prove the force actually reaches the physics** before any experiment: set
 `airborne_span_m` to 4000 (~27 N at 6 m/s, >1 g on a ~2 kg x500) and confirm the
