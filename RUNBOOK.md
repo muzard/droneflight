@@ -1143,12 +1143,20 @@ copies of the same arm. The CSV header records what the plugin actually read —
 ### 4.4 Bring-up: prove the force reaches the physics
 
 A logged tension is not an applied one. Before any real experiment, confirm the
-wrench actually lands, using a magnitude too large to miss:
+wrench actually lands, using a magnitude too large to miss. `airborne_span_m`
+takes an **env override** (`DRONEFLIGHT_TETHER_SPAN`) so this is a one-shot, not
+an SDF edit between arms:
 
 ```bash
-# absurd span -> ~27 N at 6 m/s, >1 g on a ~2 kg x500: it should visibly lose the route
-DRONEFLIGHT_TETHER_CSV=$HOME/tether-huge.csv ./run_sitl.sh <plan> ~/drone/PX4-Autopilot
-#   ...with <airborne_span_m>4000</airborne_span_m> in the x500 model SDF
+DRONEFLIGHT_TETHER_SPAN=4000 DRONEFLIGHT_TETHER_CSV=$HOME/tether-huge.csv \
+    ./run_sitl.sh <plan> ~/drone/PX4-Autopilot
+```
+
+Then fly the mission and watch it fail. Verify the arm was configured as intended
+from the CSV header — it must read `airborne_span_m=4000` **and** `enabled=1`:
+
+```bash
+head -2 $HOME/tether-huge.csv
 ```
 
 | `airborne_span_m` | drag @6 m/s | total | ≈ tilt to hold it | expect |
@@ -1209,9 +1217,10 @@ cruise* — but it is **not** evidence the plugin works. Distinguish the two:
 
 - **Parity (§4.5) is what proves the plugin works.** It is independent of whether
   the force is large enough to see.
-- To show the disturbance is *real*, **sweep `airborne_span_m`** (40 → 400 in the
-  SDF) and confirm the attitude bias scales with it and with `v²`. A scaling law
-  is far stronger evidence than one A/B at a magnitude the controller can hide.
+- To show the disturbance is *real*, **sweep `airborne_span_m`** (40 → 400 → 4000
+  via `DRONEFLIGHT_TETHER_SPAN`) and confirm the attitude bias scales with it and
+  with `v²`. A scaling law is far stronger evidence than one A/B at a magnitude
+  the controller can hide.
 
 Acceptance §3 (speed policy in the loop) is **blocked on a route, not on the
 plugin**: `plans/ev_test.plan` bends ≤16°, so the policy never engages and

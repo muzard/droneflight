@@ -53,11 +53,31 @@ echo "PX4 SITL home: $PX4_HOME_LAT, $PX4_HOME_LON @ ${PX4_HOME_ALT} m (HEADLESS=
 # system-plugin path so the <plugin> block in the x500 model SDF resolves. Not
 # built = not on the path = the block loads nothing, which Gazebo reports but
 # does not treat as an error — hence the explicit banner either way.
+# The plugin reads DRONEFLIGHT_TETHER_* in the Gazebo SERVER process. Export
+# them so they reach it however this script was invoked — a bare `VAR=val
+# ./run_sitl.sh` inherits, but `export VAR; ./run_sitl.sh` would not propagate
+# past here without this. (An unexported ENABLED=0 is half of why the first
+# "OFF" arm recorded enabled=1.)
+export DRONEFLIGHT_TETHER_ENABLED DRONEFLIGHT_TETHER_CSV DRONEFLIGHT_TETHER_SPAN
+
+# ⚠️ Kill a stale Gazebo server before launching. PX4 ATTACHES to an already-
+# running gz server, and the plugin reads its env ONCE, in Configure — so a
+# leftover server from the previous arm silently reuses THAT arm's settings, and
+# the A/B becomes two copies of the first run. This is the other half of the
+# bad "OFF" arm: it inherited the ON server's enabled=1. Idempotent; harmless if
+# nothing is running.
+if pgrep -x "gz sim" >/dev/null 2>&1 || pgrep -f "gz-sim|ruby.*gz" >/dev/null 2>&1; then
+  echo "tether: killing stale gz server(s) so this arm's DRONEFLIGHT_TETHER_* actually take effect"
+  pkill -f "gz sim" 2>/dev/null || true
+  pkill -f "gz-sim" 2>/dev/null || true
+  sleep 1
+fi
+
 TETHER_BUILD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tether_plugin/build"
 if [[ -d "$TETHER_BUILD" ]]; then
   export GZ_SIM_SYSTEM_PLUGIN_PATH="${GZ_SIM_SYSTEM_PLUGIN_PATH:+$GZ_SIM_SYSTEM_PLUGIN_PATH:}$TETHER_BUILD"
-  echo "tether: plugin path $TETHER_BUILD (DRONEFLIGHT_TETHER_ENABLED=${DRONEFLIGHT_TETHER_ENABLED:-1}${DRONEFLIGHT_TETHER_CSV:+, csv=$DRONEFLIGHT_TETHER_CSV})"
-  echo "        confirm it actually loaded: look for a '[tether] ENABLED ...' line below."
+  echo "tether: plugin path $TETHER_BUILD (DRONEFLIGHT_TETHER_ENABLED=${DRONEFLIGHT_TETHER_ENABLED:-1}${DRONEFLIGHT_TETHER_SPAN:+, span=$DRONEFLIGHT_TETHER_SPAN}${DRONEFLIGHT_TETHER_CSV:+, csv=$DRONEFLIGHT_TETHER_CSV})"
+  echo "        confirm it loaded: the CSV must exist with 'enabled=' in its header (banner is now a gzwarn)."
 else
   echo "tether: plugin NOT built (no $TETHER_BUILD) — flying without payout disturbance."
 fi

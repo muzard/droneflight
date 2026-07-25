@@ -37,6 +37,28 @@ bool EnvBool(const char *_name, bool _fallback)
   return !(value == "0" || value == "false" || value == "FALSE" || value == "off");
 }
 
+// Optional env override for a numeric parameter. Returns the fallback (the SDF
+// value) when unset or unparseable. Used so an A/B sweep — e.g. airborne_span_m
+// 40 -> 4000 for the "is the force even applied?" test — is a one-shot env var,
+// not an edit to the installed SDF between arms. Editing the SDF per arm is the
+// same class of error that already produced an "OFF" run wearing enabled=1.
+double EnvDouble(const char *_name, double _fallback)
+{
+  const char *raw = std::getenv(_name);
+  if (raw == nullptr || raw[0] == '\0')
+    return _fallback;
+  try
+  {
+    return std::stod(std::string(raw));
+  }
+  catch (const std::exception &)
+  {
+    gzerr << "[tether] " << _name << "='" << raw
+          << "' is not a number - using " << _fallback << ".\n";
+    return _fallback;
+  }
+}
+
 }  // namespace
 
 TetherPlugin::~TetherPlugin()
@@ -69,7 +91,10 @@ void TetherPlugin::Configure(const gz::sim::Entity &_entity,
   this->params.fiber_diameter_m = num("fiber_diameter_m", d.fiber_diameter_m);
   this->params.drag_coefficient = num("drag_coefficient", d.drag_coefficient);
   this->params.air_density_kg_m3 = num("air_density_kg_m3", d.air_density_kg_m3);
-  this->params.airborne_span_m = num("airborne_span_m", d.airborne_span_m);
+  // airborne_span_m alone takes an env override, for the §2 span sweep that
+  // proves the force reaches the body (a logged tension is not an applied one).
+  this->params.airborne_span_m =
+      EnvDouble("DRONEFLIGHT_TETHER_SPAN", num("airborne_span_m", d.airborne_span_m));
   this->params.back_tension_n = num("back_tension_n", d.back_tension_n);
   this->params.payout_inertia_kg = num("payout_inertia_kg", d.payout_inertia_kg);
   this->params.coupling_length_m = num("coupling_length_m", d.coupling_length_m);

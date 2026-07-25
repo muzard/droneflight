@@ -656,10 +656,29 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     add obstacle models, feed a feature-rich basemap — then re-fly the campaign
     over relief + obstacles + features. This is the real next campaign, not a
     tweak.
-  - ✍️ **Gazebo C++ tether wrench plugin — WRITTEN 2026-07-24, NOT COMPILED, NOT
-    FLOWN.** Sources in [`sitl/tether_plugin/`](sitl/tether_plugin/README.md);
-    requirements/acceptance in [`sitl/TETHER_PLUGIN.md`](sitl/TETHER_PLUGIN.md);
-    VM procedure in RUNBOOK §4. What is and isn't verified:
+  - 🔧 **Gazebo C++ tether wrench plugin — COMPILED, LOADED, FLOWN 2026-07-24;
+    §1 parity + §2 span-sweep still pending clean arms.** Sources in
+    [`sitl/tether_plugin/`](sitl/tether_plugin/README.md); requirements/acceptance
+    in [`sitl/TETHER_PLUGIN.md`](sitl/TETHER_PLUGIN.md); VM procedure in RUNBOOK §4.
+    It built against gz-sim8, loaded, and flew a full 77/77 mission with the force
+    logged and applied (fx/fy non-zero, tension to 0.773 N at cruise, matching the
+    model). Two operational bugs surfaced and are fixed — see below.
+    - 🐛 **The first "OFF" control arm was not off — it recorded `enabled=1`
+      (caught by the CSV header, exactly as designed).** Two causes, both fixed in
+      `run_sitl.sh`: (1) it never `export`ed `DRONEFLIGHT_TETHER_ENABLED`, and
+      (2) a stale Gazebo server from the previous ON arm was reused — PX4 attaches
+      to a running gz server and the plugin reads its env **once in Configure**,
+      so the leftover server reused ON settings. `run_sitl.sh` now exports the
+      tether vars and kills stale `gz sim` servers before launch. **Re-fly both
+      A/B arms.**
+    - 🐛 **The load banner was invisible** — emitted with `gzmsg` (Gazebo INFO,
+      verbosity ≥ 3), which PX4 runs below, so a healthy run printed nothing while
+      failures (`gzerr`) printed. Now `gzwarn`. The authoritative load check is
+      the CSV header's `enabled=` field, not the console (docs corrected).
+    - 🆕 **`airborne_span_m` now takes an env override `DRONEFLIGHT_TETHER_SPAN`**
+      so the §2 sweep (40 → 400 → 4000) is a one-shot env var, not an SDF edit
+      between arms — the same edit-per-arm hazard that produced the bad OFF run.
+    - What is and isn't verified:
     - ✅ **The physics is bit-exact against `tether.py`, proven on the Mac.**
       `tether_math.hpp` is Gazebo-free and mirrors the Python's association
       order; `tether_probe.cc` evaluates it from stdin and
