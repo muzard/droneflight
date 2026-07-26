@@ -1,29 +1,25 @@
 # Gazebo tether wrench plugin — requirements
 
-> ## Status (2026-07-24): **written, tested on the Mac, NOT YET COMPILED OR FLOWN**
+> ## Status (2026-07-26): **COMPILED, FLOWN, §1 + §2 PASSED**
 >
 > Sources are in [`tether_plugin/`](tether_plugin/) — see its
 > [README](tether_plugin/README.md) for build/install/run.
 >
 > | | |
 > |---|---|
-> | Physics (`tether_math.hpp`) | ✅ bit-exact vs `tether.py`, 24 tests on the Mac |
-> | Log format (`tether_log.hpp`) | ✅ written by C++, parsed by Python, round-trips |
-> | Acceptance gate | ✅ runnable: `droneflight tether-plugin-check --log <csv>` |
-> | Gazebo glue (`TetherPlugin.cc`) | ⚠️ **never compiled** — no `gz-sim8` on the Mac |
-> | Acceptance §1–3 below | ⛔ all three need the VM; none has been run |
+> | Physics (`tether_math.hpp`) | ✅ bit-exact vs `tether.py` |
+> | Log format (`tether_log.hpp`) | ✅ round-trips |
+> | Gazebo glue (`TetherPlugin.cc`) | ✅ **compiled against gz-sim8, loaded, flew 77/77** |
+> | §1 parity | ✅ EXACT on a real Gazebo log (`droneflight tether-plugin-check`) |
+> | §2 disturbance | ✅ scaling law: pitch tracks force to ≤0.5° over 0 → 18 N (`sim-logs/abtest/`) |
+> | §3 speed-policy in the loop | ⏭ READY to fly: `plans/slalom_test.plan` + `fly --no-speed-policy` control arm (RUNBOOK §4.7) |
 >
-> **The C++ that talks to Gazebo is unverified.** It was written against the
-> gz-sim8 API from documentation, not against a compiler, so expect the first VM
-> build to surface signature/header errors. Everything *behind* that interface is
-> tested. Treat the first VM session as "make it compile and confirm the
-> `[tether] ENABLED` line", not as an experiment.
->
-> ⚠️ Also unresolved: whether a ~0.76 N pull is even **visible** on a ~2 kg x500.
-> It is ~0.04 g, ~2.2° of steady tilt. Acceptance §2 may well measure "no
-> detectable effect" — which is a legitimate result (the fiber does not disturb
-> this airframe at cruise) but is *not* proof the plugin works. §1 parity is the
-> gate that proves it works; §2 measures whether it matters.
+> **The disturbance is NOT near the noise floor** (an earlier note here guessed it
+> would be, and that was wrong): a multirotor holds a steady horizontal force by
+> tilting, and the controller holds that tilt, so even 0.76 N is a clear +2.1°
+> pitch bias above the disabled baseline. Full results + the silent-failure traps
+> hit along the way (invisible banner, stale gz server, pow-vs-multiply parity):
+> `droneflight/CLAUDE.md` → Slice 3, and RUNBOOK §4.
 
 The in-the-loop half of the tether build item (RUNBOOK §4, Tech-Selection §4.2).
 The offline model — `droneflight/src/droneflight/tether.py`, exercised by

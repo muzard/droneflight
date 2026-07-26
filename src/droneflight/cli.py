@@ -795,6 +795,7 @@ def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live
         connection_url=args.url,
         night_operation=args.night,
         progress_timeout_s=args.progress_timeout,
+        speed_policy_enabled=not args.no_speed_policy,
     )
     result = asyncio.run(fly_mission(MavsdkConnector(), mission, config))
     print(
@@ -1006,6 +1007,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Seconds without waypoint progress before abort+RTL "
         "(default: derived from the plan's longest leg).",
+    )
+    f.add_argument(
+        "--no-speed-policy",
+        action="store_true",
+        help="Fly every waypoint at cruise (disable the tether-safe slowdown). "
+        "The control arm for the in-loop speed-policy test (RUNBOOK §4.7).",
     )
     f.set_defaults(func=_fly)
 

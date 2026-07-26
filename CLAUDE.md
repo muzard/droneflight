@@ -656,11 +656,36 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     add obstacle models, feed a feature-rich basemap — then re-fly the campaign
     over relief + obstacles + features. This is the real next campaign, not a
     tweak.
-  - ✅ **Gazebo C++ tether wrench plugin — WORKS. §1 parity EXACT, the force
-    provably reaches the body (2026-07-24/25).** Sources in
+  - ✅ **Gazebo C++ tether wrench plugin — DONE. §1 parity EXACT + §2 disturbance
+    confirmed with a scaling law (2026-07-24 → 26).** Sources in
     [`sitl/tether_plugin/`](sitl/tether_plugin/README.md); requirements/acceptance
     in [`sitl/TETHER_PLUGIN.md`](sitl/TETHER_PLUGIN.md); VM procedure in RUNBOOK §4.
-    Built against gz-sim8, loaded, flew 77/77.
+    Built against gz-sim8, loaded, flew 77/77. Only §3 (speed policy in the loop)
+    remains, and it is blocked on a turn-rich route, not the plugin.
+    - ✅ **§2 A/B + scaling PASSED, and it is NOT null (`sim-logs/abtest/`).**
+      Clean arms this time — `ab-off` genuinely recorded `enabled=0` (the
+      stale-server + unexported-env fixes held). Cruise pitch vs applied force,
+      one model (airframe aero drag 1.33 N from the OFF baseline + tether force,
+      pitch = `atan((1.33+F)/mg)`), four force levels:
+
+      | arm | applied | predicted pitch | measured | err |
+      |---|---|---|---|---|
+      | off (enabled=0) | 0 N | 3.87° | 3.87° | (baseline) |
+      | on, span 40 | 0.76 N | 6.07° | 5.98° | −0.09° |
+      | span 400 | 3.15 N | 12.85° | 12.38° | −0.47° |
+      | span 4000 | 18.1 N | 44.7° | 43.9° | −0.82°* |
+
+      *saturated at the 45° `MPC_TILTMAX_AIR` limit. The model tracks the airframe
+      to **≤0.5° unsaturated** across a 24× force range — far stronger evidence
+      than any single A/B.
+    - 🧭 **Correction: my repeated "§2 will be near-null, PX4 trims it out" was
+      WRONG.** Even the 0.76 N default tether is clearly visible — **+2.1° steady
+      pitch above the disabled baseline** (5.98° vs 3.87°), well over the ~0.3°
+      attitude noise. Why: a multirotor produces horizontal force **only by
+      tilting**, and the position controller must *hold* that tilt against a steady
+      disturbance — there is no integrator that removes it. A constant force shows
+      as a constant attitude offset, not a transient the loop absorbs. (One
+      unmatched ULog, `18_41_25.ulg`, has no CSV/fly-log — a scrapped run; ignore.)
     - ✅ **§4.4 bring-up PASSED — `AddWorldForce` lands.** The span=4000 arm
       (`sim-logs/tetherhuge/`, header `airborne_span_m=4000 enabled=1`) logged
       ~18 N and the airframe **pitched to 44°** (theory: `atan(18/(2·9.8))` =
@@ -735,10 +760,15 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
       Parity (§1) is what proves the plugin works; §2 measures whether the fiber
       *matters*. Sweep `airborne_span_m` (40 → 400) so the evidence is a scaling
       law, not one A/B at a magnitude the controller can hide.
-    - ⛔ **Acceptance §3 (speed policy in the loop) is blocked on a route, not on
-      the plugin** — `plans/ev_test.plan` bends ≤16°, so the policy never fires
-      and `tether-check` already calls the tether slack there. Needs a turn-rich
-      plan; same gap as the flat-world caveat.
+    - ⏭ **Acceptance §3 (speed policy in the loop) — now READY to fly.** The
+      planner can't supply a turn-rich route (any-angle + fillet keep every vertex
+      <25°, so the policy's per-vertex trigger barely fires — droneplanner
+      SHORTFALLS cross-cutting). So §3 uses a **synthetic** course
+      `plans/slalom_test.plan` (`sitl/make_slalom_plan.py`): 32 wp, 120 m legs,
+      turns 20–160°, constant 30 m. Offline it slows **26/32 waypoints** and drops
+      the tether turn-transient **2.07 → 0.88 N**. The control arm is
+      `droneflight fly --no-speed-policy` (flies cruise everywhere). Procedure:
+      RUNBOOK §4.7. A/B = policy on vs `--no-speed-policy`, tether on in both.
     - 🧪 **A/B is one env var, not an SDF edit:** `DRONEFLIGHT_TETHER_ENABLED=0|1`
       and `DRONEFLIGHT_TETHER_CSV=<path>`. A disabled run still loads and still
       logs `enabled=0`, so a control arm is identifiable from its own artifacts —

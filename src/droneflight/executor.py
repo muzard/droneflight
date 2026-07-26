@@ -92,8 +92,17 @@ def prepare_items(mission: FlightMission, config: FlightConfig) -> list[MissionI
     """Apply the tether-safe speed policy to a mission (pure, testable).
 
     The policy's cruise speed is aligned to the mission's cruise speed so the
-    plan's intended pace is honored while turns are still slowed.
+    plan's intended pace is honored while turns are still slowed. When the policy
+    is disabled (``speed_policy_enabled=False``), every waypoint flies at cruise —
+    the control arm for the in-loop §3 test.
     """
+    if not config.speed_policy_enabled:
+        return [
+            MissionItem(
+                lat=w.lat, lon=w.lon, alt_agl_m=w.alt_agl_m, speed_ms=mission.cruise_speed_ms
+            )
+            for w in mission.waypoints
+        ]
     policy = replace(config.speed, cruise_speed_ms=mission.cruise_speed_ms)
     return apply_speed_policy(mission, policy)
 

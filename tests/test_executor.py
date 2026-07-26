@@ -88,6 +88,27 @@ def test_prepare_items_uses_mission_cruise_speed() -> None:
     assert items[0].speed_ms == 6.0  # mission cruise speed honored
 
 
+def _turning_mission() -> FlightMission:
+    # A 90° corner at the middle waypoint so the speed policy has something to do.
+    wps = (
+        Waypoint(lat=46.90, lon=15.00, alt_agl_m=30.0),
+        Waypoint(lat=46.91, lon=15.00, alt_agl_m=30.0),
+        Waypoint(lat=46.91, lon=15.01, alt_agl_m=30.0),
+    )
+    return FlightMission(
+        name="t", home_lat=46.90, home_lon=15.0, cruise_speed_ms=6.0, waypoints=wps
+    )
+
+
+def test_speed_policy_disabled_flies_every_waypoint_at_cruise() -> None:
+    """The §3 control arm: --no-speed-policy => no slowdown through the corner."""
+    m = _turning_mission()
+    on = prepare_items(m, FlightConfig())
+    off = prepare_items(m, FlightConfig(speed_policy_enabled=False))
+    assert min(it.speed_ms for it in on) < 6.0  # policy slows the 90° corner
+    assert all(it.speed_ms == 6.0 for it in off)  # disabled: everything at cruise
+
+
 def test_not_ready_message_names_the_missing_flag() -> None:
     from droneflight.connector import not_ready_message
 
