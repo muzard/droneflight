@@ -656,13 +656,40 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     add obstacle models, feed a feature-rich basemap — then re-fly the campaign
     over relief + obstacles + features. This is the real next campaign, not a
     tweak.
-  - 🔧 **Gazebo C++ tether wrench plugin — COMPILED, LOADED, FLOWN 2026-07-24;
-    §1 parity + §2 span-sweep still pending clean arms.** Sources in
+  - ✅ **Gazebo C++ tether wrench plugin — WORKS. §1 parity EXACT, the force
+    provably reaches the body (2026-07-24/25).** Sources in
     [`sitl/tether_plugin/`](sitl/tether_plugin/README.md); requirements/acceptance
     in [`sitl/TETHER_PLUGIN.md`](sitl/TETHER_PLUGIN.md); VM procedure in RUNBOOK §4.
-    It built against gz-sim8, loaded, and flew a full 77/77 mission with the force
-    logged and applied (fx/fy non-zero, tension to 0.773 N at cruise, matching the
-    model). Two operational bugs surfaced and are fixed — see below.
+    Built against gz-sim8, loaded, flew 77/77.
+    - ✅ **§4.4 bring-up PASSED — `AddWorldForce` lands.** The span=4000 arm
+      (`sim-logs/tetherhuge/`, header `airborne_span_m=4000 enabled=1`) logged
+      ~18 N and the airframe **pitched to 44°** (theory: `atan(18/(2·9.8))` =
+      42.6°), pegged near the 45° limit, and cruise dropped 6.0 → 4.9 m/s. So the
+      wrench reaches the body at the right magnitude. ⚠️ **My "it will lose the
+      route / mission fails" prediction was wrong** — the x500 has enough thrust
+      to fly at 45° tilt and it completed 77/77. "Completed the trip" is *not*
+      evidence the force is absent; the tilt/speed signature is what proves it
+      lands.
+    - ✅ **§1 parity EXACT** on that real log: applied force (back+drag) matches
+      `tether.py` **bit-for-bit** (`droneflight tether-plugin-check` → EXACT).
+    - 🐛 **…but that took fixing a false-DIVERGED in the gate itself.** The real
+      log first failed parity by **3.55e-15 N** on 9/13644 samples — pure
+      float noise: Python squared speed with `**2` (a `pow()` call) while the C++
+      used `v*v`, and `pow(v,2) != v*v` by 1 ULP for some values. Fixed by
+      squaring with a multiply in `tether.py` (drag + turn), matching the C++, so
+      the applied force is bit-exact again. Separately, the **turn** term can
+      *never* be bit-exact across the boundary (`math.cos` vs `std::cos` are
+      different libms), so it is now held to a 1e-9 N noise floor instead of `==0`
+      — it is a *logged, not injected* diagnostic, so this doesn't weaken the gate
+      on the force that's actually applied. The 1-ULP tamper test still has teeth
+      (it tampers tension, still `==0`). Regression:
+      `test_squares_with_multiplication_not_pow_for_cpp_parity`.
+    - 🧭 **Lesson: bit-exact `==` across a Python/C++ boundary is only achievable
+      for pure arithmetic.** Any transcendental (`cos`, `sin`, `exp`) will differ
+      by ≤1 ULP between libms; gate those to a noise floor, keep `==` for the
+      arithmetic. The offline Mac test grid passed `==` only because it never hit
+      the value/`cos` combinations a real flight does.
+    - Two operational bugs also surfaced and are fixed — see below.
     - 🐛 **The first "OFF" control arm was not off — it recorded `enabled=1`
       (caught by the CSV header, exactly as designed).** Two causes, both fixed in
       `run_sitl.sh`: (1) it never `export`ed `DRONEFLIGHT_TETHER_ENABLED`, and

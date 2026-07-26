@@ -77,6 +77,23 @@ def test_turn_tension_scales_with_speed_squared() -> None:
     assert fast == pytest.approx(4.0 * slow)  # halving speed quarters the turn load
 
 
+def test_squares_with_multiplication_not_pow_for_cpp_parity() -> None:
+    """drag/turn must square speed with `*`, not `**2`.
+
+    `v**2` routes through pow() and differs from `v*v` by 1 ULP on some values.
+    The C++ plugin (tether_math.hpp) squares with a multiply, and the parity gate
+    demands a bit-exact match on the applied force — a real span=4000 flight
+    falsely "DIVERGED" by 3.55e-15 N until this was aligned. 4.989233542214098 is
+    a speed from that flight where pow != mul.
+    """
+    v = 4.989233542214098
+    assert v**2 != v * v  # the whole reason this test exists
+    c = TetherConfig()
+    k = 0.5 * c.air_density_kg_m3 * c.drag_coefficient * c.fiber_diameter_m * c.airborne_span_m
+    assert drag_tension_n(c, v) == k * (v * v)  # multiply, bit-exact
+    assert drag_tension_n(c, v) != k * v**2  # not the pow() value
+
+
 def test_total_tension_is_the_sum() -> None:
     c = TetherConfig()
     total = tension_n(c, speed_ms=5.0, deflection_deg=120.0)

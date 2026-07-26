@@ -115,13 +115,18 @@ def drag_tension_n(config: TetherConfig, speed_ms: float) -> float:
     """
     if speed_ms <= 0.0:
         return 0.0
+    # `speed_ms * speed_ms`, NOT `speed_ms**2`: the latter routes through pow()
+    # and differs from a plain multiply by 1 ULP for some values. The C++ plugin
+    # (tether_math.hpp) squares with a multiply, and the parity gate demands a
+    # bit-exact match — a real span=4000 flight hit 9 samples where pow≠mul and
+    # falsely "DIVERGED" by 3.55e-15 N. Keep both sides on multiplication.
     return (
         0.5
         * config.air_density_kg_m3
         * config.drag_coefficient
         * config.fiber_diameter_m
         * config.airborne_span_m
-        * speed_ms**2
+        * (speed_ms * speed_ms)
     )
 
 
@@ -135,8 +140,12 @@ def turn_tension_n(config: TetherConfig, speed_ms: float, deflection_deg: float)
     if speed_ms <= 0.0 or deflection_deg <= 0.0:
         return 0.0
     theta = math.radians(deflection_deg)
+    # multiply, not **2 — bit-exactness with tether_math.hpp (see drag_tension_n).
     return (
-        config.payout_inertia_kg * speed_ms**2 * (1.0 - math.cos(theta)) / config.coupling_length_m
+        config.payout_inertia_kg
+        * (speed_ms * speed_ms)
+        * (1.0 - math.cos(theta))
+        / config.coupling_length_m
     )
 
 
@@ -392,14 +401,25 @@ def parse_plugin_log(path: Path) -> PluginLog:
 class PluginParity:
     """How far the in-loop plugin drifted from this module, and what it applied.
 
-    ``exact`` is the gate. The errors are not tolerances that happen to be small:
-    the C++ mirrors this module's association order, so anything other than
-    identically zero means the two implementations have genuinely diverged.
+    ``exact`` is the gate, and it covers exactly the force the plugin **applies**
+    to the body: back-tension + drag. Those are pure arithmetic, so the C++
+    (`tether_math.hpp`) and this module agree bit-for-bit — anything other than
+    identically zero means the two implementations genuinely diverged. A real
+    span=4000 flight confirmed this once `speed_ms**2` was changed to
+    `speed_ms * speed_ms` here to match the C++ multiply (the `pow()` route
+    differs by 1 ULP on some values).
 
-    ``max_force_error_n`` is deliberately **not** part of ``exact``: it compares
-    a re-normalised vector magnitude against a scalar, so a few ULP is expected
-    on any heading that is not axis-aligned. It catches a wrong-direction or
-    wrong-magnitude wrench, not drift.
+    ``max_turn_error_n`` and ``max_force_error_n`` are deliberately **not** part
+    of ``exact``:
+    * the **turn** transient is *logged, not injected* — it never enters the
+      applied wrench — and it goes through `cos`, whose libm implementation is not
+      bit-identical between CPython and the VM's libstdc++, so a sub-ULP residual
+      is expected and unfixable by any formula change;
+    * ``max_force_error_n`` compares a re-normalised vector magnitude against a
+      scalar, so a few ULP is expected off-axis.
+    Both are still reported and would flag a *real* divergence (wrong coefficient,
+    wrong direction, unapplied force — all many orders of magnitude larger than a
+    ULP), just not held to bit-exactness they cannot achieve.
     """
 
     samples: int
@@ -414,13 +434,20 @@ class PluginParity:
     peak_turn_n: float
     peak_speed_ms: float
 
+    # Turn parity cannot reach zero across the Python/C++ `cos` boundary, but a
+    # genuine turn-model error is >> this. Anything under a few ULP of a newton is
+    # float noise; 1e-9 N is millions of ULP of headroom below any real defect.
+    _TURN_NOISE_FLOOR_N = 1e-9
+
     @property
     def exact(self) -> bool:
         return (
             self.max_drag_error_n == 0.0
             and self.max_tension_error_n == 0.0
-            and self.max_turn_error_n == 0.0
             and self.bad_static_samples == 0
+            # Turn is diagnostic (logged, not injected) and cos-limited — held to
+            # a noise floor, not bit-exactness. See the class docstring.
+            and self.max_turn_error_n <= self._TURN_NOISE_FLOOR_N
         )
 
     def load_fraction(self, break_tension_n: float) -> float:

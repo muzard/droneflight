@@ -1163,13 +1163,21 @@ head -2 $HOME/tether-huge.csv
 |---|---|---|---|---|
 | 40 (default) | 0.26 N | 0.76 N | ~2.2° | near the noise floor |
 | 400 | 2.65 N | 3.15 N | ~9° | clearly visible in the ULog |
-| 4000 | 26.5 N | 27.0 N | can't hold | dragged off route / mission fails |
+| 4000 | 26.5 N | 27.0 N | ~43° | **massive tilt + speed loss** (see below) |
 
-**If 4000 changes nothing, `AddWorldForce` is not landing** — the plugin is
-logging a force it never applies, which is the one failure mode that looks
-completely healthy from the CSV. Fix that before trusting any smaller number.
-(Note the force only exists once the vehicle has *translated*: in a pure vertical
-climb there is no horizontal travel direction and the pull is zero by design.)
+**FLOWN 2026-07-25 (`sim-logs/tetherhuge/`): the force lands.** At span=4000 the
+airframe **pitched to 44°** (theory `atan(18/(2·9.8))` = 42.6°, and it hit the
+45° `MPC_TILTMAX_AIR` limit) and cruise fell 6.0 → 4.9 m/s. ⚠️ **It still
+completed 77/77** — do NOT read "mission completed" as "force absent". The x500
+has the thrust to fly at 45° tilt against ~1 g of drag; the **tilt and speed-loss
+signature** is the evidence, not route failure. Score this from the ULog attitude,
+not from whether the mission finished.
+
+**If 4000 leaves attitude and cruise speed unchanged, `AddWorldForce` is not
+landing** — the plugin is logging a force it never applies, the one failure mode
+that looks completely healthy from the CSV. (The force only exists once the
+vehicle has *translated*: in a pure vertical climb there is no horizontal travel
+direction and the pull is zero by design.)
 
 Then walk it back to the default span and confirm a normal mission still
 completes — a NaN or runaway force would show as a sim that flies worse, not as
