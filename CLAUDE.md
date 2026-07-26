@@ -23,7 +23,7 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `mavsdk_connector.py` | live PX4 adapter (⚠️ needs SITL; excluded from coverage, not unit-tested) |
 | `sitl_launch.py` | inject the plan's home into PX4 SITL (`PX4_HOME_*`) so a mission lands at the real AO, not Zurich |
 | `config.py`, `cli.py` | config + `validate` / `nav` / `tether-check` / `tether-plugin-check` / `simfly` / `sitl-env` / `px4-params` / `flatten-plan` / `ev-bridge` / `ev-report` / `fly` commands |
-| `sitl/tether_plugin/` | **Gazebo C++ wrench plugin (v0)** — physics bit-exact vs `tether.py`; ✍️ written, **not yet compiled or flown** |
+| `sitl/tether_plugin/` | **Gazebo C++ wrench plugin (v0)** — physics bit-exact vs `tether.py`; ✅ compiled, flown, §1 parity + §2 disturbance passed (§3 ready) |
 
 ## Run / test
 ```bash
@@ -41,7 +41,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 185 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 222 tests, ~96% cov
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -661,7 +661,8 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     [`sitl/tether_plugin/`](sitl/tether_plugin/README.md); requirements/acceptance
     in [`sitl/TETHER_PLUGIN.md`](sitl/TETHER_PLUGIN.md); VM procedure in RUNBOOK §4.
     Built against gz-sim8, loaded, flew 77/77. Only §3 (speed policy in the loop)
-    remains, and it is blocked on a turn-rich route, not the plugin.
+    remains, and it is **READY to fly** (synthetic turn-rich course — see the §3
+    sub-entry below and RUNBOOK §4.7).
     - ✅ **§2 A/B + scaling PASSED, and it is NOT null (`sim-logs/abtest/`).**
       Clean arms this time — `ab-off` genuinely recorded `enabled=0` (the
       stale-server + unexported-env fixes held). Cruise pitch vs applied force,

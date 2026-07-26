@@ -135,6 +135,16 @@ def build_plan() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    out = Path(__file__).resolve().parents[1].parent / "plans" / "slalom_test.plan"
+    import sys
+
+    # Output path is an optional arg, because the .plan lives OUTSIDE the git
+    # repos (in DroneAutomation/plans on the Mac, ~/drone/plans on the VM) — it
+    # does not ride `git pull`. Only this generator does; regenerate the .plan
+    # wherever you need it. Default is the Mac layout.
+    if len(sys.argv) > 1:
+        out = Path(sys.argv[1])
+    else:
+        out = Path(__file__).resolve().parents[1].parent / "plans" / "slalom_test.plan"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(build_plan(), indent=4), encoding="utf-8")
     print(f"wrote {out}  ({len(TURN_SEQUENCE_DEG) + 2} waypoints)")
