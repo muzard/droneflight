@@ -1407,34 +1407,41 @@ Minimum AGL across every flown run, including the two that stalled:
 | `02_52_58` | **11.91 m** | 0 |
 | `03_11_41` | **11.96 m** | 0 |
 | `03_28_04` | **11.91 m** | 0 |
+| `cfit-rep2/` ×5 | **11.90–11.94 m** | 0 |
 
-A **5 cm spread over six flights** against a predicted 9.02 m floor, and 0 of
-~250 000 samples under 5 m. **Terrain clearance is closed.** Mechanism confirmed
+A **7 cm spread over eleven flights** against a predicted 9.02 m floor, and 0 of
+~500 000 samples under 5 m. **Terrain clearance is closed.** Mechanism confirmed
 too: splitting
 shrinks the commanded altitude *step*, and PX4's descent gradient scales with the
 step — **0.220** for the unsplit 40.5 m step, **0.040** for the split 18.3 m one.
 
-🟠 **The stall is the vertical acceptance window — `NAV_MC_ALT_RAD` — and it is a
-RATE, not a switch.** Seven flights, and the outcome orders perfectly by the
-vertical error at the inserted vertex (every completion ≤0.841 m, every stall
-more):
+✅ **The stall is `NAV_MC_ALT_RAD`, and the rule has no exceptions in 12 flights:
+the mission stalls iff the vertical error at some waypoint exceeds the window.**
 
-| ulog | `ALT_RAD` | \|alt err\| at the vertex | outcome |
-|---|---|---|---|
-| `00_49_06` | 0.8 | 1.580 m (wp11, v1's spurious insert) | stall 11/79 |
-| `01_36_02` | 0.8 | 0.873 m (wp51) | stall 51/78 |
-| `03_28_04` | 2.0 | 0.669 m | COMPLETE |
-| `02_34_36` | 2.0 | 0.716 m | COMPLETE |
-| `03_11_41` | 2.0 | 0.721 m | COMPLETE |
-| `02_05_36` | 2.0 | 0.841 m | COMPLETE |
-| `02_52_58` | 2.0 | **1.190 m** | **stall 51/78** |
+| window | err at inserted vertex | err at final wp | runs | completed |
+|---|---|---|---|---|
+| 0.8 | 2.147 m | — | 2 | **0/2** |
+| 2.0 | 0.664 / 0.725 / **2.569** m | 1.75–1.80 m | 5 | **4/5** |
+| 4.0 | 0.669–0.719 m | 1.78–1.83 m | 5 | **5/5** |
 
-**Stall rate 2/2 at 0.8 → 1/5 at 2.0.** The error varies run to run and
-occasionally exceeds the window, so 2.0 is not sufficient.
-`configs/px4/terrain_following.params` is now **4.0** — 3.4× headroom over the
-worst error seen, still 3× under the route's 11.9 m of measured clearance. Load
-it at step 4. (`02_25_28.ulg` never armed — a 253 s boot artifact with no fly
-log; do not score it.)
+Two distinct error populations, and both matter. The **inserted vertex** is
+bimodal — usually 0.66–0.73 m, but it spikes to 2.1–2.6 m in roughly 1 run in 6,
+and those spikes are the stalls. The **final waypoint** sits at ~1.78 m in every
+healthy run, so a 0.8 m window would fail there too; the 0.8 runs simply never got
+that far.
+
+`configs/px4/terrain_following.params` is **4.0** — covers the whole observed
+distribution (worst 2.569 m) with 1.56× margin, still 3× under the route's 11.9 m
+of measured clearance. Load it at step 4.
+
+⚠️ **The 5/5 at 4.0 does not by itself prove 4.0.** None of those five saw a
+spike (max 1.83 m), so they would have passed at 2.0 as well. The case for 4.0 is
+the error *distribution* across all 12 runs, not that run of five.
+(`02_25_28.ulg` never armed — a 253 s boot artifact with no fly log; don't score it.)
+
+⚠️ **Measure the error at the waypoint that stalled, not the route-wide worst.**
+The worst error in a *healthy* run is at the final waypoint (~1.78 m), which is a
+different phenomenon; conflating them nearly produced a spurious result here.
 
 ⚠️ **Two audit traps this cost a full wrong conclusion to learn.**
 * **A param set at the `pxh>` prompt after boot lands in the ULog's
@@ -1480,6 +1487,12 @@ grep -o '<uri>file://[^<]*</uri>' ~/drone/PX4-Autopilot/Tools/simulation/gz/worl
 The world does **not** need regenerating for this flight — it depends only on the
 DTM and home, and neither changed (verified 2026-07-27: a re-planned route leaves
 the world byte-identical).
+
+🔁 **The demo route changed on 2026-07-27** (flight-altitude viewshed): it is now
+**87 waypoints, 5056.7 m, and needs NO inserted vertex**. Everything in §4.8 was
+flown against the *old* 78-waypoint route, so re-running it now exercises neither
+the same leg nor the densifier. Keep `NAV_MC_ALT_RAD = 4.0` regardless — the
+~1.78 m final-waypoint error is a property of the route shape, not of the insert.
 
 **4 — load the acceptance param.** Without it the mission stalls at the inserted
 vertex (twice measured):

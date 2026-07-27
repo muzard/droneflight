@@ -41,22 +41,25 @@
 # default window, so widening it changes their behaviour not at all. It only
 # affects waypoints the vehicle genuinely cannot hit tightly.
 #
-# MEASURED OVER 7 FLIGHTS (2026-07-27, `sim-logs/cfit/` + `cfit/cfit-rep/`).
-# The vertical error at the inserted vertex varies run to run, and the outcome
-# orders perfectly by it — every completion had <=0.841 m, every stall more:
+# MEASURED OVER 12 FLIGHTS (2026-07-27, `sim-logs/cfit/` + `cfit-rep/` + `cfit-rep2/`).
+# Outcome is decided by ONE rule, with no exceptions in 12 runs: the mission
+# stalls iff the vertical error at some waypoint exceeds this window.
 #
-#   ulog          ALT_RAD  |alt err| at the stalling vertex  outcome
-#   00_49_06        0.8    1.580 m  (wp11, v1's spurious insert)  STALL 11/79
-#   01_36_02        0.8    0.873 m  (wp51)                        STALL 51/78
-#   03_28_04        2.0    0.669 m                                COMPLETE
-#   02_34_36        2.0    0.716 m                                COMPLETE
-#   03_11_41        2.0    0.721 m                                COMPLETE
-#   02_05_36        2.0    0.841 m                                COMPLETE
-#   02_52_58        2.0    1.190 m                                STALL 51/78
+#   window   err at inserted vertex   err at final wp   runs   outcome
+#   0.8      2.147 m                  -                 2      0/2 COMPLETE
+#   2.0      0.664 / 0.725 / 2.569 m  1.75-1.80 m       5      4/5 COMPLETE
+#   4.0      0.669-0.719 m            1.78-1.83 m       5      5/5 COMPLETE
 #
-# Stall rate: 2/2 at 0.8 -> 1/5 at 2.0. So 2.0 helps a lot but is NOT sufficient;
-# 4.0 gives 3.4x headroom over the worst error yet observed (1.19 m) while still
-# sitting 3x under the route's measured 11.9 m of terrain clearance.
+# Two distinct populations, and both matter:
+#   * The INSERTED vertex is bimodal - usually 0.66-0.73 m, but it spikes to
+#     2.1-2.6 m in roughly 1 run in 6. Those spikes are the stalls.
+#   * The FINAL waypoint sits at ~1.78 m in every healthy run. A 0.8 m window
+#     would fail there too; the 0.8 runs simply never got that far.
+#
+# 4.0 covers the entire observed distribution (worst 2.569 m) with 1.56x margin.
+# ⚠️ The 5/5 at 4.0 does NOT independently prove it - none of those five saw a
+# spike (max 1.83 m), so they would have passed at 2.0 as well. The evidence for
+# 4.0 is the error DISTRIBUTION across all 12 runs, not that run of five.
 #
 # ⚠️ This is empirical tuning against a quantity we cannot measure cleanly. PX4
 # tests its *own estimate*, and the error figures above are groundtruth — a proxy.
