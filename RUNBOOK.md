@@ -1380,10 +1380,37 @@ on `make_slalom_plan.py`, and `tether-check --no-px4-prior`. **No plugin rebuild
 
 The planner used to guarantee clearance against **linear** altitude interpolation.
 PX4 front-loads a leg's descent, and on 2026-07-24 that flew the aircraft into the
-ground at 0.8 m AGL, ending the mission at **51/77**. Fixed 2026-07-27: big-drop
-legs are split, and clearance is re-scored against the flown profile. On the demo
-AO the worst point went **−6.6 m → +11.9 m AGL** for **2 extra vertices** (77 →
-79). *This has only been verified offline.* The flight is the test.
+ground at 0.8 m AGL, ending the mission at **51/77**. Fixed 2026-07-27: clearance
+is re-scored against the flown profile, and the legs that check rejects are split.
+Demo AO worst point **−6.6 m → +9.0 m AGL** for **1 extra vertex** (77 → 78).
+
+🔴 **The first attempt at this fix crashed worse — flown 2026-07-27,
+`sim-logs/cfit/`.** v1 split on a *drop threshold* rather than on the clearance
+check, so it also split a leg already clear at +9.0 m AGL. PX4 requires **both**
+horizontal and vertical acceptance (`NAV_MC_ALT_RAD` = **0.8 m**); the vehicle
+passed that gratuitous vertex 1.58 m off vertically, `mission_result.seq_current`
+**froze at item 22 (= waypoint 11/79)**, and the trajectory generator slid past it
+for 565 s, descending, until it touched down 29 m below the plan's lowest
+altitude. The watchdog and RTL both worked. **Scoring lesson: an unreachable
+waypoint fails 40 legs earlier than the CFIT it prevents, and it looks nothing
+like a crash in the console — the mission simply stops counting.**
+
+✅ **v2 FLOWN 2026-07-27 (`sim-logs/cfit/01_36_02.ulg`) — the clearance fix
+works.** Minimum AGL **11.97 m** over the mission phase (predicted floor 9.02 m),
+**0 of 49 500 samples under 5 m**, no terrain contact, on the exact leg that
+crashed the aircraft on 07-24 at 0.8 m AGL. Mechanism confirmed too: splitting
+shrinks the commanded altitude step, and PX4's descent gradient scales with it —
+**0.220** for the unsplit 40.5 m step, **0.040** for the split 18.3 m one.
+
+🟠 **One blocker remains and it needs a PARAM, not another plan change.** The run
+stalled at **51/78** targeting the inserted vertex, missing PX4's vertical
+acceptance by **7 cm** (best |error| inside `NAV_ACC_RAD` = **0.87 m** vs
+`NAV_MC_ALT_RAD` = 0.8 m). No placement fixes it: PX4 spreads a leg's descent
+across the whole leg, so the vehicle is descending at every interior point.
+**Load `configs/px4/terrain_following.params` (`NAV_MC_ALT_RAD = 2.0`) before the
+next run** — it is an acceptance tolerance, not a clearance change; the aircraft
+flies no lower, and every original waypoint tracked to ≤0.37 m so they are
+unaffected.
 
 **1 — regenerate the plan on the Mac** (droneplanner is clone-only on the VM, and
 the `.plan` does not ride git):
@@ -1393,7 +1420,9 @@ cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && droneplanner pla
 ```
 
 Confirm before copying — `report.json` must show `clearance_violations: 0` and
-`descent_vertices_inserted: 2`, and the plan must have **79** waypoints.
+`descent_vertices_inserted: 1`, and the plan must have **78** waypoints. If
+`descent_vertices_inserted` is larger, the densifier has regressed to splitting
+safe legs; do not fly it (see the v1 failure above).
 
 **2 — copy it over:**
 
@@ -1415,7 +1444,17 @@ The world does **not** need regenerating for this flight — it depends only on 
 DTM and home, and neither changed (verified 2026-07-27: a re-planned route leaves
 the world byte-identical).
 
-**4 — fly it**, same as §3:
+**4 — load the acceptance param** (once; it persists across reboots after
+`param save`). Without it the mission stalls at the inserted vertex:
+
+```bash
+droneflight px4-params --file ~/droneflight/configs/px4/terrain_following.params
+```
+
+Paste the printed `param set` lines into `pxh>`, then `reboot`. Confirm with
+`param show NAV_MC_ALT_RAD` — it must read **2.0**, not 0.8.
+
+**5 — fly it**, same as §3:
 
 ```bash
 PX4_GZ_WORLD=planner_terrain ./sitl/run_sitl.sh ~/drone/plans/terrain_fixed.plan ~/drone/PX4-Autopilot
@@ -1425,15 +1464,24 @@ PX4_GZ_WORLD=planner_terrain ./sitl/run_sitl.sh ~/drone/plans/terrain_fixed.plan
 droneflight fly --plan ~/drone/plans/terrain_fixed.plan --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/terrain-fixed.log
 ```
 
-**How to score it — and what a false pass looks like.** The headline is
-`COMPLETED 78/78` (79 waypoints) instead of stalling at 51. But **completion alone
-is not the result**: the 2026-07-24 run also flew 51 waypoints before it hit
-anything. Score the **minimum AGL** from the ULog —
-`vehicle_local_position_groundtruth.z` against the DEM, or
-`distance_sensor`/`vehicle_local_position.dist_bottom` if available — and check it
-never approaches 0 on the descending legs. The planner predicts a **11.9 m**
-floor; anything materially under that means the front-loaded model is still
-optimistic, which is the interesting failure and worth a session on its own.
+**How to score it — three distinct failure modes, don't confuse them.**
+
+1. **Sequencer freeze** — hit twice now (11/79, then 51/78). Symptom: `mission
+   progress` stops advancing **while the vehicle keeps flying**; it does not look
+   like a failure in the console. Check `mission_result.seq_current` — pinned at
+   one value means PX4 refused a waypoint. Then take the vertical error at that
+   waypoint over the samples inside `NAV_ACC_RAD`; if the *best* one exceeds
+   `NAV_MC_ALT_RAD`, that is the cause. Step 4's param is the fix. If it stalls
+   again *with* `NAV_MC_ALT_RAD = 2.0` loaded, report the measured error before
+   widening further — 2.0 already has 2.3× margin over the observed 0.87 m.
+2. **CFIT** — what the fix is for, and now **verified clear** (11.97 m min AGL).
+   Score **minimum AGL** from `vehicle_local_position_groundtruth.z` against the
+   DEM. Below the predicted **9.0 m** floor means the descent model has become
+   optimistic — that is the interesting failure and worth a session.
+3. **Clean pass**: `COMPLETED 77/77` (78 waypoints). ⚠️ **Completion alone is not
+   the result** — the 2026-07-24 run flew 51 waypoints before it hit anything, and
+   the v1 run "flew" for 565 s after the mission had already stopped. Always
+   report the min-AGL number alongside the completion count.
 
 ⚠️ **The climb side is unvalidated by construction.** The model treats climbs as
 linear because prompt climbing only adds clearance — if this flight shows PX4

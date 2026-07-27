@@ -1,0 +1,51 @@
+# PX4 parameters for flying a TERRAIN-FOLLOWING plan whose legs carry large
+# altitude steps — so the mission sequencer does not stall on a waypoint the
+# vehicle cannot hit to centimetre vertical accuracy.
+# Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
+#
+# Apply ON TOP OF sitl_bringup.params (and the GPS-denied set if flying that way):
+#   droneflight px4-params --file configs/px4/sitl_bringup.params \
+#                          --file configs/px4/terrain_following.params
+# then paste the `param set` lines into pxh and `reboot`.
+#
+# WHY THIS EXISTS
+# The planner's CFIT fix (droneplanner SHORTFALLS item 0) splits a descending leg
+# whose flown profile would hit terrain, inserting one vertex so the autopilot
+# cannot get ahead of the ground. That works — flown 2026-07-27
+# (`sim-logs/cfit/01_36_02.ulg`), minimum AGL went from 0.8 m (the 2026-07-24
+# crash on this exact leg) to 11.97 m, with zero samples under 5 m.
+#
+# But PX4 will not SEQUENCE PAST a mission waypoint until the vehicle is inside
+# BOTH the horizontal acceptance radius (NAV_ACC_RAD, 10 m) and the vertical one
+# (NAV_MC_ALT_RAD, 0.8 m by default). An inserted vertex sits mid-descent by
+# construction, so the vehicle passes it while still coming down:
+#
+#   run              inserted vertex   best |alt error| inside NAV_ACC_RAD
+#   2026-07-27 v1    leg 10 (unneeded) 1.58 m   -> froze at 11/79
+#   2026-07-27 v2    leg 50 (needed)   0.87 m   -> froze at 51/78, by 7 cm
+#
+# A stall is silent and does not look like a crash: `mission progress` simply
+# stops advancing while the vehicle keeps flying the last trajectory. The v1 run
+# slid past its frozen waypoint for 565 s, descending, until it touched down.
+#
+# WHY WIDENING THE WINDOW IS THE RIGHT LEVER, NOT A PLANNER CHANGE
+# No insertion placement can avoid this. PX4 spreads a leg's descent across the
+# leg (measured gradient 0.040 for an 18 m step, 0.220 for a 40 m one), so the
+# vehicle is descending at EVERY interior point of a descending leg — there is no
+# "settled" position to insert at. The altitude the plan asks for is still flown;
+# only the tolerance for declaring the waypoint reached changes.
+#
+# It costs nothing on ordinary waypoints. Measured over 51 accepted arrivals
+# (2026-07-24) PX4 held altitude to 0.35 m mean / 0.64 m p95, and every original
+# waypoint on the 2026-07-27 route tracked to <=0.37 m — all far inside even the
+# default window, so widening it changes their behaviour not at all. It only
+# affects waypoints the vehicle genuinely cannot hit tightly.
+#
+# 2.0 m is chosen for margin over the measured 0.87 m worst case while staying
+# far under the route's 11.97 m of terrain clearance. It is an ACCEPTANCE
+# tolerance, not a clearance change: the aircraft does not fly any lower.
+#
+# ⚠️ Like NAV_DLL_ACT and the RTL altitude, this is a deliberate design choice
+# and belongs in the aircraft's failsafe/nav policy, not left at a default that
+# was tuned for precise survey flights over flat ground.
+1	1	NAV_MC_ALT_RAD	2.0	9
