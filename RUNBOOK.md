@@ -1363,6 +1363,103 @@ speed policy and tether transient observable in the loop.
 
 A full catenary / lumped-segment cable model is a later refinement (v1).
 
+### 4.10 ▶ NEXT ON THE VM — B2a: fly the below-canopy route through **actual trees**
+
+TEST-PLAN item 5. Every SITL result so far — including B1's clean 282/282 — flew
+a world with **nothing in it**. The planner routes under the canopy and grants a
+lateral corridor on the promise that the flight stack avoids what it finds there;
+as the user put it, the corridor "serves little purpose on an open field where
+the route could actually be planned perfectly in advance". So put trees in.
+
+**B2a is the control arm, and it is a clean A/B against B1**: same plan, same
+terrain, same params, tether off — the *only* difference is 4000 trunk cylinders.
+B1 flew it 282/282 with 6.26 m min AGL. Any difference here is the forest.
+
+#### What is built (Mac) and what is not
+
+| piece | state |
+|---|---|
+| trunk generation + SDF injection (`gz-world --forest-dsm`) | ✅ built, unit-tested |
+| trunk manifest → `perception.sense()` (`droneflight/trunk_manifest.py`) | ✅ built, unit-tested |
+| **offboard executor driving `avoidance.py` in the loop** | ❌ **not built — that is B2b** |
+
+So today's run is the control arm: **mission mode, no avoidance**. It answers
+"does the planned route actually hit trees?", which is the question the avoidance
+arm will later be measured against. `7 trunks fall within a rotor span of the
+planned centreline` on the demo AO, so the honest prediction is that it does.
+
+#### 1 — build the forested world (Mac)
+
+⚠️ **`--base-world` must be PX4's own `default.sdf`, never an already-generated
+terrain world** — the terrain model is *appended*, so feeding it
+`planner_terrain.sdf` injects the heightmap twice.
+
+```bash
+cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && . ../.venv/bin/activate && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
+```
+
+```bash
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf --forest-dsm demo_ao/dsm.tif --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_forest_dem.tif --out worlds/planner_forest.sdf
+```
+
+Read the reported line before going further — it is the experiment's dose:
+`N trunks over A ha (D stems/ha, median nearest-neighbour S m, band reaches B m)`.
+**S is the number that decides whether the test is fair**: the airframe is 0.9 m
+wide and needs roughly 1 m of clearance, so a median gap of ~3.7 m is cluttered
+but flyable. If you raise `--stems-per-ha`, S falls and at some point no policy
+can succeed — that is a legitimate experiment, but say which one you ran.
+
+#### 2 — ship three files to the VM
+
+```bash
+scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/planner_forest.sdf /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/planner_forest_dem.tif arttudrone@192.168.132.129:~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
+```
+
+```bash
+scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/planner_forest_trunks.csv arttudrone@192.168.132.129:~/drone/plans/
+```
+
+The `.plan` is unchanged from B1 (`~/drone/plans/canopy.plan`); re-`scp` it only
+if you re-planned.
+
+#### 3 — fly it (VM), world as arg 3
+
+```bash
+cd ~/droneflight && . ~/venv/bin/activate && DRONEFLIGHT_TETHER_ENABLED=0 ./sitl/run_sitl.sh ~/drone/plans/canopy.plan ~/drone/PX4-Autopilot planner_forest
+```
+
+Confirm `world: planner_forest` and that Gazebo actually finished loading — 4000
+static models is a 2.8 MB SDF, so **watch the startup time and the real-time
+factor**. If RTF collapses, that is the tractability limit; re-generate with a
+lower `--stems-per-ha` and report the density you actually flew.
+
+```bash
+cd ~/droneflight && . ~/venv/bin/activate && droneflight fly --plan ~/drone/plans/canopy.plan --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/forest-control.log
+```
+
+#### 4 — score it against B1
+
+There is no contact sensor on the trunks, so a collision shows up as **dynamics**,
+not as a log message. Score in this order:
+
+1. **Completion** vs B1's 282/282. A stall or an RTL is the headline.
+2. **Attitude/velocity discontinuities** in the ULog — a static cylinder strike
+   appears as a step in `vehicle_angular_velocity` and a sudden loss of ground
+   speed, unlike terrain contact which also spikes `z`.
+3. **Where** it happened: cross-reference the position against the trunk manifest
+   to name the tree. If the aircraft flew clean through the 7 on-centreline
+   trunks, suspect the trunks are not in the world (grep the SDF for
+   `<model name="trunk_` on the VM) before believing it.
+
+⚠️ **A completion here is NOT "avoidance works"** — nothing is avoiding anything
+in this arm. It would mean the route happens to thread the stand, which is worth
+knowing but is a property of this seed's trunk placement, not of the stack.
+
+⚠️ **The forest is easier than a real one**: bare cylinders, ground to canopy top,
+no branches, no crown, no understory, no lean. It flatters the aircraft.
+
+---
+
 ### 4.9 ✅ B1 — below-canopy route: FLOWN 2026-07-27, **COMPLETED 282/282**
 
 `sim-logs/canopy/21_38_21.ulg` + `canopy.log`. Terrain world, tether off
