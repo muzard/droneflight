@@ -1363,6 +1363,116 @@ speed policy and tether transient observable in the loop.
 
 A full catenary / lumped-segment cable model is a later refinement (v1).
 
+### 4.9 ▶ NEXT ON THE VM — B1: fly the below-canopy route (2026-07-27)
+
+**This supersedes §4.8 as the next flight.** It is item 1 of
+[`../TEST-PLAN.md`](../TEST-PLAN.md), which is the ordered plan the session is
+now working through; read that file first if you are picking this up cold.
+
+#### What changed and why this needs flying
+
+The planner used to hold a fixed **30 m above bare terrain** — over the demo AO's
+12–22 m stands that is *above the canopy*, so its concealment was fake. It now
+flies **under the canopy** (`droneplanner/fields/altitude.py`), and honours
+`waypoint_spacing_m` so the commanded altitude can track the ground. The emitted
+route changed shape completely:
+
+| | old (flown 6× on 2026-07-27) | **new (unflown)** |
+|---|---|---|
+| waypoints | 78 | **282** |
+| altitude | ~30 m AGL | **9–15 m AGL** |
+| min AGL, flown profile | 11.9 m measured | 6.64 m predicted |
+| waypoints reached descending | 2 | **88** |
+
+Terrain is unchanged (only the DSM grew a canopy), so **`worlds/planner_terrain.sdf`
+and its DEM are still valid — do not regenerate them.** This flight is directly
+comparable to the six CFIT runs.
+
+#### 🔴 The prediction: this is expected to STALL. Fly it anyway.
+
+`NAV_MC_ALT_RAD = 4.0` was established over 12 flights on a route with **two**
+waypoints reached mid-descent. This route has **88**. Per-waypoint the spike rate
+to >2 m was ~1 in 6:
+
+```bash
+droneflight validate --plan ~/drone/plans/canopy.plan   # prints the exposure count
+```
+
+That is a genuine prediction with a number attached, and either outcome is
+informative:
+* **It stalls** → the vertical-acceptance window does not scale to dense
+  terrain-following routes, and the fix is *not* a bigger window (4.0 m is
+  already 3× the measured clearance margin). It is TEST-PLAN **A2** — gate
+  reduction — i.e. the corridor contract, which removes the waypoints instead of
+  widening the tolerance. A stall here is the strongest available argument for it.
+* **It completes** → the 1-in-6 spike rate is not independent per waypoint (the
+  spikes are probably a property of a *leg*, not of each vertex on it), which is
+  itself worth knowing before sizing any future route.
+
+#### Also measure — this settles a documented model disagreement
+
+Two descriptions of PX4's descent are on record and they conflict:
+`droneplanner/planner/terrain_profile.py` front-loads at 0.333;
+`configs/px4/terrain_following.params` reports 0.040 on an 18 m step and concludes
+PX4 descends throughout the leg. They may not even be the same statistic — one
+reads like an initial slope, the other like a leg average. **On a descending leg,
+plot commanded and actual altitude against along-track distance** and settle it.
+The CFIT model and `arrival.py` both depend on the answer.
+
+#### Procedure
+
+**1 — sync and stage the plan** (the `.plan` is gitignored; `scp` it):
+
+```bash
+cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
+```
+
+```bash
+scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/out_demo/mission.plan <vm>:~/drone/plans/canopy.plan
+```
+
+On the VM, `git pull` **both** repos (new: `droneflight/src/droneflight/arrival.py`,
+`droneplanner/fields/altitude.py`).
+
+**2 — params.** Same as §4.8: `sitl_bringup.params` + `terrain_following.params`
+(`NAV_MC_ALT_RAD = 4.0`). Verify with `param show NAV_MC_ALT_RAD` — a value set at
+`pxh>` lands in `changed_parameters`, **not** `initial_parameters`.
+
+**3 — fly it**, terrain world, GPS-enabled (isolate one variable — this is about
+sequencing and terrain, not GPS denial). ⚠️ **World as arg 3** — omit it and PX4
+silently loads its flat `default.sdf`, which invalidates the whole flight:
+
+```bash
+./sitl/run_sitl.sh ~/drone/plans/canopy.plan ~/drone/PX4-Autopilot planner_terrain
+```
+
+```bash
+droneflight fly --plan ~/drone/plans/canopy.plan --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/canopy.log
+```
+
+**4 — score it.** Same three failure modes as §4.8, same two audit traps
+(`changed_parameters`; score altitude against
+`vehicle_local_position_groundtruth`, never `vehicle_local_position`). Report
+**completion count AND min AGL together** — completion alone is not the result.
+
+Additionally, because this route is low: report the **distribution** of
+per-waypoint vertical error, not just the worst. With 88 exposed waypoints the
+shape of that distribution is the actual finding, and it is what sizes any future
+route.
+
+#### ⚠️ Known defect in the plan being flown — do not let it confuse the scoring
+
+**One leg of 281 commands a 2.35 m/s descent against the airframe's 2.0 m/s
+limit.** The planner reported `climb_violations = 0` because it checks the *AGL*
+profile while the `.plan` carries relative-to-home altitude — terrain-driven
+vertical motion is invisible to it (`droneplanner/SHORTFALLS.md` item 0b, flagged
+long ago as the user's call, now live for the first time because flying low makes
+terrain motion large relative to the band). PX4 will simply descend slower than
+commanded there and arrive high, **adding** to that waypoint's vertical error. If
+the stall happens at that waypoint, this is why — it is not a new phenomenon.
+
+---
+
 ### 4.8 NEXT ON THE VM — two flights (2026-07-27)
 
 Two fixes landed on the Mac and are green offline. **A** is the important one: it

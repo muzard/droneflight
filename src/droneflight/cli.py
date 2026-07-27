@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from droneflight import __version__
+from droneflight.arrival import assess_arrivals
 from droneflight.config import FlightConfig
 from droneflight.correction import CorrectionConfig
 from droneflight.ev_bridge import (
@@ -85,6 +86,28 @@ def _validate(args: argparse.Namespace) -> int:
     print(f"sensor mode: {sensor.mode.value} (covert={sensor.covert})")
     for warning in sensor.warnings:
         print(f"  warning: {warning}")
+
+    # Vertical-acceptance exposure: how many waypoints the vehicle reaches while
+    # still descending. Each is a draw from the heavy-tailed error distribution
+    # that stalled three missions — see arrival.py.
+    arrivals = assess_arrivals(mission)
+    n_desc = arrivals.exposure_count
+    total = max(1, len(arrivals.arrivals))
+    print(
+        f"vertical acceptance: {n_desc}/{total} waypoints reached while descending "
+        f"({n_desc / total:.0%})"
+    )
+    if n_desc:
+        steepest = arrivals.descending[0]
+        print(
+            f"  steepest arrival: wp {steepest.index}, {steepest.descent_m:.1f} m down over "
+            f"{steepest.leg_length_m:.0f} m (gradient {steepest.required_gradient:.3f})"
+        )
+        # 1-in-6 is the observed spike rate at a descending waypoint (12 flights).
+        print(
+            f"  at the observed 1-in-6 spike rate, P(no stall) ~ "
+            f"{arrivals.stall_free_probability(1 / 6):.1%} — independence assumed, see arrival.py"
+        )
 
     alts = [w.alt_agl_m for w in mission.waypoints]
     print(f"altitude (relative to home): {min(alts):.1f} .. {max(alts):.1f} m")
