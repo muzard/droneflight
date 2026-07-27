@@ -13,7 +13,7 @@ import math
 
 import pytest
 
-from droneflight.arrival import assess_arrivals
+from droneflight.arrival import STEEP_STEP_M, assess_arrivals
 from droneflight.model import FlightMission, Waypoint
 
 _M_PER_DEG_LAT = math.radians(1.0) * 6_371_000.0
@@ -34,19 +34,19 @@ def _mission(alts: list[float], leg_m: float = 100.0) -> FlightMission:
 
 def test_level_flight_has_no_exposure() -> None:
     report = assess_arrivals(_mission([30.0, 30.0, 30.0, 30.0]))
-    assert report.exposure_count == 0
-    assert report.stall_free_probability(1 / 6) == 1.0
+    assert report.descending == ()
+    assert report.max_step_m == 0.0
 
 
 def test_climbing_arrivals_are_not_exposed() -> None:
     """Only descents put the vehicle below its commanded altitude on arrival."""
     report = assess_arrivals(_mission([10.0, 20.0, 30.0]))
-    assert report.exposure_count == 0
+    assert report.descending == ()
 
 
-def test_each_descending_waypoint_is_one_dice_roll() -> None:
+def test_each_descending_leg_is_recorded() -> None:
     report = assess_arrivals(_mission([40.0, 30.0, 20.0, 20.0, 10.0]))
-    assert report.exposure_count == 3
+    assert len(report.descending) == 3
     assert [a.index for a in report.descending] == [1, 2, 4]
 
 
@@ -59,28 +59,33 @@ def test_descending_arrivals_are_ranked_steepest_first() -> None:
 
 def test_sub_decimetre_steps_are_bookkeeping_not_descents() -> None:
     report = assess_arrivals(_mission([30.0, 29.95, 29.9]))
-    assert report.exposure_count == 0
+    assert report.descending == ()
 
 
-def test_exposure_scales_the_bet_with_route_density() -> None:
-    """The point of the whole module: density is the risk, not any one waypoint.
+def test_the_step_size_is_what_separates_the_two_flown_routes() -> None:
+    """Measured in B1: step size discriminates, arrival count does not.
 
-    NAV_MC_ALT_RAD = 4.0 was established on a route with two such waypoints. The
-    same per-waypoint risk over a denser route is a different bet entirely.
+    The 282-waypoint route flew 282/282 with a max step of 8.56 m; the sparse
+    route that stalled three missions had 18-40 m steps. Both have plenty of
+    descending arrivals, so only the step tells them apart.
     """
-    sparse = assess_arrivals(_mission([40.0, 35.0, 30.0]))
-    dense = assess_arrivals(_mission([40.0 - i for i in range(60)]))
-    assert sparse.exposure_count == 2
-    assert dense.exposure_count == 59
-    assert dense.stall_free_probability(1 / 6) < sparse.stall_free_probability(1 / 6)
-    assert dense.stall_free_probability(1 / 6) < 0.01
+    dense = assess_arrivals(_mission([40.0 - i * 0.5 for i in range(60)]))  # 0.5 m steps
+    sparse = assess_arrivals(_mission([40.0, 15.0, 0.0], leg_m=700.0))  # 25 m and 15 m steps
+    assert dense.max_step_m < STEEP_STEP_M < sparse.max_step_m
+    assert dense.steep == ()
+    assert len(sparse.steep) == 2
+    assert sparse.steep[0].descent_m == pytest.approx(25.0)
+    # Both routes are full of descending arrivals — which is exactly why counting
+    # them predicted nothing.
+    assert dense.descending and sparse.descending
 
 
-def test_probability_argument_is_validated() -> None:
-    report = assess_arrivals(_mission([30.0, 20.0]))
-    assert report.stall_free_probability(0.0) == 1.0
-    with pytest.raises(ValueError, match="per_waypoint_risk"):
-        report.stall_free_probability(1.5)
+def test_descending_count_is_kept_only_as_a_diagnostic() -> None:
+    """B1 measured descending arrivals to be indistinguishable from level ones."""
+    report = assess_arrivals(_mission([40.0, 39.5, 39.0]))
+    assert len(report.descending) == 2
+    assert report.max_step_m == pytest.approx(0.5)
+    assert report.steep == ()  # shallow steps: not a risk, whatever the count
 
 
 def test_zero_length_leg_has_no_gradient() -> None:

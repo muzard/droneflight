@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from droneflight import __version__
-from droneflight.arrival import assess_arrivals
+from droneflight.arrival import STEEP_STEP_M, assess_arrivals
 from droneflight.config import FlightConfig
 from droneflight.correction import CorrectionConfig
 from droneflight.ev_bridge import (
@@ -87,26 +87,24 @@ def _validate(args: argparse.Namespace) -> int:
     for warning in sensor.warnings:
         print(f"  warning: {warning}")
 
-    # Vertical-acceptance exposure: how many waypoints the vehicle reaches while
-    # still descending. Each is a draw from the heavy-tailed error distribution
-    # that stalled three missions — see arrival.py.
+    # Vertical acceptance: the per-leg altitude STEP is what separated the route
+    # that stalled (18-40 m steps) from the one that flew clean (8.56 m). Counting
+    # descending arrivals was measured worthless — see arrival.py.
     arrivals = assess_arrivals(mission)
-    n_desc = arrivals.exposure_count
-    total = max(1, len(arrivals.arrivals))
+    steep = arrivals.steep
     print(
-        f"vertical acceptance: {n_desc}/{total} waypoints reached while descending "
-        f"({n_desc / total:.0%})"
+        f"vertical acceptance: largest altitude step {arrivals.max_step_m:.1f} m "
+        f"({len(steep)} leg(s) over {STEEP_STEP_M:.0f} m)"
     )
-    if n_desc:
-        steepest = arrivals.descending[0]
+    for a in steep[:3]:
         print(
-            f"  steepest arrival: wp {steepest.index}, {steepest.descent_m:.1f} m down over "
-            f"{steepest.leg_length_m:.0f} m (gradient {steepest.required_gradient:.3f})"
+            f"  steep leg into wp {a.index}: {a.descent_m:.1f} m down over "
+            f"{a.leg_length_m:.0f} m (gradient {a.required_gradient:.3f})"
         )
-        # 1-in-6 is the observed spike rate at a descending waypoint (12 flights).
+    if steep:
         print(
-            f"  at the observed 1-in-6 spike rate, P(no stall) ~ "
-            f"{arrivals.stall_free_probability(1 / 6):.1%} — independence assumed, see arrival.py"
+            "  large steps on long legs are what stalled three missions; consider "
+            "a smaller waypoint_spacing_m"
         )
 
     alts = [w.alt_agl_m for w in mission.waypoints]

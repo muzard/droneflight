@@ -1,4 +1,4 @@
-"""How many times does a mission roll the vertical-acceptance dice?
+"""Vertical-acceptance risk: what a mission asks PX4 to track, and how hard.
 
 WHY THIS EXISTS
 PX4 sequences a mission waypoint only when the vehicle is inside both the
@@ -8,38 +8,43 @@ look like a failure: the trajectory generator keeps flying, sliding past the
 waypoint until something else stops it. It froze a real mission at 11/79 on
 2026-07-27, and at 51/78 twice more.
 
-Over 12 flights (`sim-logs/cfit/`, `cfit-rep/`, `cfit-rep2/`) one rule held with
-no exceptions: **the mission stalls iff the vertical error at some waypoint
-exceeds the window.** The error splits into two populations:
+WHAT PREDICTS IT — and what does NOT (measured, TEST-PLAN B1, 2026-07-27)
+The first version of this module counted **waypoints reached while descending**,
+on the reasoning that a vehicle still coming down is a vehicle off its commanded
+altitude. That predictor said the 282-waypoint below-canopy route (88 such
+waypoints, against 2 on the route that tuned ``NAV_MC_ALT_RAD = 4.0``) would
+almost certainly stall.
 
-* waypoints the vehicle reaches **level** — 0.35 m mean, 0.64 m p95, worst 0.37 m
-  on the flown route: never a problem;
-* waypoints interior to a **descending** leg — usually 0.66-0.73 m, but spiking
-  to **2.1-2.6 m in roughly 1 run in 6**. Those spikes are the stalls.
+**It flew 282/282, and the predictor was measured worthless:**
 
-So the risk is not a property of a waypoint's geometry, it is a *count of
-opportunities*: every waypoint reached while descending is another draw from that
-heavy-tailed distribution. ``NAV_MC_ALT_RAD = 4.0`` covers the worst of 12 runs
-(2.569 m) with 1.56x margin — but that margin was established over a route with
-**two** such waypoints. A route with two hundred is a different bet entirely, and
-that is what this module measures.
+| arrivals (274 scored, `sim-logs/canopy/21_38_21.ulg`) | mean | p95 | max |
+|---|---|---|---|
+| reached while **descending** | 0.165 m | 0.972 m | 1.817 m |
+| reached **level or climbing** | 0.163 m | 0.950 m | 1.653 m |
 
-⚠️ **WHAT THIS DELIBERATELY DOES NOT DO: predict the error in metres.**
-Two models of PX4's descent are on record here and they disagree:
+Statistically identical. Correlation between a leg's altitude step and the error
+at its endpoint: **-0.002**. So neither "is it descending" nor "how far does it
+descend" predicts anything *within this route's range*.
 
-* ``droneplanner.planner.terrain_profile`` front-loads at ``descent_rate /
-  cruise_speed`` (0.333), justified by the 2026-07-24 crash leg, where 0.220 was
-  measured;
-* ``configs/px4/terrain_following.params``, written after 12 flights, records
-  0.040 on an 18 m step and concludes PX4 descends throughout the leg, so no
-  placement is "settled".
+What separates the two routes is the **size of the altitude step per leg**:
+18-40 m on the CFIT route (which stalled), at most **8.56 m** here (which did
+not). Densifying waypoints shrinks every step, and PX4 tracks small steps
+trivially — mean error **0.164 m** here against 0.35 m over the sparse route.
+**More waypoints made vertical tracking better, not worse.** That is the opposite
+of what this module originally assumed, and it is why it now reports the *step
+sizes a route demands* rather than counting arrivals.
 
-Those two numbers may not even be the same statistic — one reads like an initial
-slope, the other like a leg average. Until a flight measures the altitude-vs-
-along-track profile directly (that is part of B1's scoring), any metres-of-error
-predictor would be fitting a model to an unresolved ambiguity, which is the
-failure this project keeps paying for. **Counting exposure is robust to the
-ambiguity; predicting magnitude is not.** So this counts.
+⚠️ **Two flown routes is two data points.** The threshold below is drawn between
+8.56 m (flew clean) and 18 m (stalled) — a wide gap with nothing in it. Treat
+``STEEP_STEP_M`` as a screening line, not a calibrated limit.
+
+⚠️ **This still does not predict the error in metres**, and B1 could not settle
+why: the front-loaded-vs-linear descent disagreement between
+``droneplanner.planner.terrain_profile`` (0.333) and
+``configs/px4/terrain_following.params`` (0.040 on an 18 m step) needs a **long
+leg with a big drop** to distinguish them, and this route has none (median leg
+24.6 m). It matters less now — the planner no longer emits such legs — but it is
+unresolved, not answered.
 """
 
 from __future__ import annotations
@@ -54,6 +59,12 @@ _EARTH_R = 6_371_000.0
 # Below this, a leg's altitude change is bookkeeping noise, not a descent the
 # vehicle has to fly down. Well under the tightest observed level-arrival error.
 LEVEL_TOLERANCE_M = 0.1
+
+# Altitude step above which a leg is worth flagging. Drawn between the two flown
+# routes — 8.56 m max step completed 282/282 with 1.82 m worst error; 18-40 m
+# steps stalled three missions. The gap between them is unsampled, so this is a
+# screening line, not a calibrated limit.
+STEEP_STEP_M = 12.0
 
 
 @dataclass(frozen=True)
@@ -91,7 +102,12 @@ class ArrivalReport:
 
     @property
     def descending(self) -> tuple[Arrival, ...]:
-        """Waypoints reached while descending, steepest first — the dice rolls."""
+        """Waypoints reached while descending, steepest first.
+
+        ⚠️ Kept as a diagnostic, **not** as a risk metric: B1 measured these to be
+        indistinguishable from level arrivals (0.165 m vs 0.163 m mean). See the
+        module docstring.
+        """
         return tuple(
             sorted(
                 (a for a in self.arrivals if a.arrives_descending),
@@ -101,20 +117,24 @@ class ArrivalReport:
         )
 
     @property
-    def exposure_count(self) -> int:
-        return len(self.descending)
+    def steep(self) -> tuple[Arrival, ...]:
+        """Legs whose altitude step exceeds :data:`STEEP_STEP_M`, largest first.
 
-    def stall_free_probability(self, per_waypoint_risk: float) -> float:
-        """Chance every descending waypoint clears, at a given per-waypoint failure rate.
-
-        Independence is an assumption, and a shaky one — consecutive waypoints on
-        the same leg share whatever transient causes a spike. Treat the result as
-        an order of magnitude that shows how the bet scales with route density,
-        not as a calibrated probability.
+        This is the quantity that separated the route that stalled from the one
+        that did not.
         """
-        if not 0.0 <= per_waypoint_risk <= 1.0:
-            raise ValueError("per_waypoint_risk must be in [0, 1]")
-        return (1.0 - per_waypoint_risk) ** self.exposure_count
+        return tuple(
+            sorted(
+                (a for a in self.arrivals if a.descent_m > STEEP_STEP_M),
+                key=lambda a: a.descent_m,
+                reverse=True,
+            )
+        )
+
+    @property
+    def max_step_m(self) -> float:
+        """Largest single-leg altitude step the route demands."""
+        return max((a.descent_m for a in self.arrivals), default=0.0)
 
 
 def _ground_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

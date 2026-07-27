@@ -1363,7 +1363,62 @@ speed policy and tether transient observable in the loop.
 
 A full catenary / lumped-segment cable model is a later refinement (v1).
 
-### 4.9 ▶ NEXT ON THE VM — B1: fly the below-canopy route (2026-07-27)
+### 4.9 ✅ B1 — below-canopy route: FLOWN 2026-07-27, **COMPLETED 282/282**
+
+`sim-logs/canopy/21_38_21.ulg` + `canopy.log`. Terrain world, tether off
+(`DRONEFLIGHT_TETHER_ENABLED=0`), GPS-enabled, `NAV_MC_ALT_RAD = 4.0` confirmed
+in `initial_parameters`. 926 s of AUTO_MISSION, 5.3 km, no warnings, no RTL.
+
+**Both things B1 set out to test came back positive, and the stall prediction was
+falsified.**
+
+| | predicted | measured |
+|---|---|---|
+| completion | stall (88 exposed waypoints vs 2) | **282/282** |
+| min AGL after takeoff | 6.64 m | **6.26 m**, 0 samples <5 m |
+| worst vertical error | >4.0 m somewhere | **1.817 m** (window 4.0) |
+
+*(The raw minimum AGL over the whole log is −0.01 m; that is the vehicle sitting
+on the ground for the first 8.9 s. Always exclude the takeoff window.)*
+
+🔴 **The predictor was wrong, and the measurement says why.** Counting waypoints
+"reached while descending" predicted near-certain stall. Scored over 274 arrivals:
+
+| arrivals | mean | p95 | max |
+|---|---|---|---|
+| reached **descending** (86) | 0.165 m | 0.972 m | 1.817 m |
+| reached **level/climbing** (188) | 0.163 m | 0.950 m | 1.653 m |
+
+Indistinguishable. Correlation between a leg's altitude step and its arrival
+error: **−0.002**. What actually separates this route from the one that stalled
+is the **per-leg altitude step** — max **8.56 m** here against 18–40 m there.
+Mean error **0.164 m**, against 0.35 m over the sparse route: **densifying the
+waypoints made vertical tracking better, not worse.** `arrival.py` now reports
+step sizes instead of counting arrivals.
+
+✅ **The 2.35 m/s over-limit leg was a non-event.** wp23 — flagged pre-flight
+because it commands a descent steeper than the airframe's 2.0 m/s (PX4's actual
+`MPC_Z_VEL_MAX_DN` is **1.5**) — tracked to **0.003 m**. At 25 m spacing PX4
+spreads a descent across neighbouring legs, so a *per-leg* rate limit is the
+wrong frame. SHORTFALLS 0b is still a real blindness; it did not bite here.
+
+📐 **Also measured:** cross-track vs the planned polyline mean **0.42 m**, p95
+1.81 m, max **2.28 m** — mission mode tracks the dense line tightly and uses no
+corridor freedom at all. And 64 of 281 legs are shorter than `NAV_ACC_RAD`
+(10 m), with **7 waypoints never entered** — PX4 already sequences these in
+bursts. Both facts matter for TEST-PLAN A2/B3.
+
+⚠️ **B1 could NOT settle the front-loaded-vs-linear descent question.**
+Distinguishing `terrain_profile.py`'s 0.333 from the params file's 0.040 needs a
+**long leg with a big drop**; this route's median leg is 24.6 m and its largest
+drop 8.56 m. Still open — and now less urgent, because the planner no longer
+emits such legs.
+
+---
+
+#### (original pre-flight brief, kept as the record of what was predicted)
+
+### 4.9a B1 — below-canopy route (written 2026-07-27, before the flight)
 
 **This supersedes §4.8 as the next flight.** It is item 1 of
 [`../TEST-PLAN.md`](../TEST-PLAN.md), which is the ordered plan the session is
