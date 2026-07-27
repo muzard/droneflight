@@ -13,6 +13,7 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `sensors.py` | passive-optical / passive-thermal / active-lidar tradeoff |
 | `speed_policy.py` | slow through turns/reversals (protect the fiber); consolidates duplicate-waypoint clusters so a turn is seen at its true angle |
 | `tether.py` | **v0 payout-tension model** — back-tension + airborne-span drag + turn/reversal load; validates the speed policy against a break budget (`tether-check`); also **parses + scores the Gazebo plugin's log** (`tether-plugin-check`) |
+| `px4_profile.py` | **the measured PX4 corner prior** — bend → corner speed *and* lateral accel, calibrated from the acceptance §3 control arm. `tether.py` scores through it, because the "flat cruise" arm it used to assume is a profile no autopilot flies |
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter |
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
@@ -119,8 +120,12 @@ What remains **completely unflown** because the world is benign:
   untouched (and real perception needs the RTX box, Track B).
 - **VTRN over real features** — texture/forest starvation is *modelled*, never
   matched against real imagery; the §6.3 bench is unbuilt.
-- **The tether speed policy over real turns** — the flown route is too smooth
-  (≤16° bends), so the policy has never engaged in flight (see `tether.py`).
+- **The tether speed policy over real turns** — every *planned* route is too
+  smooth (≤16° bends) for the policy to engage. It has now been flown on a
+  **synthetic** 20–160° course (acceptance §3, `sim-logs/4.7/`) and **did nothing
+  measurable**: −0.4 % on the peak turn transient for 2.19× flight time, because
+  PX4 already decelerates into corners on its own. So the policy is unexercised on
+  real routes *and* unvalidated as a benefit on any route (see `tether.py`).
 - **Concealment/viewshed** — no line-of-sight or cover exists in an empty world.
 
 **Bottom line: "it flies GPS-denied" means "the injection pipeline flies a smooth
@@ -641,8 +646,50 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     40 % of a conservative 2 N budget**, at cruise, and the route is too smooth
     (max 16° bend) to need slowing. So on these concealment routes the speed
     policy is *inactive and unneeded* — the fiber constraint isn't what shapes
-    them. The policy earns its keep only on reversal-heavy routes (proven in the
-    unit test, not on this plan).
+    them.
+  - ✅ **RECALIBRATED 2026-07-27 — `tether.py` now scores through the measured PX4
+    corner prior (`px4_profile.py`), and the corrected model reproduces the
+    flight to ~1 %.** Two columns, both measured from the §3 control arm, and
+    **both are needed**:
+    * **corner speed** vs bend (6.00 m/s at 0° → 0.46 at 160°) — PX4 decelerating
+      into the corner uncommanded. Dominates the *drag* term.
+    * **lateral accel** vs bend — which is *not* monotone: it peaks at 2.87 m/s²
+      near 45–50° (just under PX4's 3.0 `MPC_ACC_HOR` default) and collapses to
+      ~0.9 at a reversal, because PX4 nearly stops and pivots rather than carving
+      one. Dominates the *turn* term, and it is why the tether transient peaks at
+      **moderate** bends while reversals are the safest corners.
+
+    Calibrating speed alone leaves the turn term ~4× *low*; calibrating both:
+
+    | quantity | old model | recalibrated | **flown (`sim-logs/4.7/`)** |
+    |---|---|---|---|
+    | peak applied \|F\| | 2.07 N | **0.765 N** | 0.7719 / 0.7732 N |
+    | peak turn transient | 1.31 N | **0.311 N** | 0.3150 / 0.3164 N |
+    | fiber snaps predicted | 6 | **0** | 0 |
+    | policy vs no-policy | 2.07 vs 0.88 N | **identical** | −0.4 % |
+
+    So the corrected model **predicts the §3 null that falsified the old one** —
+    the strongest validation available short of a new flight. Also fixed: the turn
+    term now uses the deflection the *payout* sees (`a_lat·L/v²`, the same bridge
+    the Gazebo plugin applies in the loop) instead of the plan's vertex angle —
+    they differ hugely, a 20° vertex was flown as a **49°** per-sample deflection.
+    `tether-check --no-px4-prior` reproduces the old numbers and says so in its
+    banner. ⚠️ **Calibrated at one cruise speed (6.0 m/s), one airframe, default
+    PX4 params, flat world** — whether the corner cap is absolute or scales with
+    cruise is **UNRESOLVED**; RUNBOOK §4.8 is the experiment that settles it.
+    ⚠️ The parity gate is untouched and still EXACT on all real logs (it re-derives
+    from *logged* speed/deflection, so it never goes through the prior).
+  - 🔴 **"The policy earns its keep on reversal-heavy routes" is now MEASURED
+    FALSE in the loop.** That claim rested on the unit test and the offline model.
+    Acceptance §3 flew a deliberately reversal-heavy course (20–160°) and the
+    policy moved the peak turn transient by **−0.4 %** (0.3164 → 0.3150 N) for
+    **2.19× flight time** — because PX4 decelerates into corners on its own, and
+    because slowing makes it corner *tighter*, which cancels the `v²` gain. Worse,
+    the offline model over-predicts 7–18× at sharp bends and **under-predicts
+    2–5× at shallow ones**, where the real in-loop peak actually is. Full result
+    and both mechanisms: the §3 sub-entry under the tether plugin below
+    (`sim-logs/4.7/`). **`tether-check`'s corner numbers should not be quoted as
+    flight-representative until the model carries PX4's corner deceleration.**
   - ⚠️ **Calibration is un-benched** (Tech-Selection §7). Coefficients are
     order-of-magnitude; trust the *comparisons* (policy on/off, leg vs reversal),
     not the absolute newtons. And a real fiber-break mechanism is **still
@@ -656,13 +703,16 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
     add obstacle models, feed a feature-rich basemap — then re-fly the campaign
     over relief + obstacles + features. This is the real next campaign, not a
     tweak.
-  - ✅ **Gazebo C++ tether wrench plugin — DONE. §1 parity EXACT + §2 disturbance
-    confirmed with a scaling law (2026-07-24 → 26).** Sources in
+  - ✅ **Gazebo C++ tether wrench plugin — DONE, all three acceptance items flown
+    (2026-07-24 → 26).** §1 parity EXACT, §2 disturbance confirmed with a scaling
+    law, §3 flown 2026-07-26. Sources in
     [`sitl/tether_plugin/`](sitl/tether_plugin/README.md); requirements/acceptance
     in [`sitl/TETHER_PLUGIN.md`](sitl/TETHER_PLUGIN.md); VM procedure in RUNBOOK §4.
-    Built against gz-sim8, loaded, flew 77/77. Only §3 (speed policy in the loop)
-    remains, and it is **READY to fly** (synthetic turn-rich course — see the §3
-    sub-entry below and RUNBOOK §4.7).
+    Built against gz-sim8, loaded, flew 77/77.
+    🔴 **§3 returned a NEGATIVE: the speed policy does nothing measurable in the
+    loop** (peak turn transient 0.3150 vs 0.3164 N, −0.4 %, for 2.19× flight
+    time). The *plugin* is sound — the finding is about the **policy** and the
+    offline model behind it. See the §3 sub-entry below.
     - ✅ **§2 A/B + scaling PASSED, and it is NOT null (`sim-logs/abtest/`).**
       Clean arms this time — `ab-off` genuinely recorded `enabled=0` (the
       stale-server + unexported-env fixes held). Cruise pitch vs applied force,
@@ -761,15 +811,81 @@ VIO/VTRN/avoidance (Isaac Sim + RTX) is a **later phase** — the M4 can't run i
       Parity (§1) is what proves the plugin works; §2 measures whether the fiber
       *matters*. Sweep `airborne_span_m` (40 → 400) so the evidence is a scaling
       law, not one A/B at a magnitude the controller can hide.
-    - ⏭ **Acceptance §3 (speed policy in the loop) — now READY to fly.** The
-      planner can't supply a turn-rich route (any-angle + fillet keep every vertex
-      <25°, so the policy's per-vertex trigger barely fires — droneplanner
-      SHORTFALLS cross-cutting). So §3 uses a **synthetic** course
+    - 🔴 **Acceptance §3 (speed policy in the loop) — FLOWN 2026-07-26, and it
+      RETURNED A NEGATIVE (`sim-logs/4.7/`).** The A/B is valid and the policy's
+      predicted benefit **did not appear in the loop**. Synthetic turn-rich course
       `plans/slalom_test.plan` (`sitl/make_slalom_plan.py`): 32 wp, 120 m legs,
-      turns 20–160°, constant 30 m. Offline it slows **26/32 waypoints** and drops
-      the tether turn-transient **2.07 → 0.88 N**. The control arm is
-      `droneflight fly --no-speed-policy` (flies cruise everywhere). Procedure:
-      RUNBOOK §4.7. A/B = policy on vs `--no-speed-policy`, tether on in both.
+      turns 20–160°, constant 30 m — the planner can't supply one (any-angle +
+      fillet keep every vertex <25°; droneplanner SHORTFALLS cross-cutting).
+      Both arms **COMPLETED 32/32**, tether ON in both, parity **EXACT** in both.
+
+      | | offline predicted | policy arm | cruise arm (`--no-speed-policy`) | Δ |
+      |---|---|---|---|---|
+      | **peak `turn_n`** | 0.88 vs **2.07 N** | **0.3150 N** | **0.3164 N** | **−0.4 %** |
+      | mean corner `turn_n` | — | 0.1478 N | 0.1724 N | −14 % |
+      | peak applied \|F\| | — | 0.7719 N (39 %) | 0.7732 N (39 %) | −0.2 % |
+      | fiber snaps | 6 predicted, control arm | 0 | **0** | — |
+      | cross-track max | — | **2.22 m** | 1.45 m | policy *worse* |
+      | flight time | — | 1612 s | 736 s | **2.19×** |
+
+      Logs: `s3-policy.{csv,log}` + `23_09_30.ulg`, `s3-cruise.{csv,log}` +
+      `23_40_58.ulg`. The −14 % mean / −0.4 % peak is stable across corner windows
+      of 10–60 m, so it is not a windowing artifact. The policy lowered the
+      transient at **22/30** corners but never at the one that sets the peak.
+    - ✅ **The arms are genuinely different — verified from the ULog, not trusted
+      from the flag.** `position_setpoint_triplet.cruising_speed` shows the policy
+      arm commanded the taper (`6.0, 5.79, 5.17, 4.33, 3.5, 2.67, 1.62, 1.0, 1.0,
+      1.62 …`, min 1.0) and the control arm commanded **6.0 at all 32 waypoints**.
+      Mean moving speed 2.39 vs 5.36 m/s. This is a real null, not a broken run.
+    - 🔬 **Why it's null — mechanism 1: PX4 already IS a speed policy.** The
+      control arm was commanded 6.0 m/s everywhere and *still* decelerated into
+      every corner, scaled by bend angle — the same shape our policy implements:
+
+      | plan bend | control-arm speed at the vertex |
+      |---|---|
+      | 0–35° | 4.39 m/s |
+      | 35–60° | 3.07 |
+      | 60–100° | 2.07 |
+      | 100–140° | 1.22 |
+      | 140–180° | **0.51** |
+
+      So the offline model's premise — that a no-policy vehicle carries cruise
+      through a 160° reversal — is **false in AUTO_MISSION**. There is no
+      "flat cruise profile" for a multirotor mission to protect against.
+    - 🔬 **Mechanism 2: slowing tightens the corner, which cancels the gain.** The
+      plugin bridges waypoint-angle → continuous trajectory as
+      `deflection = a_lat·L/v² = L/r`, while `turn_n ∝ v²(1−cos θ)`. At the
+      transient peak the policy arm's turn radius is **5.3 m** vs the control
+      arm's **13.6 m** — 2.6× tighter, so its deflection is 2.6× larger and the
+      two effects fight to a draw. Slowing down does **not** monotonically reduce
+      the in-loop transient, because PX4 spends the speed on a tighter turn.
+    - 🔴 **The offline model is wrong in BOTH directions — and optimistic exactly
+      where the peak is.** Against what was actually flown, `tether-check`'s
+      waypoint model **over-predicts 7–18× at bends ≥100°** (wp19, 155°: predicted
+      1.29 N, flew 0.070 N) and **under-predicts 2–5× at bends ≤35°** (wp15, a 20°
+      vertex, logged a **49° per-sample deflection** at 5.06 m/s — the vehicle's
+      heading excursion through a corner exceeds the geometric turn). The real
+      in-loop peak lives at **45–50° bends**, where the policy barely slows and
+      offline predicted only 0.24 N. Sharp reversals — the thing the policy is
+      built around — are the *safest* corners in flight, not the worst.
+    - ⚖️ **Verdict: §3 does not pass as written.** The corner transient did not
+      fall. The fiber stayed under budget in both arms, but the control arm proves
+      the policy is not what kept it there — 2.19× flight time bought ~0 peak
+      reduction and slightly worse tracking. For a battery-limited *laying* drone
+      that is a bad trade as currently tuned. **The plugin (§1 + §2) is done and
+      sound; it is the speed policy that now has an open defect.**
+    - ⚠️ **Read it narrowly.** `turn_n` is **logged, not injected**, so this is a
+      quantity derived from real flown kinematics, not a force the airframe felt —
+      the tether transient never fed back into the flight. And it is one
+      flat-world run on a synthetic course with un-benched coefficients
+      (Tech-Selection §7). What it does establish is the *flown speed and
+      curvature profile*, which is real and is what the offline model gets wrong.
+    - 🧭 **Consequence for the roadmap: the planner-side curvature-window trigger
+      is now the WRONG fix to do first.** It would only make a miscalibrated
+      policy fire more often. `tether.py` needs PX4's own corner deceleration in
+      it (measure `v(bend)` from these two ULogs and use that as the corner-speed
+      prior) before the trigger is worth building. Recorded in droneplanner
+      SHORTFALLS cross-cutting.
     - 🧪 **A/B is one env var, not an SDF edit:** `DRONEFLIGHT_TETHER_ENABLED=0|1`
       and `DRONEFLIGHT_TETHER_CSV=<path>`. A disabled run still loads and still
       logs `enabled=0`, so a control arm is identifiable from its own artifacts —

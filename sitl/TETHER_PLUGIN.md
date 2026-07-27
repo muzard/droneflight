@@ -12,7 +12,15 @@
 > | Gazebo glue (`TetherPlugin.cc`) | ✅ **compiled against gz-sim8, loaded, flew 77/77** |
 > | §1 parity | ✅ EXACT on a real Gazebo log (`droneflight tether-plugin-check`) |
 > | §2 disturbance | ✅ scaling law: pitch tracks force to ≤0.5° over 0 → 18 N (`sim-logs/abtest/`) |
-> | §3 speed-policy in the loop | ⏭ READY to fly: `plans/slalom_test.plan` + `fly --no-speed-policy` control arm (RUNBOOK §4.7) |
+> | §3 speed-policy in the loop | 🔴 **FLOWN 2026-07-26, NEGATIVE** — policy moved the peak turn transient −0.4 % (0.3150 vs 0.3164 N) for 2.19× flight time (`sim-logs/4.7/`, RUNBOOK §4.7) |
+>
+> **§3's negative is about the POLICY, not the plugin.** The plugin did its job:
+> parity EXACT in both arms. What §3 showed is that PX4 already decelerates into
+> corners on its own (a control arm commanded cruise at all 32 waypoints still
+> flew ≥140° reversals at 0.51 m/s), and that slowing further makes it corner
+> *tighter* — `deflection = a_lat·L/v² = L/r` — which cancels the `v²` reduction
+> in turn tension. The offline waypoint model over-predicts 7–18× at bends ≥100°
+> and under-predicts 2–5× at bends ≤35°, where the real in-loop peak sits.
 >
 > **The disturbance is NOT near the noise floor** (an earlier note here guessed it
 > would be, and that was wrong): a multirotor holds a steady horizontal force by

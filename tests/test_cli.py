@@ -567,11 +567,21 @@ def test_tether_check_flags_a_break_and_exits_nonzero(
     }
     plan = tmp_path / "rev.plan"
     plan.write_text(json.dumps(doc))
-    rc = app(["tether-check", "--plan", str(plan), "--break-tension", "1.0"])
+    # --no-px4-prior restores the uncalibrated scoring, where flat cruise snaps.
+    rc = app(["tether-check", "--plan", str(plan), "--break-tension", "1.0", "--no-px4-prior"])
     out = capsys.readouterr().out
     assert "SNAP" in out
     assert "prevents" in out  # the policy saves what flat cruise would break
+    assert "prior OFF" in out  # an uncalibrated run must be identifiable from its output
     assert rc == 0  # policy arm stays within the limit even though flat cruise does not
+
+    # By default the PX4 corner prior applies and the reversal survives untouched —
+    # the acceptance §3 result (sim-logs/4.7), asserted where operators will see it.
+    rc = app(["tether-check", "--plan", str(plan), "--break-tension", "1.0"])
+    out = capsys.readouterr().out
+    assert "SNAP" not in out
+    assert "PX4 decelerates into corners on its own" in out
+    assert rc == 0
 
 
 def _write_tether_plugin_log(path: Path, *, enabled: int = 1, span: float = 40.0) -> None:

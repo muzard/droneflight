@@ -56,6 +56,7 @@ from itertools import pairwise
 from pathlib import Path
 
 from droneflight.model import FlightMission
+from droneflight.px4_profile import flown_deflection_deg, flown_speed_ms
 from droneflight.speed_policy import (
     SpeedPolicy,
     _speed_for_bend,
@@ -166,8 +167,13 @@ class TetherLoad:
     paid_out_length_m: float
     speed_ms: float
     deflection_deg: float
+    """The route's vertex angle — the corner as the *plan* describes it."""
     tension_n: float
     break_tension_n: float
+    flown_deflection_deg: float = 0.0
+    """Course change the payout actually sees (heading rate over the coupling
+    length). This, not ``deflection_deg``, is what ``tension_n`` was computed
+    from — they differ a lot at shallow bends. See ``px4_profile``."""
 
     @property
     def load_fraction(self) -> float:
@@ -228,14 +234,24 @@ def analyse_tether(
     config: TetherConfig,
     *,
     policy: SpeedPolicy | None = None,
+    px4_corner_prior: bool = True,
 ) -> TetherReport:
-    """Payout tension along a mission, at the speeds the policy would fly.
+    """Payout tension along a mission, at the speeds the vehicle will actually fly.
 
-    With ``policy`` set, each vertex's speed is the tether-safe policy speed; with
-    ``policy=None`` every vertex runs at ``cruise_speed_ms`` — the control that
-    shows what the fiber would see if the drone never slowed. Tension is scored
-    on the route **consolidated** to real vertices (duplicate-waypoint clusters
-    merged), so a turn is seen at its true angle rather than smeared to ~0°.
+    With ``policy`` set, each vertex's *commanded* speed is the tether-safe policy
+    speed; with ``policy=None`` every vertex is commanded ``cruise_speed_ms``.
+
+    ``px4_corner_prior`` (default on) then caps each commanded speed by the speed
+    PX4 imposes on itself at that bend — measured in flight, see
+    :mod:`droneflight.px4_profile`. **Without it the ``policy=None`` arm is
+    fiction**: acceptance §3 commanded flat cruise at all 32 waypoints and the
+    vehicle still cornered at 0.46-4.96 m/s, so scoring that arm at 6 m/s
+    over-predicted the corner transient 7-18x at sharp bends (and *under*-predicted
+    it at shallow ones). Pass ``False`` only to reproduce a pre-2026-07-26 number.
+
+    Tension is scored on the route **consolidated** to real vertices
+    (duplicate-waypoint clusters merged), so a turn is seen at its true angle
+    rather than smeared to ~0°.
     """
     lat0 = mission.home_lat
     raw = [_to_local_m(w.lat, w.lon, lat0) for w in mission.waypoints]
@@ -259,7 +275,17 @@ def analyse_tether(
             speed = policy.cruise_speed_ms
         else:
             speed = _speed_for_bend(deflection, policy)
-        t = tension_n(config, speed_ms=speed, deflection_deg=deflection)
+        turn_deflection = deflection
+        if px4_corner_prior:
+            speed = flown_speed_ms(speed, deflection)
+            # The turn term is driven by what the *payout* sees, which is a
+            # heading rate over the coupling length, not the plan's vertex angle.
+            turn_deflection = flown_deflection_deg(deflection, speed, config.coupling_length_m)
+        t = (
+            config.back_tension_n
+            + drag_tension_n(config, speed)
+            + turn_tension_n(config, speed, turn_deflection)
+        )
         loads.append(
             TetherLoad(
                 index=reps[i],
@@ -268,6 +294,7 @@ def analyse_tether(
                 deflection_deg=deflection,
                 tension_n=t,
                 break_tension_n=config.break_tension_n,
+                flown_deflection_deg=turn_deflection,
             )
         )
     return TetherReport(loads=tuple(loads), config=config)

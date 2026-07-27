@@ -107,21 +107,62 @@ def test_total_tension_is_the_sum() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_speed_policy_prevents_a_reversal_break() -> None:
-    """A reversal at cruise snaps the fiber; the policy's slowdown saves it.
+def test_uncalibrated_model_says_a_reversal_at_cruise_snaps() -> None:
+    """What the model claimed before the PX4 corner prior — kept, and pinned OFF.
 
-    This is the model validating the speed policy against payout physics — the
-    reason the module exists.
+    This was the module's headline result and the justification for the speed
+    policy. It is preserved only as the *uncalibrated* baseline: acceptance §3
+    flew exactly this scenario and nothing snapped, because no vehicle flies a
+    reversal at cruise. See ``test_px4_prior_is_what_survives_a_reversal``.
     """
     m = _mission([(46.90, 15.0), (46.9018, 15.0), (46.9002, 15.0)])  # out then reverse
+    cfg = TetherConfig()
+    no_policy = analyse_tether(m, cfg, policy=None, px4_corner_prior=False)
+    with_policy = analyse_tether(
+        m, cfg, policy=SpeedPolicy(cruise_speed_ms=6.0, min_speed_ms=1.0), px4_corner_prior=False
+    )
+
+    assert no_policy.breaks
+    assert no_policy.peak is not None and no_policy.peak.deflection_deg > 150.0
+    assert with_policy.within_limit
+    assert with_policy.max_tension_n < no_policy.max_tension_n
+
+
+def test_px4_prior_is_what_survives_a_reversal_not_the_speed_policy() -> None:
+    """The §3 finding, pinned: PX4's own corner deceleration keeps the fiber intact.
+
+    Flown 2026-07-26 (`sim-logs/4.7/`): a control arm commanded 6.0 m/s at all 32
+    waypoints still cornered at 0.46-4.96 m/s, the peak turn transient moved
+    -0.4% versus the policy arm, and neither arm broke anything. With the prior
+    on, the model must reproduce that null — if these two ever diverge again, the
+    prior has stopped being applied.
+    """
+    m = _mission([(46.90, 15.0), (46.9018, 15.0), (46.9002, 15.0)])
     cfg = TetherConfig()
     no_policy = analyse_tether(m, cfg, policy=None)
     with_policy = analyse_tether(m, cfg, policy=SpeedPolicy(cruise_speed_ms=6.0, min_speed_ms=1.0))
 
-    assert no_policy.breaks  # flat cruise through the reversal snaps
-    assert no_policy.peak is not None and no_policy.peak.deflection_deg > 150.0
-    assert with_policy.within_limit  # the policy slows enough to survive
-    assert with_policy.max_tension_n < no_policy.max_tension_n
+    assert no_policy.within_limit, "PX4 will not fly a reversal at cruise"
+    assert with_policy.within_limit
+    assert with_policy.max_tension_n == pytest.approx(no_policy.max_tension_n)
+    # And the uncalibrated model must still disagree, or the arms are not distinct.
+    uncal = analyse_tether(m, cfg, policy=None, px4_corner_prior=False)
+    assert uncal.max_tension_n > no_policy.max_tension_n * 2.0
+
+
+def test_prior_uses_the_flown_deflection_not_the_vertex_angle() -> None:
+    """A shallow vertex is a much larger course change to the payout.
+
+    The waypoint model reads the angle between two legs; the fiber sees a heading
+    rate sustained over the coupling length. Measured in flight: a 20 deg vertex
+    was flown as a 49 deg per-sample deflection. Scoring the vertex angle
+    under-reads shallow corners, which is where the flown transient peaks.
+    """
+    # A gentle bend: ~20 deg at the middle vertex.
+    m = _mission([(46.9000, 15.0000), (46.9020, 15.0000), (46.9038, 15.0009)])
+    load = analyse_tether(m, TetherConfig(), policy=None).loads[1]
+    assert 0.0 < load.deflection_deg < 30.0
+    assert load.flown_deflection_deg > load.deflection_deg * 2.0
 
 
 def test_straight_route_never_breaks_and_policy_is_inactive() -> None:
@@ -134,8 +175,15 @@ def test_straight_route_never_breaks_and_policy_is_inactive() -> None:
 
 def test_report_flags_breaks_and_warnings() -> None:
     m = _mission([(46.90, 15.0), (46.9018, 15.0), (46.9002, 15.0)])
-    # A tiny break budget so the reversal is over it and a mid leg only warns.
-    rep = analyse_tether(m, TetherConfig(break_tension_n=1.0, warn_fraction=0.5), policy=None)
+    # Exercises the report's break/warning classification, so the prior is off:
+    # with it on this route no longer breaks at any sane budget (that is the §3
+    # finding, covered by its own test — this one is about the plumbing).
+    rep = analyse_tether(
+        m,
+        TetherConfig(break_tension_n=1.0, warn_fraction=0.5),
+        policy=None,
+        px4_corner_prior=False,
+    )
     assert rep.breaks
     assert rep.peak is not None and rep.peak.exceeds_break
     assert rep.peak.load_fraction > 1.0

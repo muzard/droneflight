@@ -221,17 +221,30 @@ cd ~/droneplanner && git pull      # picks up regenerated worlds/DEMs
 | `demo_ao/dtm.tif`, `demo_ao/worlds/*.sdf` | ✅ (tracked in droneplanner) |
 | **`.plan`** | ❌ gitignored build artifact — `scp` it |
 
-The world's DEM `<uri>` is an **absolute path** baked in at generation time
-(`--dem-path`), currently `/home/arttudrone/droneplanner/demo_ao/dtm.tif` so it
-resolves inside the VM's clone. If the VM layout changes, regenerate with
-`droneplanner gz-world --dem-path <new path>`.
+🔴 **DO NOT copy the tracked `demo_ao/worlds/planner_terrain.sdf` — it is the
+PRE-FIX world and it will bury the vehicle.** Its DEM `<uri>` still points at the
+**raw** `demo_ao/dtm.tif`; Gazebo reads a DEM's raw elevations, so the terrain
+surface under home lands at `z = min_elev` (+40 m) while PX4 spawns at `z = 0`.
+That is the buried-spawn bug that read as a stable hover and then flung the
+vehicle on its first translation — it cost two sessions to find. The world that
+actually flew (2026-07-24) was regenerated on the VM against the **zero-based
+DEM** `gz-world` now emits, and that regenerated copy is what lives in
+`$PX4_DIR/Tools/simulation/gz/worlds/` there. The tracked file is stale.
 
-After pulling, install the world into PX4:
+**Check before flying** — a healthy world names a `*_dem.tif`, not `dtm.tif`:
 
 ```bash
-cp ~/droneplanner/demo_ao/worlds/planner_terrain.sdf \
-   ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
+grep -o '<uri>file://[^<]*</uri>' ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_terrain.sdf | head -1
 ```
+
+If that shows `dtm.tif`, regenerate it (§2b below) instead of flying it. The
+world depends only on the **DTM and home**, so a re-planned route does *not*
+require regenerating it — verified 2026-07-27, the route change alone leaves the
+world byte-identical.
+
+The DEM `<uri>` is an **absolute path** baked in at generation time
+(`--dem-path`), so it must resolve inside the VM. If the VM layout changes,
+regenerate with `droneplanner gz-world --dem-path <new path>`.
 
 **The `.plan`** is a build artifact — copy it across:
 
@@ -1241,7 +1254,41 @@ cruise* — but it is **not** evidence the plugin works. Distinguish the two:
   with `v²`. A scaling law is far stronger evidence than one A/B at a magnitude
   the controller can hide.
 
-### 4.7 Acceptance §3 — speed policy in the loop (turn-rich course READY)
+### 4.7 Acceptance §3 — speed policy in the loop — ❌ FLOWN 2026-07-26, NEGATIVE
+
+**Result (`sim-logs/4.7/`): the policy does nothing measurable in the loop.**
+Both arms COMPLETED 32/32, tether ON in both, parity EXACT in both.
+
+| | offline predicted | policy | cruise (`--no-speed-policy`) | Δ |
+|---|---|---|---|---|
+| **peak `turn_n`** | 0.88 vs **2.07 N** | **0.3150 N** | **0.3164 N** | **−0.4 %** |
+| mean corner `turn_n` | — | 0.1478 N | 0.1724 N | −14 % |
+| peak applied \|F\| | — | 0.7719 N (39 %) | 0.7732 N (39 %) | −0.2 % |
+| fiber snaps | 6 predicted, control | 0 | **0** | — |
+| cross-track max | — | **2.22 m** | 1.45 m | policy *worse* |
+| flight time | — | 1612 s | 736 s | **2.19×** |
+
+**Two mechanisms, both invisible offline.** (1) *PX4 already is a speed policy* —
+the control arm was commanded 6.0 m/s at all 32 waypoints (verified from
+`position_setpoint_triplet.cruising_speed` in the ULog) and still slowed to
+4.39 m/s at ≤35° bends and **0.51 m/s** at ≥140° reversals, scaled by bend angle
+just like our policy. (2) *Slowing tightens the corner* — the plugin's bridge is
+`deflection = a_lat·L/v² = L/r`, and the policy arm's turn radius at the transient
+peak is **5.3 m** vs the control's **13.6 m**, so the larger deflection cancels
+the `v²` reduction.
+
+⚠️ **The offline model is wrong in both directions**: it over-predicts 7–18× at
+bends ≥100° and **under-predicts 2–5× at bends ≤35°**, where the real in-loop peak
+lives (45–50°). Do not quote `tether-check` corner numbers as flight-representative
+until it carries a PX4 corner-speed prior.
+
+**Scoring an §3 rerun:** `turn_n` is *logged, not injected*, so score it as a
+derived measure of the flown speed/curvature profile, not as a force the airframe
+felt. Verify the arms differ from the **ULog's commanded `cruising_speed`**, never
+from the CLI flag — a taper `6.0 … 1.0` vs a flat `6.0` is the proof the control
+arm was really uncontrolled. The procedure below is unchanged and still correct.
+
+#### Procedure (unchanged — for reruns)
 
 `plans/ev_test.plan` bends ≤16°, so the policy never engages there. The planner
 cannot supply a sharper route — its any-angle search + kinematic fillet spread
@@ -1278,9 +1325,9 @@ droneflight fly --plan ~/drone/plans/slalom_test.plan --url udpin://0.0.0.0:1454
 ```
 
 Compare the **tether turn-transient** (CSV `turn_n`) at the corners and the
-**cross-track** between arms: with the policy slowing through the reversals, the
-corner transient should fall and the fiber load stay under the break budget. That
-drop, in the loop, is the §3 result.
+**cross-track** between arms. The hypothesis was that the policy's slowdown
+lowers the corner transient; as flown (2026-07-26) it did **not** — see the result
+table at the top of §4.7.
 
 ⚠️ **This course is a flight-stack instrument, not a planned route** — it does not
 come from the planner and has no concealment meaning. It exists solely to make the
@@ -1288,7 +1335,115 @@ speed policy and tether transient observable in the loop.
 
 A full catenary / lumped-segment cable model is a later refinement (v1).
 
-A full catenary / lumped-segment cable model is a later refinement (v1).
+### 4.8 NEXT ON THE VM — two flights (2026-07-27)
+
+Two fixes landed on the Mac and are green offline. **A** is the important one: it
+is a CFIT fix and it has never flown. **B** is optional and settles an open
+question in a calibration.
+
+**Prereqs:** `git pull` **both** repos on the VM. New: `droneplanner`'s
+`planner/terrain_profile.py`, `droneflight`'s `px4_profile.py`, a `--cruise` flag
+on `make_slalom_plan.py`, and `tether-check --no-px4-prior`. **No plugin rebuild**
+— `TetherPlugin.cc`/`CMakeLists` are untouched, so the existing binary is current.
+
+---
+
+#### A. CFIT fix over real terrain — the one that matters
+
+The planner used to guarantee clearance against **linear** altitude interpolation.
+PX4 front-loads a leg's descent, and on 2026-07-24 that flew the aircraft into the
+ground at 0.8 m AGL, ending the mission at **51/77**. Fixed 2026-07-27: big-drop
+legs are split, and clearance is re-scored against the flown profile. On the demo
+AO the worst point went **−6.6 m → +11.9 m AGL** for **2 extra vertices** (77 →
+79). *This has only been verified offline.* The flight is the test.
+
+**1 — regenerate the plan on the Mac** (droneplanner is clone-only on the VM, and
+the `.plan` does not ride git):
+
+```bash
+cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
+```
+
+Confirm before copying — `report.json` must show `clearance_violations: 0` and
+`descent_vertices_inserted: 2`, and the plan must have **79** waypoints.
+
+**2 — copy it over:**
+
+```bash
+scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/out_demo/mission.plan <vm>:~/drone/plans/terrain_fixed.plan
+```
+
+**3 — check the world is the FIXED one before you fly it** (§2b: the world tracked
+in git is the pre-fix, buried-spawn version — the VM's regenerated copy is the
+good one). A healthy world names a `*_dem.tif`, never `dtm.tif`:
+
+```bash
+grep -o '<uri>file://[^<]*</uri>' ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_terrain.sdf | head -1
+```
+
+The world does **not** need regenerating for this flight — it depends only on the
+DTM and home, and neither changed (verified 2026-07-27: a re-planned route leaves
+the world byte-identical).
+
+**4 — fly it**, same as §3:
+
+```bash
+PX4_GZ_WORLD=planner_terrain ./sitl/run_sitl.sh ~/drone/plans/terrain_fixed.plan ~/drone/PX4-Autopilot
+```
+
+```bash
+droneflight fly --plan ~/drone/plans/terrain_fixed.plan --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/terrain-fixed.log
+```
+
+**How to score it — and what a false pass looks like.** The headline is
+`COMPLETED 78/78` (79 waypoints) instead of stalling at 51. But **completion alone
+is not the result**: the 2026-07-24 run also flew 51 waypoints before it hit
+anything. Score the **minimum AGL** from the ULog —
+`vehicle_local_position_groundtruth.z` against the DEM, or
+`distance_sensor`/`vehicle_local_position.dist_bottom` if available — and check it
+never approaches 0 on the descending legs. The planner predicts a **11.9 m**
+floor; anything materially under that means the front-loaded model is still
+optimistic, which is the interesting failure and worth a session on its own.
+
+⚠️ **The climb side is unvalidated by construction.** The model treats climbs as
+linear because prompt climbing only adds clearance — if this flight shows PX4
+climbing *lazily* over rising terrain, that is a new defect of the same family
+(droneplanner SHORTFALLS 0b is the related AGL/AMSL blindness).
+
+---
+
+#### B. Optional — settle whether PX4's corner cap scales with cruise speed
+
+`px4_profile.py`'s corner prior was calibrated at **one cruise speed, 6.0 m/s**, so
+it cannot tell an **absolute** cap (a lateral-acceleration limit) from a **fraction
+of cruise**. It is applied as absolute, which is the more physical reading, but
+that is an assumption. One flight settles it: same §3 course, half the cruise.
+
+```bash
+python ~/droneflight/sitl/make_slalom_plan.py ~/drone/plans/slalom_slow.plan --cruise 3.0
+```
+
+```bash
+DRONEFLIGHT_TETHER_ENABLED=1 DRONEFLIGHT_TETHER_CSV=$HOME/s3-slow.csv ./run_sitl.sh ~/drone/plans/slalom_slow.plan ~/drone/PX4-Autopilot
+```
+
+```bash
+droneflight fly --plan ~/drone/plans/slalom_slow.plan --url udpin://0.0.0.0:14540 --no-speed-policy 2>&1 | tee $HOME/s3-slow.log
+```
+
+**Reading it — the two outcomes are cleanly distinguishable.** Compare the corner
+speeds against the 6.0 m/s control arm (`sim-logs/4.7/s3-cruise.csv`) at the same
+bends:
+
+| if corner speeds at 3.0 m/s cruise are… | then the cap is… | and `px4_profile` is… |
+|---|---|---|
+| **unchanged** at sharp bends (0.46 m/s at 160°, 1.75 at 90°) | absolute | correct as written |
+| **halved** (~0.23 at 160°, ~0.88 at 90°) | a fraction of cruise | wrong — must scale by `cruise/6.0` |
+
+Expect a mix: shallow bends are cruise-limited at 3.0 m/s either way (the prior
+already reads 4.96 m/s at 20°, above the new cruise), so **score this on bends
+≥90°**, where the measured cap is well under 3.0 m/s and the two hypotheses
+actually differ.
 
 ## 5. HITL & beyond
 

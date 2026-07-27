@@ -148,8 +148,14 @@ def _tether_check(args: argparse.Namespace) -> int:
     """Validate the tether-safe speed policy against the v0 payout-tension model.
 
     Runs the mission's payout tension twice — at the policy speeds and at flat
-    cruise — so the whole point of the policy (slow through bends so the fiber
-    survives) becomes a number with a pass/fail against the break tension.
+    cruise — against the break tension.
+
+    Both arms are scored through the **measured PX4 corner prior** (see
+    ``px4_profile``): the autopilot decelerates into corners whatever it was
+    commanded, so a literal "flat cruise" arm is a profile no vehicle flies.
+    ``--no-px4-prior`` restores the old uncalibrated scoring, which over-predicted
+    the flown corner load 7-18x at sharp bends. Expect the two arms to agree
+    closely with the prior on — acceptance §3 measured that null in flight.
     """
     from droneflight.speed_policy import SpeedPolicy
     from droneflight.tether import TetherConfig, analyse_tether
@@ -167,12 +173,14 @@ def _tether_check(args: argparse.Namespace) -> int:
         slow_above_deg=args.slow_above,
         reversal_deg=args.reversal_deg,
     )
-    with_policy = analyse_tether(mission, config, policy=policy)
-    no_policy = analyse_tether(mission, config, policy=None)
+    prior = not args.no_px4_prior
+    with_policy = analyse_tether(mission, config, policy=policy, px4_corner_prior=prior)
+    no_policy = analyse_tether(mission, config, policy=None, px4_corner_prior=prior)
 
     print(
         f"tether v0: break {config.break_tension_n:.1f} N, back-tension "
         f"{config.back_tension_n:.1f} N, cruise {mission.cruise_speed_ms:.1f} m/s"
+        f"{'' if prior else '  [PX4 corner prior OFF — uncalibrated]'}"
     )
     for label, rep in (("no policy (flat cruise)", no_policy), ("speed policy", with_policy)):
         peak = rep.peak
@@ -189,6 +197,12 @@ def _tether_check(args: argparse.Namespace) -> int:
         print(
             f"  → the policy prevents {len(no_policy.breaks)} fiber break(s) the flat-cruise "
             "profile would cause."
+        )
+    elif prior and no_policy.within_limit:
+        # The §3 result, made visible at the point of use rather than buried in docs.
+        print(
+            "  → both arms survive: PX4 decelerates into corners on its own, so the "
+            "policy is not what keeps the fiber intact here (acceptance §3, sim-logs/4.7)."
         )
     return 0 if with_policy.within_limit else 1
 
@@ -853,6 +867,14 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--slow-above", type=float, default=30.0, help="Bend (deg) to start slowing.")
     t.add_argument(
         "--reversal-deg", type=float, default=150.0, help="Bend (deg) treated as reversal."
+    )
+    t.add_argument(
+        "--no-px4-prior",
+        action="store_true",
+        help=(
+            "Score at the commanded speed instead of PX4's measured corner speed. "
+            "Reproduces pre-2026-07-26 numbers; over-predicts the flown corner load 7-18x."
+        ),
     )
     t.set_defaults(func=_tether_check)
 

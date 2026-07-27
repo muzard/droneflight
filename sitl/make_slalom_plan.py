@@ -109,7 +109,7 @@ def _item(seq: int, lat: float, lon: float) -> dict[str, object]:
     }
 
 
-def build_plan() -> dict[str, object]:
+def build_plan(cruise_ms: float = CRUISE_MS) -> dict[str, object]:
     track = build_track()
     items = []
     for i, (e, n) in enumerate(track, start=1):
@@ -120,7 +120,7 @@ def build_plan() -> dict[str, object]:
         "geoFence": {"circles": [], "polygons": [], "version": 2},
         "groundStation": "QGroundControl",
         "mission": {
-            "cruiseSpeed": CRUISE_MS,
+            "cruiseSpeed": cruise_ms,
             "firmwareType": 12,
             "globalPlanAltitudeMode": 1,
             "hoverSpeed": 5.0,
@@ -135,16 +135,31 @@ def build_plan() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    # Output path is an optional arg, because the .plan lives OUTSIDE the git
+    # Output path is an explicit arg, because the .plan lives OUTSIDE the git
     # repos (in DroneAutomation/plans on the Mac, ~/drone/plans on the VM) — it
     # does not ride `git pull`. Only this generator does; regenerate the .plan
     # wherever you need it. Default is the Mac layout.
-    if len(sys.argv) > 1:
-        out = Path(sys.argv[1])
-    else:
-        out = Path(__file__).resolve().parents[1].parent / "plans" / "slalom_test.plan"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(build_plan(), indent=4), encoding="utf-8")
-    print(f"wrote {out}  ({len(TURN_SEQUENCE_DEG) + 2} waypoints)")
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "out",
+        nargs="?",
+        type=Path,
+        default=Path(__file__).resolve().parents[1].parent / "plans" / "slalom_test.plan",
+    )
+    ap.add_argument(
+        "--cruise",
+        type=float,
+        default=CRUISE_MS,
+        help=(
+            "Cruise speed (m/s). The PX4 corner prior in droneflight/px4_profile.py was "
+            "calibrated at 6.0 only, so whether PX4's corner cap is absolute or scales "
+            "with cruise is UNRESOLVED — re-flying this course at another cruise speed "
+            "is the experiment that settles it (RUNBOOK 4.8)."
+        ),
+    )
+    args = ap.parse_args()
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(build_plan(args.cruise), indent=4), encoding="utf-8")
+    print(f"wrote {args.out}  ({len(TURN_SEQUENCE_DEG) + 2} waypoints, cruise {args.cruise} m/s)")
