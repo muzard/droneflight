@@ -841,6 +841,58 @@ def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live
     return 0 if result.completed else 1
 
 
+def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs a live autopilot
+    """TEST-PLAN B2b: fly the route as a corridor, avoidance in the loop."""
+    from droneflight.mavsdk_offboard import MavsdkOffboardConnector
+    from droneflight.offboard import OffboardConfig, OffboardResult, fly_corridor
+    from droneflight.trunk_manifest import TrunkManifestError, load_trunk_manifest
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        mission = load_qgc_plan(args.plan)
+        manifest = load_trunk_manifest(args.trunks)
+    except (PlanLoadError, TrunkManifestError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"forest: {len(manifest.trunks)} trunks from {args.trunks}")
+    config = OffboardConfig(
+        lookahead_m=args.lookahead,
+        cruise_speed_ms=mission.cruise_speed_ms,
+        control_hz=args.control_hz,
+        sensor_range_m=args.sensor_range,
+    )
+    obstacles = manifest.obstacle_field()
+    if args.no_avoidance:
+        # The control arm: same executor, same guidance, blind. Isolates the
+        # avoidance layer from the corridor-following that carries it.
+        from droneflight.perception import ObstacleField
+
+        obstacles = ObstacleField()
+        print("avoidance: DISABLED (control arm) — the trees are still in the world")
+
+    connector = MavsdkOffboardConnector(control_hz=args.control_hz)
+
+    async def run() -> OffboardResult:
+        await connector.connect(args.url, ready_timeout_s=60.0)
+        await connector.arm()
+        await connector.takeoff(args.takeoff_alt)
+        try:
+            return await fly_corridor(connector, mission, obstacles, config)
+        finally:
+            await connector.stop_offboard()
+            await connector.disconnect()
+
+    result = asyncio.run(run())
+    print(
+        f"{'REACHED GOAL' if result.reached_goal else 'DID NOT REACH GOAL'}: "
+        f"route point {result.route_index}/{result.route_points - 1}, "
+        f"{result.steps} control steps, closest obstacle {result.min_clearance_m:.1f} m, "
+        f"{result.blocked_steps} step(s) with no free heading"
+    )
+    return 0 if result.reached_goal else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The full CLI grammar.
 
@@ -1058,6 +1110,31 @@ def build_parser() -> argparse.ArgumentParser:
         "The control arm for the in-loop speed-policy test (RUNBOOK §4.7).",
     )
     f.set_defaults(func=_fly)
+
+    fc = sub.add_parser(
+        "fly-corridor",
+        help="TEST-PLAN B2b: fly a .plan as a corridor with reactive avoidance (offboard).",
+    )
+    fc.add_argument("--plan", type=Path, required=True)
+    fc.add_argument(
+        "--trunks",
+        type=Path,
+        required=True,
+        help="Trunk manifest from `droneplanner gz-world --forest-dsm` — the SAME file the "
+        "Gazebo world was built from, so perception senses what physics will hit.",
+    )
+    fc.add_argument("--url", default="udpin://0.0.0.0:14540")
+    fc.add_argument("--lookahead", type=float, default=25.0, help="Carrot distance (m).")
+    fc.add_argument("--control-hz", type=float, default=10.0)
+    fc.add_argument("--sensor-range", type=float, default=30.0)
+    fc.add_argument("--takeoff-alt", type=float, default=15.0)
+    fc.add_argument(
+        "--no-avoidance",
+        action="store_true",
+        help="Control arm: fly the identical guidance with an EMPTY obstacle field. "
+        "The trees stay in the world, so this measures what avoidance is worth.",
+    )
+    fc.set_defaults(func=_fly_corridor)
 
     return parser
 

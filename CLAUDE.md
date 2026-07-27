@@ -15,7 +15,9 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `tether.py` | **v0 payout-tension model** — back-tension + airborne-span drag + turn/reversal load; validates the speed policy against a break budget (`tether-check`); also **parses + scores the Gazebo plugin's log** (`tether-plugin-check`) |
 | `px4_profile.py` | **the measured PX4 corner prior** — bend → corner speed *and* lateral accel, calibrated from the acceptance §3 control arm. `tether.py` scores through it, because the "flat cruise" arm it used to assume is a profile no autopilot flies |
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
-| `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter |
+| `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter. 🔴 **Measured limit 2026-07-28: flies ≤50 stems/ha (7 m spacing), hovers at ≥100 (5 m).** Real forest is 400-1000/ha — see TEST-PLAN B2 |
+| `offboard.py` + `mavsdk_offboard.py` | **corridor executor** — carrot guidance along the route, avoidance in the loop, altitude commanded by us not interpolated by PX4 (what A2 says a corridor needs). `droneflight fly-corridor` |
+| `trunk_manifest.py` | loads the trunk CSV the Gazebo world was built from, so perception senses what physics will hit |
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
 | `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver), plus yaw drift and EV lock loss |
 | `correction.py` | **optical terrain-relative correction** — data-driven fixes over a spatially varying basemap; confidence floor + innovation gate + Kalman fuse |
@@ -42,7 +44,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 252 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 271 tests, ~96% cov
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.

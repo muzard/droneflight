@@ -66,7 +66,7 @@ branch = true
 source = ["droneflight"]
 # The live MAVSDK adapter needs a real autopilot; it is exercised in the sim
 # harness (RUNBOOK.md), not unit tests.
-omit = ["*/mavsdk_connector.py"]
+omit = ["*/mavsdk_connector.py", "*/mavsdk_offboard.py"]
 
 [tool.coverage.report]
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise NotImplementedError"]

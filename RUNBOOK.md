@@ -1375,18 +1375,60 @@ the route could actually be planned perfectly in advance". So put trees in.
 terrain, same params, tether off — the *only* difference is 4000 trunk cylinders.
 B1 flew it 282/282 with 6.26 m min AGL. Any difference here is the forest.
 
-#### What is built (Mac) and what is not
+#### What is built (all of it, Mac-side)
 
 | piece | state |
 |---|---|
 | trunk generation + SDF injection (`gz-world --forest-dsm`) | ✅ built, unit-tested |
-| trunk manifest → `perception.sense()` (`droneflight/trunk_manifest.py`) | ✅ built, unit-tested |
-| **offboard executor driving `avoidance.py` in the loop** | ❌ **not built — that is B2b** |
+| trunk manifest → `perception.sense()` (`trunk_manifest.py`) | ✅ built, unit-tested |
+| offboard corridor executor (`offboard.py`, `droneflight fly-corridor`) | ✅ built, unit-tested |
+| MAVSDK offboard driver (`mavsdk_offboard.py`) | ✅ built, **unexercised** (no autopilot on the Mac) |
 
-So today's run is the control arm: **mission mode, no avoidance**. It answers
-"does the planned route actually hit trees?", which is the question the avoidance
-arm will later be measured against. `7 trunks fall within a rotor span of the
-planned centreline` on the demo AO, so the honest prediction is that it does.
+#### 🔴 Read this before flying: the answer may already be known
+
+Running the executor **kinematically** against the real 4000-trunk manifest, the
+reactive layer **cannot fly the forest** — it hovers, `avoid()` finding no free
+bearing, 84 % of control steps blocked. Sweeping density locates the boundary:
+
+| stems/ha | median spacing | reaches goal | steps blocked |
+|---|---|---|---|
+| 25 | 10.0 m | ✅ | 0 % |
+| 50 | 7.0 m | ✅ | 0 % |
+| **100** | **5.0 m** | ❌ | **79 %** |
+| 172 | 3.8 m | ❌ | 84 % |
+
+Real mature managed forest is **400–1000 stems/ha**. So this is a **policy** limit
+(90° FOV, 6 m reaction = 1.0 s at cruise, and `atan2(0.95, r)` of angular padding
+per blocked ray, which saturates the FOV at close spacing) rather than a
+geometric one — a 5 m gap is far wider than the 1.9 m the airframe needs.
+
+The kinematic harness has instant velocity response and no turn-rate limit, so
+**real dynamics can only be worse**. Fly the bracket, not one point.
+
+#### 1 — build TWO forested worlds (Mac)
+
+⚠️ **`--base-world` must be PX4's own `default.sdf`, never an already-generated
+terrain world** — the terrain model is *appended*, so feeding it
+`planner_terrain.sdf` injects the heightmap twice.
+
+```bash
+cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && . ../.venv/bin/activate && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
+```
+
+Sparse arm — the density the layer *should* handle:
+
+```bash
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 50 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_sparse_dem.tif --out worlds/forest_sparse.sdf
+```
+
+Dense arm — the density it should *fail* at:
+
+```bash
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 400 --max-stems 4000 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_dense_dem.tif --out worlds/forest_dense.sdf
+```
+
+Record the reported `stems/ha` and `median nearest-neighbour` for each — those,
+not the flag, are what was flown.
 
 #### 1 — build the forested world (Mac)
 
@@ -1409,35 +1451,78 @@ wide and needs roughly 1 m of clearance, so a median gap of ~3.7 m is cluttered
 but flyable. If you raise `--stems-per-ha`, S falls and at some point no policy
 can succeed — that is a legitimate experiment, but say which one you ran.
 
-#### 2 — ship three files to the VM
+#### 2 — ship the worlds, DEMs and manifests to the VM
 
 ```bash
-scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/planner_forest.sdf /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/planner_forest_dem.tif arttudrone@192.168.132.129:~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
+scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/forest_*.sdf /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/forest_*_dem.tif arttudrone@192.168.132.129:~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
 ```
 
 ```bash
-scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/planner_forest_trunks.csv arttudrone@192.168.132.129:~/drone/plans/
+scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/forest_*_trunks.csv arttudrone@192.168.132.129:~/drone/plans/
+```
+
+Sync the code — `offboard.py`, `mavsdk_offboard.py` and `trunk_manifest.py` are
+new, so this run **does** need a pull (unlike B1):
+
+```bash
+ssh arttudrone@192.168.132.129 'cd ~/droneflight && git pull && cd ~/droneplanner && git pull'
 ```
 
 The `.plan` is unchanged from B1 (`~/drone/plans/canopy.plan`); re-`scp` it only
 if you re-planned.
 
-#### 3 — fly it (VM), world as arg 3
+#### 3 — arm 1: mission mode through the dense forest (the control)
+
+No avoidance at all — it answers "does the planned route hit trees?". World as
+arg 3; omit it and PX4 loads its flat default and the run is void.
 
 ```bash
-cd ~/droneflight && . ~/venv/bin/activate && DRONEFLIGHT_TETHER_ENABLED=0 ./sitl/run_sitl.sh ~/drone/plans/canopy.plan ~/drone/PX4-Autopilot planner_forest
+cd ~/droneflight && . ~/venv/bin/activate && DRONEFLIGHT_TETHER_ENABLED=0 ./sitl/run_sitl.sh ~/drone/plans/canopy.plan ~/drone/PX4-Autopilot forest_dense
 ```
 
-Confirm `world: planner_forest` and that Gazebo actually finished loading — 4000
-static models is a 2.8 MB SDF, so **watch the startup time and the real-time
-factor**. If RTF collapses, that is the tractability limit; re-generate with a
-lower `--stems-per-ha` and report the density you actually flew.
+Confirm `world: forest_dense`, and **watch Gazebo's startup time and real-time
+factor** — 4000 static models is a 2.8 MB SDF and its RTF is unmeasured. If RTF
+collapses, that is the tractability limit: regenerate at a lower density and
+report what you flew.
 
 ```bash
-cd ~/droneflight && . ~/venv/bin/activate && droneflight fly --plan ~/drone/plans/canopy.plan --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/forest-control.log
+cd ~/droneflight && . ~/venv/bin/activate && droneflight fly --plan ~/drone/plans/canopy.plan --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/b2-mission-dense.log
 ```
 
-#### 4 — score it against B1
+#### 4 — arms 2 and 3: the corridor executor, sparse then dense
+
+Restart SITL between arms (a stale `gz` server silently reuses the previous
+world — the lesson from the tether A/B).
+
+**Sparse (50 stems/ha) — expected to fly:**
+
+```bash
+cd ~/droneflight && . ~/venv/bin/activate && DRONEFLIGHT_TETHER_ENABLED=0 ./sitl/run_sitl.sh ~/drone/plans/canopy.plan ~/drone/PX4-Autopilot forest_sparse
+```
+
+```bash
+cd ~/droneflight && . ~/venv/bin/activate && droneflight fly-corridor --plan ~/drone/plans/canopy.plan --trunks ~/drone/plans/forest_sparse_trunks.csv --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/b2-corridor-sparse.log
+```
+
+**Dense (full density) — expected to hover and never arrive:**
+
+```bash
+cd ~/droneflight && . ~/venv/bin/activate && DRONEFLIGHT_TETHER_ENABLED=0 ./sitl/run_sitl.sh ~/drone/plans/canopy.plan ~/drone/PX4-Autopilot forest_dense
+```
+
+```bash
+cd ~/droneflight && . ~/venv/bin/activate && droneflight fly-corridor --plan ~/drone/plans/canopy.plan --trunks ~/drone/plans/forest_dense_trunks.csv --url udpin://0.0.0.0:14540 2>&1 | tee ~/logs/b2-corridor-dense.log
+```
+
+⚠️ **The manifest must match the world.** Passing `forest_sparse_trunks.csv`
+while flying `forest_dense` makes the aircraft avoid trees that are not there and
+fly through ones that are — and nothing in either tool will complain.
+
+`fly-corridor` prints `REACHED GOAL / DID NOT REACH GOAL`, the route index it got
+to, the closest obstacle, and the count of steps with no free heading — that last
+number is the one that distinguishes "hit a tree" from "gave up".
+
+#### 5 — score it against B1
 
 There is no contact sensor on the trunks, so a collision shows up as **dynamics**,
 not as a log message. Score in this order:
