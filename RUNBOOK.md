@@ -1395,22 +1395,59 @@ altitude. The watchdog and RTL both worked. **Scoring lesson: an unreachable
 waypoint fails 40 legs earlier than the CFIT it prevents, and it looks nothing
 like a crash in the console — the mission simply stops counting.**
 
-✅ **v2 FLOWN 2026-07-27 (`sim-logs/cfit/01_36_02.ulg`) — the clearance fix
-works.** Minimum AGL **11.97 m** over the mission phase (predicted floor 9.02 m),
-**0 of 49 500 samples under 5 m**, no terrain contact, on the exact leg that
-crashed the aircraft on 07-24 at 0.8 m AGL. Mechanism confirmed too: splitting
-shrinks the commanded altitude step, and PX4's descent gradient scales with it —
-**0.220** for the unsplit 40.5 m step, **0.040** for the split 18.3 m one.
+✅ **v2 FLOWN SIX TIMES 2026-07-27 — the clearance fix works, reproducibly.**
+Minimum AGL across every flown run, including the two that stalled:
 
-🟠 **One blocker remains and it needs a PARAM, not another plan change.** The run
-stalled at **51/78** targeting the inserted vertex, missing PX4's vertical
-acceptance by **7 cm** (best |error| inside `NAV_ACC_RAD` = **0.87 m** vs
-`NAV_MC_ALT_RAD` = 0.8 m). No placement fixes it: PX4 spreads a leg's descent
-across the whole leg, so the vehicle is descending at every interior point.
-**Load `configs/px4/terrain_following.params` (`NAV_MC_ALT_RAD = 2.0`) before the
-next run** — it is an acceptance tolerance, not a clearance change; the aircraft
-flies no lower, and every original waypoint tracked to ≤0.37 m so they are
-unaffected.
+| run | min AGL | samples <5 m |
+|---|---|---|
+| 07-24 baseline (unsplit leg) | **0.8 m** → flew into the ground |
+| `01_36_02` | **11.97 m** | 0 |
+| `02_05_36` | **11.94 m** | 0 |
+| `02_34_36` | **11.96 m** | 0 |
+| `02_52_58` | **11.91 m** | 0 |
+| `03_11_41` | **11.96 m** | 0 |
+| `03_28_04` | **11.91 m** | 0 |
+
+A **5 cm spread over six flights** against a predicted 9.02 m floor, and 0 of
+~250 000 samples under 5 m. **Terrain clearance is closed.** Mechanism confirmed
+too: splitting
+shrinks the commanded altitude *step*, and PX4's descent gradient scales with the
+step — **0.220** for the unsplit 40.5 m step, **0.040** for the split 18.3 m one.
+
+🟠 **The stall is the vertical acceptance window — `NAV_MC_ALT_RAD` — and it is a
+RATE, not a switch.** Seven flights, and the outcome orders perfectly by the
+vertical error at the inserted vertex (every completion ≤0.841 m, every stall
+more):
+
+| ulog | `ALT_RAD` | \|alt err\| at the vertex | outcome |
+|---|---|---|---|
+| `00_49_06` | 0.8 | 1.580 m (wp11, v1's spurious insert) | stall 11/79 |
+| `01_36_02` | 0.8 | 0.873 m (wp51) | stall 51/78 |
+| `03_28_04` | 2.0 | 0.669 m | COMPLETE |
+| `02_34_36` | 2.0 | 0.716 m | COMPLETE |
+| `03_11_41` | 2.0 | 0.721 m | COMPLETE |
+| `02_05_36` | 2.0 | 0.841 m | COMPLETE |
+| `02_52_58` | 2.0 | **1.190 m** | **stall 51/78** |
+
+**Stall rate 2/2 at 0.8 → 1/5 at 2.0.** The error varies run to run and
+occasionally exceeds the window, so 2.0 is not sufficient.
+`configs/px4/terrain_following.params` is now **4.0** — 3.4× headroom over the
+worst error seen, still 3× under the route's 11.9 m of measured clearance. Load
+it at step 4. (`02_25_28.ulg` never armed — a 253 s boot artifact with no fly
+log; do not score it.)
+
+⚠️ **Two audit traps this cost a full wrong conclusion to learn.**
+* **A param set at the `pxh>` prompt after boot lands in the ULog's
+  `changed_parameters`, NOT `initial_parameters`.** Diffing only the boot snapshot
+  made two differently-configured flights look identical and produced a confident
+  "it's nondeterministic, the param is irrelevant" — which was wrong. Check both.
+* **Score altitude error against `vehicle_local_position_groundtruth`, not
+  `vehicle_local_position`.** The latter's `z` is relative to the EKF local
+  origin, not the mission's home datum, and `ref_alt` is NaN in these logs;
+  comparing it to a plan altitude gives ~0 error and "explains" nothing. Truth is
+  a proxy for what PX4 tests, but it predicts all three outcomes correctly.
+
+⚠️ Still **n=1 at 2.0** — repeat runs turn this correlation into a rate.
 
 **1 — regenerate the plan on the Mac** (droneplanner is clone-only on the VM, and
 the `.plan` does not ride git):
@@ -1444,15 +1481,22 @@ The world does **not** need regenerating for this flight — it depends only on 
 DTM and home, and neither changed (verified 2026-07-27: a re-planned route leaves
 the world byte-identical).
 
-**4 — load the acceptance param** (once; it persists across reboots after
-`param save`). Without it the mission stalls at the inserted vertex:
+**4 — load the acceptance param.** Without it the mission stalls at the inserted
+vertex (twice measured):
 
 ```bash
 droneflight px4-params --file ~/droneflight/configs/px4/terrain_following.params
 ```
 
-Paste the printed `param set` lines into `pxh>`, then `reboot`. Confirm with
-`param show NAV_MC_ALT_RAD` — it must read **2.0**, not 0.8.
+Paste the printed lines into `pxh>`. Setting it at the prompt is fine — that is
+how the successful run did it — but then **verify it took**, because a value set
+this way does not appear in the ULog's `initial_parameters`:
+
+```bash
+param show NAV_MC_ALT_RAD
+```
+
+It must read **4.0**. `param save` makes it survive a reboot.
 
 **5 — fly it**, same as §3:
 
@@ -1466,14 +1510,15 @@ droneflight fly --plan ~/drone/plans/terrain_fixed.plan --url udpin://0.0.0.0:14
 
 **How to score it — three distinct failure modes, don't confuse them.**
 
-1. **Sequencer freeze** — hit twice now (11/79, then 51/78). Symptom: `mission
-   progress` stops advancing **while the vehicle keeps flying**; it does not look
-   like a failure in the console. Check `mission_result.seq_current` — pinned at
-   one value means PX4 refused a waypoint. Then take the vertical error at that
-   waypoint over the samples inside `NAV_ACC_RAD`; if the *best* one exceeds
-   `NAV_MC_ALT_RAD`, that is the cause. Step 4's param is the fix. If it stalls
-   again *with* `NAV_MC_ALT_RAD = 2.0` loaded, report the measured error before
-   widening further — 2.0 already has 2.3× margin over the observed 0.87 m.
+1. **Sequencer freeze** — hit twice at `NAV_MC_ALT_RAD = 0.8`, fixed by 2.0.
+   Symptom: `mission progress` stops advancing **while the vehicle keeps flying**;
+   it does not look like a failure in the console — the local setpoint slides past
+   the waypoint and the vehicle descends on it until the watchdog fires. Check
+   `mission_result.seq_current`: pinned at one value means PX4 stopped sequencing.
+   Then take the best |altitude error| over samples inside `NAV_ACC_RAD`, using
+   `vehicle_local_position_groundtruth`, and compare it to the *effective*
+   `NAV_MC_ALT_RAD` — read from `changed_parameters` as well as
+   `initial_parameters`. Both audit traps are spelled out above.
 2. **CFIT** — what the fix is for, and now **verified clear** (11.97 m min AGL).
    Score **minimum AGL** from `vehicle_local_position_groundtruth.z` against the
    DEM. Below the predicted **9.0 m** floor means the descent model has become

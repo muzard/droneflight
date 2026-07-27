@@ -41,11 +41,42 @@
 # default window, so widening it changes their behaviour not at all. It only
 # affects waypoints the vehicle genuinely cannot hit tightly.
 #
-# 2.0 m is chosen for margin over the measured 0.87 m worst case while staying
-# far under the route's 11.97 m of terrain clearance. It is an ACCEPTANCE
-# tolerance, not a clearance change: the aircraft does not fly any lower.
+# MEASURED OVER 7 FLIGHTS (2026-07-27, `sim-logs/cfit/` + `cfit/cfit-rep/`).
+# The vertical error at the inserted vertex varies run to run, and the outcome
+# orders perfectly by it — every completion had <=0.841 m, every stall more:
+#
+#   ulog          ALT_RAD  |alt err| at the stalling vertex  outcome
+#   00_49_06        0.8    1.580 m  (wp11, v1's spurious insert)  STALL 11/79
+#   01_36_02        0.8    0.873 m  (wp51)                        STALL 51/78
+#   03_28_04        2.0    0.669 m                                COMPLETE
+#   02_34_36        2.0    0.716 m                                COMPLETE
+#   03_11_41        2.0    0.721 m                                COMPLETE
+#   02_05_36        2.0    0.841 m                                COMPLETE
+#   02_52_58        2.0    1.190 m                                STALL 51/78
+#
+# Stall rate: 2/2 at 0.8 -> 1/5 at 2.0. So 2.0 helps a lot but is NOT sufficient;
+# 4.0 gives 3.4x headroom over the worst error yet observed (1.19 m) while still
+# sitting 3x under the route's measured 11.9 m of terrain clearance.
+#
+# ⚠️ This is empirical tuning against a quantity we cannot measure cleanly. PX4
+# tests its *own estimate*, and the error figures above are groundtruth — a proxy.
+# It predicts all seven outcomes correctly, which is why it is trusted here, but a
+# `vehicle_local_position`-based calculation does NOT work (its z is relative to
+# the EKF local origin, not the mission home datum, and `ref_alt` is NaN in these
+# logs). That mistake produced a confidently wrong "the param is irrelevant"
+# conclusion on 2026-07-27.
+#
+# ⚠️ A value set at the `pxh>` prompt lands in the ULog's `changed_parameters`,
+# NOT `initial_parameters`. Check both when auditing a run, or two
+# differently-configured flights will look identical — which is what happened.
+#
+# ALTERNATIVE, if the stall persists: drop the inserted vertex entirely and raise
+# the failing leg's END altitude by 14 m instead (measured: that clears the same
+# leg to 5.4 m without any new waypoint). It removes the sequencing risk outright
+# but costs concealment — 30 m -> 44 m AGL over that stretch — so it is a
+# survivability trade, not a free fix. See droneplanner SHORTFALLS item 0.
 #
 # ⚠️ Like NAV_DLL_ACT and the RTL altitude, this is a deliberate design choice
 # and belongs in the aircraft's failsafe/nav policy, not left at a default that
 # was tuned for precise survey flights over flat ground.
-1	1	NAV_MC_ALT_RAD	2.0	9
+1	1	NAV_MC_ALT_RAD	4.0	9
