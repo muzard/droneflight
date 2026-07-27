@@ -218,20 +218,36 @@ cd ~/droneplanner && git pull      # picks up regenerated worlds/DEMs
 | Artifact | Via git? |
 |---|---|
 | `droneflight` source, `sitl/run_sitl.sh` | ✅ |
-| `demo_ao/dtm.tif`, `demo_ao/worlds/*.sdf` | ✅ (tracked in droneplanner) |
+| `demo_ao/dtm.tif`, `worlds/planner_terrain.sdf` + `worlds/planner_terrain_dem.tif` | ✅ (tracked in droneplanner) |
 | **`.plan`** | ❌ gitignored build artifact — `scp` it |
 
-🔴 **DO NOT copy the tracked `demo_ao/worlds/planner_terrain.sdf` — it is the
-PRE-FIX world and it will bury the vehicle.** Its DEM `<uri>` still points at the
-**raw** `demo_ao/dtm.tif`; Gazebo reads a DEM's raw elevations, so the terrain
-surface under home lands at `z = min_elev` (+40 m) while PX4 spawns at `z = 0`.
-That is the buried-spawn bug that read as a stable hover and then flung the
-vehicle on its first translation — it cost two sessions to find. The world that
-actually flew (2026-07-24) was regenerated on the VM against the **zero-based
-DEM** `gz-world` now emits, and that regenerated copy is what lives in
-`$PX4_DIR/Tools/simulation/gz/worlds/` there. The tracked file is stale.
+✅ **The stale `demo_ao/worlds/` worlds were DELETED (2026-07-27). Exactly one
+world is tracked now: `worlds/planner_terrain.sdf` + its zero-based
+`worlds/planner_terrain_dem.tif`**, verified byte-identical to a fresh `gz-world`
+regeneration on 2026-07-27. A `git pull` on the VM therefore delivers a world
+that is safe to fly.
 
-**Check before flying** — a healthy world names a `*_dem.tif`, not `dtm.tif`:
+What was deleted, and why it was dangerous: all three `demo_ao/worlds/*.sdf`
+pointed their DEM `<uri>` at a **raw** DTM. Gazebo reads a DEM's raw elevations,
+so the terrain surface under home landed at `z = min_elev` while PX4 spawns at
+`z = 0` — the buried-spawn bug that read as a stable hover and then flung the
+vehicle on its first translation. It cost two sessions to find.
+
+| deleted file | DEM `<uri>` → | DEM min | vehicle |
+|---|---|---|---|
+| `demo_ao/worlds/planner_terrain.sdf` | raw `demo_ao/dtm.tif` | 40.0 m | buried 40 m |
+| `demo_ao/worlds/planner_flat.sdf` | raw `demo_ao/worlds/dtm_flat.tif` | 124.68 m | buried **125 m** |
+| `demo_ao/worlds/planner_nocol.sdf` | raw `demo_ao/dtm.tif` | 40.0 m | terrain 40 m off |
+
+The terrain one was a byte-duplicate of `worlds/planner_terrain.sdf` apart from
+that URI — two tracked copies of one world at two paths is *how* the stale one
+survived — and the other two are diagnostics for a bug that is now root-caused,
+fixed, and confirmed in flight (Slice 2, 2026-07-24). Both regenerate on demand
+from `--flat` / `--no-collision` (§2b).
+
+**Still check before flying** — the VM's `$PX4_DIR/.../worlds/` copy is *not*
+managed by git and can be stale from an older pull. A healthy world names a
+`*_dem.tif`, never `dtm.tif`:
 
 ```bash
 grep -o '<uri>file://[^<]*</uri>' ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_terrain.sdf | head -1
@@ -314,15 +330,14 @@ by injecting `PX4_HOME_*` from `droneflight sitl-env`:
 # PX4 exposes MAVLink on udp://:14540 (what droneflight --url targets).
 ```
 
-## 2b. Fly over the planned terrain (not PX4's flat world) — ⏸️ PARKED
+## 2b. Fly over the planned terrain (not PX4's flat world) — ✅ FLIES
 
-> **Parked 2026-07-21.** The terrain world loads and flies but the vehicle tumbles
-> on translation (see the open-bug section below). It is **not on the MVP critical
-> path**: the altitude-frame bug it was built to catch is already fixed and
-> regression-tested, and the external-vision bridge injects error rather than
-> sensing terrain, so it runs fine on the flat `default.sdf`. Resume here only
-> when terrain-following, tether physics, or low-altitude margins need in-the-loop
-> proof.
+> **Unparked 2026-07-24 — the terrain world flies.** It was parked 2026-07-21
+> because the vehicle tumbled on translation; that turned out to be the
+> buried-spawn bug, now root-caused and fixed (zero-based DEM) and confirmed in
+> flight over real relief — 51/77 waypoints, altitude tracking terrain +29 →
+> −42 m (Slice 2). The open-bug section below is retained as the diagnostic
+> record, not as a live defect.
 
 PX4's default Gazebo world is **flat**, so a terrain-aware `.plan` flown in it
 proves nothing about nap-of-the-earth flight — and actively hides altitude-frame
@@ -336,11 +351,14 @@ droneplanner demo-ao --out demo_ao/
 droneplanner plan     --mission demo_ao/mission.yaml --out out_demo/
 droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan \
                       --base-world <PX4>/Tools/simulation/gz/worlds/default.sdf \
-                      --dem-path /home/<user>/droneplanner/demo_ao/dtm.tif \
-                      --out demo_ao/worlds/planner_terrain.sdf
+                      --dem-path /home/<user>/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_terrain_dem.tif \
+                      --out worlds/planner_terrain.sdf
 
-# copy the .sdf AND the .tif it references to the VM (§1.6), then:
-cp planner_terrain.sdf ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
+# ⚠️ --dem-path must name the ZERO-BASED <out>_dem.tif at the path it will have
+#    ON THE VM. Pointing it at the raw dtm.tif is the buried-spawn bug (§1.6).
+# copy BOTH files to the VM (§1.6 — git carries them), then:
+cp worlds/planner_terrain.sdf worlds/planner_terrain_dem.tif \
+   ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
 ./sitl/run_sitl.sh ~/plans/mission.plan ~/drone/PX4-Autopilot planner_terrain   # world = arg 3
 ```
 
@@ -440,12 +458,22 @@ heightmap present; the flat `default.sdf` flew fine.
 | Attitude/control tuning | ❌ 18 s climb at 0.2° attitude error |
 | Lockstep / heightfield CPU cost | ❌ `sensor_combined` dt median 4.00 ms, p99 4.00, 0 gaps >50 ms, cpuload 0.31 |
 
-**Next experiment (built, not yet run)** — bisect shape vs. heightmap:
+**Next experiment — SUPERSEDED (2026-07-23/24), do not run it.** This bisect
+(flat DEM vs real relief) was overtaken by the root cause: *both* arms spawned
+buried, so it would only have measured the same bug twice. The
+`demo_ao/worlds/planner_flat.sdf` and `planner_nocol.sdf` it used were **deleted
+2026-07-27** — they pointed at raw DEMs (§1.6). If either diagnostic is ever
+needed again, regenerate it rather than resurrecting a tracked copy:
 
 ```bash
-droneplanner gz-world ... --flat --out demo_ao/worlds/planner_flat.sdf
-# copy planner_flat.sdf AND dtm_flat.tif to the VM, then fly planner_flat
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan \
+    --base-world $PX4_DIR/Tools/simulation/gz/worlds/default.sdf \
+    --dem-path /home/<user>/.../gz/worlds/planner_flat_dem.tif \
+    --flat --out worlds/planner_flat.sdf          # or --no-collision
+# copy the .sdf AND its *_dem.tif to the VM
 ```
+
+The historical reasoning it rested on:
 
 * **stable over flat DEM** → it is terrain *slope/normals*. Note the ODE debug
   line reports `AABB max z = 150.32` (the DEM's max elevation) rather than the
@@ -1373,9 +1401,11 @@ Confirm before copying — `report.json` must show `clearance_violations: 0` and
 scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/out_demo/mission.plan <vm>:~/drone/plans/terrain_fixed.plan
 ```
 
-**3 — check the world is the FIXED one before you fly it** (§2b: the world tracked
-in git is the pre-fix, buried-spawn version — the VM's regenerated copy is the
-good one). A healthy world names a `*_dem.tif`, never `dtm.tif`:
+**3 — check the world is the FIXED one before you fly it** (§1.6: the stale
+pre-fix worlds were deleted 2026-07-27, so git now carries only the good
+`worlds/planner_terrain.sdf` — but the VM's `$PX4_DIR/.../worlds/` copy is not
+managed by git and can still be stale from an older pull). A healthy world names
+a `*_dem.tif`, never `dtm.tif`:
 
 ```bash
 grep -o '<uri>file://[^<]*</uri>' ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_terrain.sdf | head -1
