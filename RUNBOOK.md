@@ -1363,7 +1363,7 @@ speed policy and tether transient observable in the loop.
 
 A full catenary / lumped-segment cable model is a later refinement (v1).
 
-### 4.10 ▶ NEXT ON THE VM — B2a: fly the below-canopy route through **actual trees**
+### 4.10 🔵 B2 — fly the below-canopy route through **actual trees** (IN PROGRESS)
 
 TEST-PLAN item 5. Every SITL result so far — including B1's clean 282/282 — flew
 a world with **nothing in it**. The planner routes under the canopy and grants a
@@ -1384,26 +1384,48 @@ B1 flew it 282/282 with 6.26 m min AGL. Any difference here is the forest.
 | offboard corridor executor (`offboard.py`, `droneflight fly-corridor`) | ✅ built, unit-tested |
 | MAVSDK offboard driver (`mavsdk_offboard.py`) | ✅ built, **unexercised** (no autopilot on the Mac) |
 
-#### 🔴 Read this before flying: the answer may already be known
+#### 🔴 Two traps already cost a run each. Read before touching anything.
 
-Running the executor **kinematically** against the real 4000-trunk manifest, the
-reactive layer **cannot fly the forest** — it hovers, `avoid()` finding no free
-bearing, 84 % of control steps blocked. Sweeping density locates the boundary:
+**1. A stale Gazebo server serves the PREVIOUS world.** PX4 *attaches* to a
+running `gz` server and silently ignores `PX4_GZ_WORLD`, so an arm launched as
+`forest_sparse` flew `forest_dense` and the only clue was one console line.
+`run_sitl.sh` now hard-fails with the surviving PIDs rather than launching, but
+**verify anyway** — one command, saves a 17-minute void run:
 
-| stems/ha | median spacing | reaches goal | steps blocked |
-|---|---|---|---|
-| 25 | 10.0 m | ✅ | 0 % |
-| 50 | 7.0 m | ✅ | 0 % |
-| **100** | **5.0 m** | ❌ | **79 %** |
-| 172 | 3.8 m | ❌ | 84 % |
+```bash
+gz topic -l | grep -m1 world
+```
 
-Real mature managed forest is **400–1000 stems/ha**. So this is a **policy** limit
-(90° FOV, 6 m reaction = 1.0 s at cruise, and `atan2(0.95, r)` of angular padding
-per blocked ray, which saturates the FOV at close spacing) rather than a
-geometric one — a 5 m gap is far wider than the 1.9 m the airframe needs.
+**2. Trunk SDF shape decides whether collisions exist at all.** One `<model>` per
+trunk collides correctly but Gazebo hangs building the scene above ~4000 of them.
+Consolidating to one static model with N posed collisions loaded fast and
+**silently stopped colliding** — the vehicle flew *through* trunks (269 of 270
+horizontal overlaps had it inside the trunk's vertical span) and completed the
+route. **One model per trunk is the default and must stay that way**; keep the
+count loadable with `--max-stems` instead. Known: 1166 loads, 2500 loads, 4000
+hangs.
 
-The kinematic harness has instant velocity response and no turn-rate limit, so
-**real dynamics can only be worse**. Fly the bracket, not one point.
+#### The control arm is already flown, and it is the baseline
+
+Mission mode **cannot fly the forest**, reproducibly:
+
+| world | mission mode |
+|---|---|
+| empty (B1) | **282/282** |
+| dense, 4000 trunks | aborted **64**/282 |
+| dense, 2500 trunks | aborted **60**/282 |
+
+Same plan, same terrain, same params — only trees differ. This doubles as the
+**collision sanity check**: if a rebuilt world flies 282/282 in mission mode, its
+collisions are dead and no corridor result from it means anything.
+
+#### What the corridor arms are testing
+
+Kinematically, against the real manifest, the reactive layer flies ≤50 stems/ha
+(7 m spacing) and fails at ≥100 (5 m), hovering with no free bearing. Real mature
+managed forest is 400–1000 stems/ha. That harness has instant velocity response
+and no turn-rate limit, so **real dynamics can only be worse** — hence a bracket,
+not a single point.
 
 #### 1 — build TWO forested worlds (Mac)
 
@@ -1429,7 +1451,7 @@ droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-
 Dense arm — the density it should *fail* at:
 
 ```bash
-droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 400 --max-stems 4000 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_dense_dem.tif --out worlds/forest_dense.sdf
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 400 --max-stems 2500 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_dense_dem.tif --out worlds/forest_dense.sdf
 ```
 
 Record the reported `stems/ha` and `median nearest-neighbour` for each — those,
@@ -1481,7 +1503,15 @@ ssh arttudrone@192.168.132.129 'cd ~/droneflight && git pull && cd ~/droneplanne
 The `.plan` is unchanged from B1 (`~/drone/plans/canopy.plan`); re-`scp` it only
 if you re-planned.
 
-#### 3 — arm 1: mission mode through the dense forest (the control)
+#### 3 — arm 1: mission mode through the dense forest (control + collision check)
+
+⚠️ **Every arm starts with this preamble.** `pkill`, wait, confirm clean, then
+launch, then verify the world. Skipping it is what voided two runs.
+
+```bash
+pkill -x px4; pkill -9 -f "gz sim"; pkill -9 -f gz-sim; sleep 3; pgrep -af "gz|px4" | grep -v pgrep || echo CLEAN
+```
+
 
 No avoidance at all — it answers "does the planned route hit trees?". World as
 arg 3; omit it and PX4 loads its flat default and the run is void.

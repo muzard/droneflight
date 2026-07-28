@@ -16,7 +16,7 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `px4_profile.py` | **the measured PX4 corner prior** — bend → corner speed *and* lateral accel, calibrated from the acceptance §3 control arm. `tether.py` scores through it, because the "flat cruise" arm it used to assume is a profile no autopilot flies |
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter. 🔴 **Measured limit 2026-07-28: flies ≤50 stems/ha (7 m spacing), hovers at ≥100 (5 m).** Real forest is 400-1000/ha — see TEST-PLAN B2 |
-| `offboard.py` + `mavsdk_offboard.py` | **corridor executor** — carrot guidance along the route, avoidance in the loop, altitude commanded by us not interpolated by PX4 (what A2 says a corridor needs). `droneflight fly-corridor` |
+| `offboard.py` + `mavsdk_offboard.py` | **corridor executor** — carrot guidance (projection onto the polyline, so a detour cannot leave it chasing a passed vertex), avoidance in the loop, altitude commanded by us not interpolated by PX4 (what A2 says a corridor needs). Logs progress every 5 s and aborts after 90 s without route progress — a silent loop got killed by hand once, mistaken for a hang. `droneflight fly-corridor` |
 | `trunk_manifest.py` | loads the trunk CSV the Gazebo world was built from, so perception senses what physics will hit |
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
 | `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver), plus yaw drift and EV lock loss |
