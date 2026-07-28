@@ -66,12 +66,33 @@ export DRONEFLIGHT_TETHER_ENABLED DRONEFLIGHT_TETHER_CSV DRONEFLIGHT_TETHER_SPAN
 # the A/B becomes two copies of the first run. This is the other half of the
 # bad "OFF" arm: it inherited the ON server's enabled=1. Idempotent; harmless if
 # nothing is running.
-if pgrep -x "gz sim" >/dev/null 2>&1 || pgrep -f "gz-sim|ruby.*gz" >/dev/null 2>&1; then
-  echo "tether: killing stale gz server(s) so this arm's DRONEFLIGHT_TETHER_* actually take effect"
-  pkill -f "gz sim" 2>/dev/null || true
-  pkill -f "gz-sim" 2>/dev/null || true
+# It also silently ignores PX4_GZ_WORLD: a leftover server keeps serving the
+# PREVIOUS world, so an arm launched as `forest_sparse` flies `forest_dense` and
+# the only clue is a console line most people scroll past. So: kill, WAIT, and
+# HARD-FAIL if anything survives. Launching anyway produces data that looks fine
+# and is wrong, which is worse than not launching.
+_reap() {  # pattern, label, pgrep-flag
+  local pattern="$1" label="$2" flag="${3:--f}"
+  pgrep "$flag" "$pattern" >/dev/null 2>&1 || return 0
+  echo "sim: killing stale $label"
+  pkill "$flag" "$pattern" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    pgrep "$flag" "$pattern" >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  pkill -9 "$flag" "$pattern" 2>/dev/null || true
   sleep 1
-fi
+  pgrep "$flag" "$pattern" >/dev/null 2>&1 || return 0
+  echo "error: stale $label survived SIGKILL — refusing to launch, because PX4 would" >&2
+  echo "       attach to it and silently fly the PREVIOUS world. Investigate:" >&2
+  pgrep "$flag" -a "$pattern" >&2 || true
+  return 1
+}
+# -x for px4: matching its full command line would also match this script, whose
+# arguments contain the PX4-Autopilot path.
+_reap px4 "PX4 instance" -x || exit 1
+_reap "gz sim" "Gazebo server" || exit 1
+_reap "gz-sim" "Gazebo server" || exit 1
 
 TETHER_BUILD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tether_plugin/build"
 if [[ -d "$TETHER_BUILD" ]]; then
