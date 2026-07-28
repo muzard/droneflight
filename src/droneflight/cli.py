@@ -861,6 +861,7 @@ def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs 
         cruise_speed_ms=mission.cruise_speed_ms,
         control_hz=args.control_hz,
         sensor_range_m=args.sensor_range,
+        stall_timeout_s=args.stall_timeout,
     )
     obstacles = manifest.obstacle_field()
     if args.no_avoidance:
@@ -889,6 +890,7 @@ def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs 
         f"route point {result.route_index}/{result.route_points - 1}, "
         f"{result.steps} control steps, closest obstacle {result.min_clearance_m:.1f} m, "
         f"{result.blocked_steps} step(s) with no free heading"
+        + (f" — {result.aborted_reason}" if result.aborted_reason else "")
     )
     return 0 if result.reached_goal else 1
 
@@ -1128,6 +1130,13 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--control-hz", type=float, default=10.0)
     fc.add_argument("--sensor-range", type=float, default=30.0)
     fc.add_argument("--takeoff-alt", type=float, default=15.0)
+    fc.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=90.0,
+        help="Abort after this many seconds without route progress. The dense arm is "
+        "expected to hover when avoidance finds no free bearing.",
+    )
     fc.add_argument(
         "--no-avoidance",
         action="store_true",

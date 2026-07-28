@@ -44,7 +44,9 @@ above the connector boundary.
 
 from __future__ import annotations
 
+import logging
 import math
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
@@ -52,6 +54,8 @@ from typing import Protocol, runtime_checkable
 from droneflight.avoidance import AvoidanceConfig, avoid
 from droneflight.model import FlightMission
 from droneflight.perception import ObstacleField, sense
+
+_log = logging.getLogger(__name__)
 
 _EARTH_R = 6_371_000.0
 
@@ -110,6 +114,16 @@ class OffboardConfig:
 
     max_climb_ms: float = 2.0
     control_hz: float = 10.0
+    progress_log_s: float = 5.0
+    """How often to report progress. A silent loop is indistinguishable from a
+    hang — the first B2 run was killed by hand after 11 minutes of flying
+    perfectly well, because nothing was printed."""
+
+    stall_timeout_s: float = 90.0
+    """Abort if the route index has not advanced in this long. The dense-forest
+    arm is *expected* to hover when avoidance finds no free bearing, and without
+    this it hovers until someone notices."""
+
     fov_deg: float = 90.0
     n_rays: int = 31
     sensor_range_m: float = 30.0
@@ -293,6 +307,9 @@ class OffboardResult:
     blocked_steps: int
     """Control steps where avoidance found no free heading and hovered."""
 
+    aborted_reason: str | None = None
+    """Set when the stall watchdog fired instead of the route finishing."""
+
 
 async def fly_corridor(
     connector: OffboardConnector,
@@ -312,7 +329,20 @@ async def fly_corridor(
     blocked_steps = 0
     min_clearance = math.inf
     reached = False
+    aborted: str | None = None
 
+    started = time.monotonic()
+    last_log = started
+    last_progress_at = started
+    best_index = -1
+
+    _log.info(
+        "corridor: %d route points, lookahead %.0f m, %d trunks, cruise %.1f m/s",
+        len(route),
+        config.lookahead_m,
+        len(obstacles.trunks),
+        config.cruise_speed_ms,
+    )
     await connector.start_offboard()
     async for east_m, north_m, up_m, yaw_deg in connector.telemetry():
         steps += 1
@@ -329,6 +359,33 @@ async def fly_corridor(
         blocked_steps += int(command.blocked)
         await connector.set_velocity_ned(command)
 
+        now = time.monotonic()
+        if guidance.index > best_index:
+            best_index, last_progress_at = guidance.index, now
+        if now - last_log >= config.progress_log_s:
+            last_log = now
+            _log.info(
+                "route %d/%d (%.0f%%)  pos %.0f,%.0f m  alt %.1f m  clearance %.1f m  "
+                "blocked %d/%d",
+                guidance.index,
+                len(route) - 1,
+                100.0 * guidance.index / max(1, len(route) - 1),
+                east_m,
+                north_m,
+                up_m,
+                command.clearance_ahead_m,
+                blocked_steps,
+                steps,
+            )
+        if now - last_progress_at > config.stall_timeout_s:
+            aborted = (
+                f"no route progress for {config.stall_timeout_s:.0f}s at point "
+                f"{guidance.index}/{len(route) - 1} "
+                f"({blocked_steps}/{steps} steps with no free heading)"
+            )
+            _log.error("corridor: %s", aborted)
+            break
+
         last = route[-1]
         if guidance.finished and (
             math.hypot(last.east_m - east_m, last.north_m - north_m) <= config.arrival_radius_m
@@ -341,6 +398,7 @@ async def fly_corridor(
     await connector.stop_offboard()
     return OffboardResult(
         reached_goal=reached,
+        aborted_reason=aborted,
         steps=steps,
         route_index=guidance.index,
         route_points=len(route),

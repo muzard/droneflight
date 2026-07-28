@@ -1407,9 +1407,14 @@ The kinematic harness has instant velocity response and no turn-rate limit, so
 
 #### 1 — build TWO forested worlds (Mac)
 
-⚠️ **`--base-world` must be PX4's own `default.sdf`, never an already-generated
-terrain world** — the terrain model is *appended*, so feeding it
-`planner_terrain.sdf` injects the heightmap twice.
+⚠️ **Two path traps here, both easy to hit:**
+* **`--base-world` must be PX4's own `default.sdf`, never an already-generated
+  terrain world** — the terrain model is *appended*, so feeding it
+  `planner_terrain.sdf` injects the heightmap twice.
+* **You are on the Mac, which has no PX4 checkout.** `~/drone/PX4-Autopilot/...`
+  is the *VM's* path. A copy of PX4's default world is kept at
+  **`../sim-logs/default.sdf`** — use that. (`--dem-path` is different: it names
+  where the DEM will live *on the VM*, so it stays a VM path.)
 
 ```bash
 cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && . ../.venv/bin/activate && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
@@ -1418,13 +1423,13 @@ cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && . ../.venv/bin/a
 Sparse arm — the density the layer *should* handle:
 
 ```bash
-droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 50 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_sparse_dem.tif --out worlds/forest_sparse.sdf
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 50 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_sparse_dem.tif --out worlds/forest_sparse.sdf
 ```
 
 Dense arm — the density it should *fail* at:
 
 ```bash
-droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 400 --max-stems 4000 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_dense_dem.tif --out worlds/forest_dense.sdf
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 400 --max-stems 4000 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_dense_dem.tif --out worlds/forest_dense.sdf
 ```
 
 Record the reported `stems/ha` and `median nearest-neighbour` for each — those,
@@ -1432,16 +1437,21 @@ not the flag, are what was flown.
 
 #### 1 — build the forested world (Mac)
 
-⚠️ **`--base-world` must be PX4's own `default.sdf`, never an already-generated
-terrain world** — the terrain model is *appended*, so feeding it
-`planner_terrain.sdf` injects the heightmap twice.
+⚠️ **Two path traps here, both easy to hit:**
+* **`--base-world` must be PX4's own `default.sdf`, never an already-generated
+  terrain world** — the terrain model is *appended*, so feeding it
+  `planner_terrain.sdf` injects the heightmap twice.
+* **You are on the Mac, which has no PX4 checkout.** `~/drone/PX4-Autopilot/...`
+  is the *VM's* path. A copy of PX4's default world is kept at
+  **`../sim-logs/default.sdf`** — use that. (`--dem-path` is different: it names
+  where the DEM will live *on the VM*, so it stays a VM path.)
 
 ```bash
 cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && . ../.venv/bin/activate && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
 ```
 
 ```bash
-droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/default.sdf --forest-dsm demo_ao/dsm.tif --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_forest_dem.tif --out worlds/planner_forest.sdf
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_forest_dem.tif --out worlds/planner_forest.sdf
 ```
 
 Read the reported line before going further — it is the experiment's dose:
