@@ -17,8 +17,9 @@ limitations; this is a safety layer, not a replacement for the global planner.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
+from droneflight.maneuver import ManeuverLimits, required_react_distance_m
 from droneflight.perception import DepthScan
 
 
@@ -28,14 +29,54 @@ class AvoidanceConfig:
 
     drone_radius_m: float = 0.45  # half-width incl. props
     safety_margin_m: float = 0.5
-    react_distance_m: float = 6.0  # steer around obstacles within this range (lookahead)
+    react_distance_override_m: float | None = None
+    """Steer around obstacles within this range. **Leave None** — it is then
+    derived from the flown speed and PX4's own accel/jerk limits
+    (`maneuver.required_react_distance_m`).
+
+    🔴 It used to be a constant 6.0 m, and TEST-PLAN B2 flew that into 19-37 tree
+    strikes: at 6.0 m/s it buys 1.0 s, and the airframe needs 1.20 s just to graze
+    past a trunk. Set this only to *reproduce* a historical run (the kinematic
+    `simfly` sweeps were all measured at 6.0) — every such run is labelled.
+    """
+
+    obstacle_radius_m: float = 0.15
+    """Radius of the thing being dodged, for the lateral-clearance budget. 0.15 m
+    is the B2 trunk manifest's."""
+
     slowdown_distance_m: float = 5.0  # begin slowing when clearance drops below this
     cruise_speed_ms: float = 5.0
     min_speed_ms: float = 0.5
+    limits: ManeuverLimits = field(default_factory=ManeuverLimits)
 
     @property
     def safety_distance_m(self) -> float:
         return self.drone_radius_m + self.safety_margin_m
+
+    @property
+    def lateral_clearance_m(self) -> float:
+        """Sideways offset needed to pass an obstacle: airframe + margin + its radius."""
+        return self.drone_radius_m + self.safety_margin_m + self.obstacle_radius_m
+
+    @property
+    def react_distance_m(self) -> float:
+        """Reaction distance actually used — derived unless explicitly overridden."""
+        if self.react_distance_override_m is not None:
+            return self.react_distance_override_m
+        return required_react_distance_m(
+            self.cruise_speed_ms, self.lateral_clearance_m, self.limits
+        )
+
+    @property
+    def is_survivable(self) -> bool:
+        """Whether the reaction distance in force can actually produce a miss.
+
+        False means the configuration is geometrically unable to avoid a head-on
+        obstacle, however good the steering is. That was true of every B2 flight.
+        """
+        return self.react_distance_m >= required_react_distance_m(
+            self.cruise_speed_ms, self.lateral_clearance_m, replace(self.limits, safety_factor=1.0)
+        )
 
 
 @dataclass(frozen=True)

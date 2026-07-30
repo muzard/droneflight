@@ -52,6 +52,11 @@ from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
 from droneflight.avoidance import AvoidanceConfig, avoid
+from droneflight.maneuver import (
+    max_speed_for_react_distance_ms,
+    required_rays,
+    required_react_distance_m,
+)
 from droneflight.model import FlightMission
 from droneflight.perception import ObstacleField, sense
 
@@ -125,7 +130,18 @@ class OffboardConfig:
     this it hovers until someone notices."""
 
     fov_deg: float = 90.0
-    n_rays: int = 31
+    n_rays: int = 91
+    """Rays across the FOV. 91 over 90 deg = 1.00 deg, which resolves a 0.15 m
+    trunk to ~17 m and so can actually feed the derived reaction distance.
+
+    🔴 Was **31** (3.00 deg) for every B2 flight, which resolves a trunk only to
+    ~6 m — detection falls to **60.9 %** by 15 m, measured against the B2 manifest
+    along the flown track. That is why the 6.0 m reaction distance looked
+    self-consistent: past it, trunks fell *between* rays. This is a limit of the
+    ray model, not of optics (1280 px over 90 deg is 0.070 deg/px), so raising it
+    costs CPU and nothing else. See `maneuver.required_rays`.
+    """
+
     sensor_range_m: float = 30.0
     avoidance: AvoidanceConfig = field(default_factory=AvoidanceConfig)
 
@@ -138,13 +154,46 @@ class OffboardConfig:
         aircraft flies slower than the plan says and every time-based number is
         wrong. One speed, set here.
 
-        ⚠️ ``react_distance_m`` is **not** rescaled, and it should be examined: at
-        the 6.0 m default and 6 m/s cruise the avoidance layer gets 1.0 s of
-        warning. That is the existing tuned value from ``simfly`` and changing it
-        would invalidate those results, but B2b should measure whether it is
-        enough with real dynamics.
+        That matters more than it used to: ``react_distance_m`` is now **derived
+        from this speed** (`maneuver.required_react_distance_m`), so the cruise
+        speed forced in here sets how far ahead the aircraft reacts. Fly faster,
+        react earlier — which is exactly what B2 showed a constant cannot do.
         """
         return replace(self.avoidance, cruise_speed_ms=self.cruise_speed_ms)
+
+    def sensing_shortfall(self) -> str | None:
+        """Why this configuration cannot avoid an obstacle, or None if it can.
+
+        Checked before takeoff. B2 flew a configuration that was *geometrically*
+        unable to miss a head-on trunk and reported ``REACHED GOAL`` through 37
+        strikes; refusing to launch it is cheaper than scoring the ULog afterwards.
+        """
+        cfg = self.avoidance_config
+        if not cfg.is_survivable:
+            need = required_react_distance_m(
+                self.cruise_speed_ms,
+                cfg.lateral_clearance_m,
+                replace(cfg.limits, safety_factor=1.0),
+            )
+            survivable_ms = max_speed_for_react_distance_ms(
+                cfg.react_distance_m, cfg.lateral_clearance_m, cfg.limits
+            )
+            return (
+                f"react distance {cfg.react_distance_m:.1f} m is below the {need:.1f} m "
+                f"needed to dodge a {cfg.obstacle_radius_m:.2f} m obstacle at "
+                f"{self.cruise_speed_ms:.1f} m/s — the airframe cannot miss it. "
+                f"Slow to {survivable_ms:.1f} m/s or raise the reaction distance."
+            )
+        need_rays = required_rays(
+            math.radians(self.fov_deg), cfg.react_distance_m, cfg.obstacle_radius_m
+        )
+        if self.n_rays < need_rays:
+            return (
+                f"{self.n_rays} rays over {self.fov_deg:.0f} deg cannot resolve a "
+                f"{cfg.obstacle_radius_m:.2f} m obstacle at the {cfg.react_distance_m:.1f} m "
+                f"reaction distance — {need_rays} needed, so obstacles fall between rays."
+            )
+        return None
 
 
 @dataclass(frozen=True)
@@ -302,13 +351,29 @@ class OffboardResult:
     route_index: int
     route_points: int
     min_clearance_m: float
-    """Closest any trunk came, over the whole flight. The safety margin, measured."""
+    """Closest any trunk came, over the whole flight. The safety margin, measured.
+
+    ⚠️ This is *forward perception*, not contact: it is what the sensor reported
+    ahead, so it says nothing about a trunk struck off-axis. Use `strikes`."""
 
     blocked_steps: int
     """Control steps where avoidance found no free heading and hovered."""
 
+    strikes: int = 0
+    """Control steps where the airframe was inside an obstacle's surface.
+
+    🔴 B2 (2026-07-28) reported ``REACHED GOAL`` on two flights that hit 19 and 37
+    trees, because nothing in this result could express "arrived, wrecked". The
+    executor's own log printed ``closest obstacle 0.0 m`` beside the success line.
+    Reaching the goal is not the success criterion — reaching it *intact* is."""
+
     aborted_reason: str | None = None
     """Set when the stall watchdog fired instead of the route finishing."""
+
+    @property
+    def succeeded(self) -> bool:
+        """Arrived **and** never hit anything. The criterion B2 was missing."""
+        return self.reached_goal and self.strikes == 0
 
 
 async def fly_corridor(
@@ -327,6 +392,7 @@ async def fly_corridor(
 
     steps = 0
     blocked_steps = 0
+    strikes = 0
     min_clearance = math.inf
     reached = False
     aborted: str | None = None
@@ -343,6 +409,16 @@ async def fly_corridor(
         len(obstacles.trunks),
         config.cruise_speed_ms,
     )
+    _log.info(
+        "corridor: react %.1f m (%d rays / %.2f deg), needs %.2f m lateral clearance",
+        config.avoidance_config.react_distance_m,
+        config.n_rays,
+        config.fov_deg / max(1, config.n_rays - 1),
+        config.avoidance_config.lateral_clearance_m,
+    )
+    shortfall = config.sensing_shortfall()
+    if shortfall is not None:
+        _log.error("corridor: CANNOT AVOID — %s", shortfall)
     await connector.start_offboard()
     async for east_m, north_m, up_m, yaw_deg in connector.telemetry():
         steps += 1
@@ -357,6 +433,20 @@ async def fly_corridor(
         )
         min_clearance = min(min_clearance, command.clearance_ahead_m)
         blocked_steps += int(command.blocked)
+        # Contact is measured against the obstacle field directly, not against the
+        # forward scan: a trunk clipped off-axis never enters the FOV, and B2's
+        # strikes were invisible to `clearance_ahead_m` for exactly that reason.
+        if obstacles.clearance(east_m, north_m) < config.avoidance_config.drone_radius_m:
+            strikes += 1
+            if strikes == 1:
+                _log.error(
+                    "corridor: STRIKE at %.0f,%.0f m (route %d/%d) — the airframe is "
+                    "inside an obstacle; this run is not a success however it ends",
+                    east_m,
+                    north_m,
+                    guidance.index,
+                    len(route) - 1,
+                )
         await connector.set_velocity_ned(command)
 
         now = time.monotonic()
@@ -404,4 +494,5 @@ async def fly_corridor(
         route_points=len(route),
         min_clearance_m=min_clearance,
         blocked_steps=blocked_steps,
+        strikes=strikes,
     )

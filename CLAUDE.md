@@ -15,8 +15,9 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `tether.py` | **v0 payout-tension model** — back-tension + airborne-span drag + turn/reversal load; validates the speed policy against a break budget (`tether-check`); also **parses + scores the Gazebo plugin's log** (`tether-plugin-check`) |
 | `px4_profile.py` | **the measured PX4 corner prior** — bend → corner speed *and* lateral accel, calibrated from the acceptance §3 control arm. `tether.py` scores through it, because the "flat cruise" arm it used to assume is a profile no autopilot flies |
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
-| `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter. 🔴 **Measured limit 2026-07-28: flies ≤50 stems/ha (7 m spacing), hovers at ≥100 (5 m).** Real forest is 400-1000/ha — see TEST-PLAN B2 |
+| `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter. 🔴 **FLOWN 2026-07-28 and it COLLIDES — 19 strikes at 50 stems/ha, 37 at 107.** `react_distance_m=6.0` gives 0.66 m of lateral offset against 1.10 m needed (0.60×) — geometrically cannot miss. The earlier "hovers at ≥100 stems/ha" limit was a *kinematic-harness artifact* and is wrong: in flight it blocks 0.17 % of steps and hits trees instead. See TEST-PLAN B2 |
 | `offboard.py` + `mavsdk_offboard.py` | **corridor executor** — carrot guidance (projection onto the polyline, so a detour cannot leave it chasing a passed vertex), avoidance in the loop, altitude commanded by us not interpolated by PX4 (what A2 says a corridor needs). Logs progress every 5 s and aborts after 90 s without route progress — a silent loop got killed by hand once, mistaken for a hang. `droneflight fly-corridor` |
+| `maneuver.py` | **the reaction-distance budget** — how far ahead an obstacle must be seen for the airframe to actually miss it, from the flown speed and PX4's `MPC_ACC_HOR`/`MPC_JERK_AUTO` (jerk-limited, so *not* ½at²). `react_distance_m` is now **derived from this, not a constant**; also `required_rays`, the angular-sampling companion. Built after B2 flew the constant into 19–37 tree strikes |
 | `trunk_manifest.py` | loads the trunk CSV the Gazebo world was built from, so perception senses what physics will hit |
 | `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
 | `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver), plus yaw drift and EV lock loss |
@@ -70,10 +71,49 @@ ruff check . && ruff format --check . && mypy --strict src && pytest -q # 271 te
   and it weakens as drift grows. `nav.py`'s idealised path is kept as the
   optimistic baseline for the A/B.
 
-## The central finding (from the closed-loop sim)
+## 🔴 The central finding is now PARTLY FALSIFIED IN THE LOOP (B2, 2026-07-28)
+**"Reactive avoidance reliably dodges obstacles" was measured in a kinematic
+harness and does not survive real dynamics.** Flown in Gazebo with live trunk
+collisions, the corridor executor reached the goal in both forest arms **by
+hitting trees** — 19 strikes at 50 stems/ha, **37** at 107 — while reporting
+`REACHED GOAL`. Cause: `react_distance_m` = 6.0 m at 6.0 m/s yields **0.66 m** of
+achievable lateral offset against **1.10 m** needed, under PX4's own
+`MPC_ACC_HOR`/`MPC_JERK_AUTO`. The harness predicted *paralysis* (79 % blocked
+steps); the aircraft delivered *collision* (0.17 % blocked). Full method, the
+clean negative control, and the sized fix: **TEST-PLAN.md § B2**. Everything
+below this line was measured in the kinematic sim and must be re-read in that
+light.
+
+### ✅ Fix landed on the Mac 2026-07-28 (unflown) — `maneuver.py`
+`react_distance_m` is now **derived**, not a constant: 6.00 m → **11.73 m** at
+6.0 m/s cruise, and it scales linearly with speed. `n_rays` 31 → **91** (3.00° →
+1.00°) so the range is actually observable. `OffboardResult` gained **`strikes`**
+and a `succeeded` property (`reached_goal and strikes == 0`) — B2 could not
+express "arrived, wrecked". `OffboardConfig.sensing_shortfall()` refuses a
+configuration that cannot geometrically miss; fed the flown B2 settings it says
+so precisely:
+
+> *react distance 6.0 m is below the 7.8 m needed to dodge a 0.15 m obstacle at
+> 6.0 m/s — the airframe cannot miss it. Slow to 3.1 m/s or raise the reaction
+> distance.*
+
+(3.1 m/s is the *with-margin* recommendation at `safety_factor=1.5`; the
+bare-graze speed is 4.60 m/s. Both are pinned by tests.)
+
+⚠️ **This invalidates every `simfly`/`reactive.py` number measured at the old
+constant** — `reactive.py` shares `AvoidanceConfig`, so its reaction distance
+moved 6.0 → 9.78 m at its 5.0 m/s cruise. Deliberate: the constant is *measured
+wrong*. `AvoidanceConfig(react_distance_override_m=6.0)` reproduces the old runs
+and is documented as historical-only, mirroring `tether-check --no-px4-prior`.
+⚠️ **`reactive.py` is still kinematic**, so even with the corrected distance its
+predictions remain non-predictive of flight — the accel/jerk limits are the next
+build item, not this one. All green offline: ruff, `mypy --strict`, **282 tests**.
+
+## The central finding (from the closed-loop **kinematic** sim — see caveat above)
 - With **known position**, reactive avoidance reliably dodges unmapped obstacles:
   blind flight collides, reactive reaches the goal (verify: `simfly` shows
-  OFF=COLLIDED wp1, ON=REACHED all).
+  OFF=COLLIDED wp1, ON=REACHED all). ⚠️ **In-loop this is false at 6 m/s** — the
+  kinematic drone stops dead when blocked; the real one carries momentum through.
 - Under **GPS-denied drift**, avoidance senses *real* trees so it keeps dodging,
   but drift wanders the *true* path out of the planned tube into dense forest.
   **Safe forest flight needs BOTH reactive avoidance AND bounded navigation
@@ -84,7 +124,15 @@ ruff check . && ruff format --check . && mypy --strict src && pytest -q # 271 te
 ## Caveats / what's NOT done
 - `reactive.py` is a **2D horizontal kinematic** sim (no physics, no vertical
   avoidance) — a fast design tool, not fidelity. Real fidelity = PX4 SITL + Gazebo
-  (RUNBOOK) on the Ubuntu VM.
+  (RUNBOOK) on the Ubuntu VM. 🔴 **B2 proved it is not merely low-fidelity but
+  predicts the WRONG FAILURE MODE**: with instant velocity response a blocked
+  drone hovers, so the harness forecasts paralysis where the aircraft collides.
+  **It needs `MPC_ACC_HOR`/`MPC_JERK_AUTO` limits before any avoidance number it
+  produces is worth quoting** — including the `--density` sweep.
+- `perception.py`'s 31 rays over a 90° FOV is **3.00° spacing**, which resolves a
+  0.3 m trunk only to ~6 m (100 % → **60.9 %** detection by 15 m). That, not
+  `sensor_range_m` (30 m), is why `react_distance_m` could not simply be raised.
+  It is a limit of the ray model, not of optics: 1280 px over 90° is 0.070°/px.
 - No real onboard state estimator (VIO/VTRN/LIO) — `nav.py` emulates its *error*
   and `ev_bridge.py` injects that error into EKF2; neither is an estimator. Real
   VIO/VTRN needs the x86+RTX box (Track B).

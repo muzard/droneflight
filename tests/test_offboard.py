@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import math
 from collections.abc import AsyncIterator
+from dataclasses import replace
 
 import pytest
 
+from droneflight.avoidance import AvoidanceConfig
 from droneflight.model import FlightMission, Waypoint
 from droneflight.offboard import (
     CarrotGuidance,
@@ -139,19 +141,38 @@ def test_a_trunk_inside_the_reaction_distance_steers_the_command_off_the_line() 
     assert command.clearance_ahead_m < 6.0
 
 
-def test_a_trunk_beyond_the_reaction_distance_only_slows_it_down() -> None:
-    """Documents a real limit rather than hiding it.
+def test_a_trunk_at_8_m_is_now_steered_around_not_merely_seen() -> None:
+    """🔴 This test used to assert the opposite, and B2 flew that into 37 strikes.
 
-    ``react_distance_m`` is 6.0 m and cruise is 6 m/s, so the avoidance layer
-    gets **one second** of warning: a trunk at 8 m is seen (clearance drops) but
-    not yet steered around. That default was tuned in the kinematic ``simfly``,
-    where the vehicle turns instantly; whether it survives real dynamics is
-    exactly what B2b has to measure.
+    The old behaviour — trunk at 8 m *seen* (clearance drops) but not steered
+    around — followed from the constant ``react_distance_m = 6.0``, which at 6 m/s
+    is 1.0 s of warning against the 1.20 s the airframe needs to graze past. The
+    reaction distance is now derived from speed and PX4's accel/jerk limits, so
+    8 m is inside it and the command carries a lateral component.
     """
     command = _with_trunk_at(8.0)
-    assert abs(command.east_ms) < 0.1
-    assert command.clearance_ahead_m < 30.0  # seen...
-    assert command.clearance_ahead_m > 6.0  # ...but not reacted to
+    assert abs(command.east_ms) > 0.5, "expected a dodge, not just a slowdown"
+    assert _config().avoidance_config.react_distance_m > 8.0
+
+
+def test_the_flown_b2_configuration_is_refused_before_takeoff() -> None:
+    """A configuration that cannot geometrically miss must say so, not fly."""
+    doomed = replace(
+        _config(),
+        n_rays=31,
+        avoidance=AvoidanceConfig(react_distance_override_m=6.0),
+        cruise_speed_ms=6.0,
+    )
+    shortfall = doomed.sensing_shortfall()
+    assert shortfall is not None and "cannot miss" in shortfall
+    assert _config().sensing_shortfall() is None
+
+
+def test_undersampled_scan_is_refused_even_when_the_maneuver_fits() -> None:
+    """Reaction distance and angular sampling are separate failures; B2 had both."""
+    undersampled = replace(_config(), n_rays=31)
+    shortfall = undersampled.sensing_shortfall()
+    assert shortfall is not None and "between rays" in shortfall
 
 
 def test_altitude_is_commanded_from_the_plan_not_left_to_the_autopilot() -> None:
