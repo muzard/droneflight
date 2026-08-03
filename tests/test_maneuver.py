@@ -11,6 +11,7 @@ from droneflight.maneuver import (
     ManeuverLimits,
     lateral_offset_m,
     max_speed_for_react_distance_ms,
+    max_speed_for_spacing_ms,
     required_rays,
     required_react_distance_m,
     time_to_offset_s,
@@ -79,6 +80,25 @@ def test_round_trip_offset_and_time():
     limits = ManeuverLimits()
     for d in (0.1, 0.66, 1.10, 5.0):
         assert lateral_offset_m(time_to_offset_s(d, limits), limits) == pytest.approx(d, abs=1e-6)
+
+
+def test_stem_spacing_caps_reactive_flight_speed():
+    """The B2 follow-up finding: reactive avoidance is coherent only while the
+    required reaction distance fits inside the mean gap between obstacles.
+
+    Measured in the corrected harness across two stem densities, strikes collapse
+    as `spacing/needed` crosses 1 — 0.59 -> 27 strikes, 1.76 -> 1.
+    """
+    clearance = AvoidanceConfig().lateral_clearance_m
+    # The flown case: 107 stems/ha is 4.6 m spacing, and 6 m/s needs 7.8 m.
+    assert max_speed_for_spacing_ms(4.6, clearance) == pytest.approx(3.5, abs=0.2)
+    assert max_speed_for_spacing_ms(7.0, clearance) == pytest.approx(5.4, abs=0.2)
+    # Real managed forest, 400-1000 stems/ha -> 1.8-2.8 m: walking pace.
+    assert max_speed_for_spacing_ms(2.8, clearance) < 2.5
+    assert max_speed_for_spacing_ms(1.8, clearance) < 1.6
+    # Denser forest must always cap speed lower.
+    speeds = [max_speed_for_spacing_ms(s, clearance) for s in (1.8, 2.8, 4.6, 7.0)]
+    assert speeds == sorted(speeds)
 
 
 def test_required_rays_explains_why_6_m_looked_self_consistent():

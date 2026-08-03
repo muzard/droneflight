@@ -138,6 +138,36 @@ def max_speed_for_react_distance_ms(
     return react_distance_m / (t * limits.safety_factor)
 
 
+def max_speed_for_spacing_ms(
+    mean_spacing_m: float, lateral_clearance_m: float, limits: ManeuverLimits | None = None
+) -> float:
+    """Fastest speed at which *reactive* avoidance is coherent in a field of
+    obstacles ``mean_spacing_m`` apart.
+
+    THE POINT (TEST-PLAN B2, measured 2026-07-30)
+    Required reaction distance grows with speed; mean stem spacing does not. Once
+    the requirement exceeds the spacing there is never an instant with a clear
+    gap, and a layer whose founding premise is "obstacles are isolated events you
+    steer around" has nothing to steer into. Measured in the corrected harness on
+    the real 107 stems/ha manifest, strikes track that ratio and nothing else:
+
+    ====================  ==========  ==========  =======
+    cruise                need        spacing/need  strikes
+    ====================  ==========  ==========  =======
+    6.0 m/s               7.82 m      0.59        27
+    4.0 m/s               5.21 m      0.88         8
+    3.0 m/s               3.91 m      1.18         9
+    2.0 m/s               2.61 m      1.76         1
+    ====================  ==========  ==========  =======
+
+    Real managed forest is 400-1000 stems/ha = 1.8-2.8 m spacing, so this caps
+    reactive flight there at roughly walking pace. Beyond that the answer is not a
+    better reactive policy but routing *between* known stems.
+    """
+    limits = limits or ManeuverLimits(safety_factor=1.0)
+    return max_speed_for_react_distance_ms(mean_spacing_m, lateral_clearance_m, limits)
+
+
 def required_rays(fov_rad: float, range_m: float, obstacle_radius_m: float) -> int:
     """Rays needed so an obstacle of that radius cannot fall *between* two of them.
 

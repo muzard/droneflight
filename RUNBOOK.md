@@ -1363,7 +1363,55 @@ speed policy and tether transient observable in the loop.
 
 A full catenary / lumped-segment cable model is a later refinement (v1).
 
-### 4.10 🔵 B2 — fly the below-canopy route through **actual trees** (IN PROGRESS)
+### 4.11 ▶ NEXT ON THE VM — the B2b speed sweep (written 2026-08-03, unflown)
+
+**Read TEST-PLAN.md → "▶▶ NEXT SESSION STARTS HERE" first**, and note that
+**N1 (does the mission close on endurance at these speeds?) gates this** — it is
+an offline question and may make the whole re-fly moot.
+
+B2 flew and failed: the corridor executor reached the goal in both forest arms
+*by hitting trees* (19 at 50 stems/ha, 36 at 107). The reaction distance was
+0.60× of what the airframe needs, and that is fixed. **But the corrected offline
+harness says the fix alone does not help** (16 and 27 strikes) — strikes track
+`stem spacing / required reaction distance`, and slowing down is the only lever
+that shrinks the requirement. This flies that prediction.
+
+Same world, same plan, tether off. **Vary only `--cruise`.** `--cruise` and
+`--n-rays` exist on `fly-corridor` as of 2026-08-03, so no code is needed.
+
+| arm | command tail | harness predicts |
+|---|---|---|
+| control | `--cruise 6.0 --n-rays 91` | ~27 strikes (B2 flew 36 at 31 rays) |
+| **test** | `--cruise 3.5 --n-rays 91` | **~8–10** |
+| floor | `--cruise 2.0 --n-rays 91` | **~1–2** |
+
+```bash
+# on the VM, per arm — see §4.10 for the world/launch preamble it shares
+droneflight fly-corridor --plan ~/drone/plans/mission.plan \
+  --trunks ~/drone/plans/forest_dense_trunks.csv \
+  --cruise 3.5 --n-rays 91 2>&1 | tee ~/drone/logs/b2b-3p5.log
+```
+
+**Score every arm the same way** (on the Mac, after `scp`-ing the ULog):
+
+```bash
+droneflight b2-score --ulog sim-logs/<arm>.ulg --trunks droneplanner/worlds/forest_dense_trunks.csv
+```
+
+Exit code is 0 **only if CLEAN** — reaching the goal is not success, which is the
+entire lesson of B2. Also score each arm against the *sparse* manifest: impacts
+align with the world that actually loaded, which is the stale-gz-server check
+that already voided two runs.
+
+⚠️ **Expect ~10–14 at 3.5 m/s, not 8** — the harness under-predicts flown counts
+by 20–40 %. **The result is whether strikes fall with speed at all.** If they do
+not, the ceiling model is wrong; reopen the diagnosis rather than patching.
+⚠️ Slow arms are long: 3.5 m/s over 5.3 km is ~28 min of sim time per arm, 2.0 m/s
+~48 min. Set `--stall-timeout` accordingly and do not mistake slow for hung.
+
+---
+
+### 4.10 🔴 B2 — fly the below-canopy route through **actual trees** (FLOWN, FAILED — see §4.11)
 
 TEST-PLAN item 5. Every SITL result so far — including B1's clean 282/282 — flew
 a world with **nothing in it**. The planner routes under the canopy and grants a

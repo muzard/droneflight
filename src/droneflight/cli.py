@@ -841,6 +841,92 @@ def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live
     return 0 if result.completed else 1
 
 
+def read_groundtruth_track(
+    ulog_path: Path,
+) -> tuple[list[float], list[float], list[float], list[float], list[float], list[float]]:
+    """Gazebo truth out of a ULog as ENU metres, ready for `strikes.score_track`.
+
+    ``vehicle_local_position_groundtruth`` is Gazebo's own pose, so its origin is
+    the world origin = the vehicle's spawn = plan home — the same frame the trunk
+    manifest uses. **Do not substitute ``vehicle_local_position``**: that is
+    relative to the EKF local origin, whose datum differs and whose ``ref_alt`` is
+    NaN in these logs. That substitution has already produced one confidently
+    wrong conclusion in this project.
+
+    NED -> ENU: east = y, north = x, up = -z.
+    """
+    from pyulog import ULog  # optional analysis dependency
+
+    log = ULog(str(ulog_path), ["vehicle_local_position_groundtruth"])
+    if not log.data_list:
+        raise ValueError(
+            f"{ulog_path} has no vehicle_local_position_groundtruth — it was not a SITL "
+            "run, or ground truth logging was off. There is nothing to score."
+        )
+    d = log.data_list[0].data
+    return (
+        [t / 1e6 for t in d["timestamp"]],
+        list(d["y"]),
+        list(d["x"]),
+        [-z for z in d["z"]],
+        list(d["vy"]),
+        list(d["vx"]),
+    )
+
+
+def _b2_score(args: argparse.Namespace) -> int:
+    """TEST-PLAN B2: was the flight clean, or did it arrive wrecked?"""
+    from droneflight.strikes import StrikeConfig, score_track
+    from droneflight.trunk_manifest import TrunkManifestError, load_trunk_manifest
+
+    try:
+        manifest = load_trunk_manifest(args.trunks)
+    except TrunkManifestError as exc:
+        print(f"ERROR: {exc}")
+        return 2
+    try:
+        t, east, north, up, ve, vn = read_groundtruth_track(args.ulog)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"ERROR: cannot read {args.ulog}: {exc}")
+        return 2
+
+    report = score_track(
+        t, east, north, up, ve, vn, manifest, StrikeConfig(accel_threshold_g=args.threshold_g)
+    )
+
+    print(f"ulog     {args.ulog.name}")
+    print(f"manifest {args.trunks.name} ({len(manifest.trunks)} trunks)")
+    print(
+        f"samples  {report.samples} ({report.airborne_samples} airborne), "
+        f"{report.samples_in_trunk_span} level with a trunk"
+    )
+    clearance = (
+        "n/a" if not math.isfinite(report.min_clearance_m) else f"{report.min_clearance_m:+.3f} m"
+    )
+    print(f"min trunk-surface clearance  {clearance}")
+    if report.min_agl_m is not None:
+        print(f"min AGL (from trunk bases)   {report.min_agl_m:+.2f} m")
+    print(f"samples inside a trunk       {report.samples_inside_trunk}")
+    print()
+    print(f"TREE STRIKES   {report.tree_strikes}")
+    print(f"GROUND IMPACTS {report.ground_impacts}")
+    other = len(report.episodes) - report.tree_strikes - report.ground_impacts
+    if other:
+        print(f"unattributed   {other}  (usually the ejection tail of a counted impact)")
+    if args.verbose and report.episodes:
+        print()
+        print("    t(s)     kind    peak_g   in->out m/s    clearance      pos")
+        for e in report.episodes:
+            print(
+                f"  {e.t_s:7.1f}  {e.kind:>8s}  {e.peak_g:6.1f}  "
+                f"{e.speed_in_ms:5.2f}->{e.speed_out_ms:5.2f}  "
+                f"{e.clearance_m:+8.3f} m  E{e.east_m:7.0f} N{e.north_m:7.0f}"
+            )
+    print()
+    print("VERDICT: CLEAN" if report.clean else "VERDICT: NOT CLEAN — arriving is not succeeding")
+    return 0 if report.clean else 1
+
+
 def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs a live autopilot
     """TEST-PLAN B2b: fly the route as a corridor, avoidance in the loop."""
     from droneflight.mavsdk_offboard import MavsdkOffboardConnector
@@ -858,9 +944,10 @@ def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs 
     print(f"forest: {len(manifest.trunks)} trunks from {args.trunks}")
     config = OffboardConfig(
         lookahead_m=args.lookahead,
-        cruise_speed_ms=mission.cruise_speed_ms,
+        cruise_speed_ms=args.cruise if args.cruise is not None else mission.cruise_speed_ms,
         control_hz=args.control_hz,
         sensor_range_m=args.sensor_range,
+        n_rays=args.n_rays,
         stall_timeout_s=args.stall_timeout,
     )
     obstacles = manifest.obstacle_field()
@@ -1131,6 +1218,22 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--sensor-range", type=float, default=30.0)
     fc.add_argument("--takeoff-alt", type=float, default=15.0)
     fc.add_argument(
+        "--cruise",
+        type=float,
+        default=None,
+        help="Override the plan's cruise speed (m/s). The reaction distance is derived "
+        "from it, so this is the knob the B2 speed-ceiling result says matters: at "
+        "107 stems/ha the geometry supports about 3.5 m/s, not the plan's 6.0.",
+    )
+    fc.add_argument(
+        "--n-rays",
+        type=int,
+        default=91,
+        help="Rays across the FOV. 91 over 90 deg = 1.00 deg, which resolves a 0.15 m "
+        "trunk to ~17 m. Use 31 to reproduce the B2 arms, which could not see one "
+        "past ~6 m.",
+    )
+    fc.add_argument(
         "--stall-timeout",
         type=float,
         default=90.0,
@@ -1144,6 +1247,29 @@ def build_parser() -> argparse.ArgumentParser:
         "The trees stay in the world, so this measures what avoidance is worth.",
     )
     fc.set_defaults(func=_fly_corridor)
+
+    bs = sub.add_parser(
+        "b2-score",
+        help="TEST-PLAN B2: score a flown ULog for tree strikes against its trunk manifest.",
+    )
+    bs.add_argument("--ulog", type=Path, required=True, help="PX4 .ulg from the arm.")
+    bs.add_argument(
+        "--trunks",
+        type=Path,
+        required=True,
+        help="The trunk manifest the world was built from. Scoring an arm against "
+        "the OTHER arm's manifest is the check that catches a stale Gazebo server "
+        "serving the wrong world — impacts align with the world that was loaded.",
+    )
+    bs.add_argument(
+        "--threshold-g",
+        type=float,
+        default=2.0,
+        help="Deceleration counted as contact. The default is 4x the ceiling the "
+        "tree-free B1 control ever reached; re-derive it if the airframe changes.",
+    )
+    bs.add_argument("--verbose", action="store_true", help="List every episode.")
+    bs.set_defaults(func=_b2_score)
 
     return parser
 

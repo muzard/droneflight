@@ -19,7 +19,8 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `offboard.py` + `mavsdk_offboard.py` | **corridor executor** — carrot guidance (projection onto the polyline, so a detour cannot leave it chasing a passed vertex), avoidance in the loop, altitude commanded by us not interpolated by PX4 (what A2 says a corridor needs). Logs progress every 5 s and aborts after 90 s without route progress — a silent loop got killed by hand once, mistaken for a hang. `droneflight fly-corridor` |
 | `maneuver.py` | **the reaction-distance budget** — how far ahead an obstacle must be seen for the airframe to actually miss it, from the flown speed and PX4's `MPC_ACC_HOR`/`MPC_JERK_AUTO` (jerk-limited, so *not* ½at²). `react_distance_m` is now **derived from this, not a constant**; also `required_rays`, the angular-sampling companion. Built after B2 flew the constant into 19–37 tree strikes |
 | `trunk_manifest.py` | loads the trunk CSV the Gazebo world was built from, so perception senses what physics will hit |
-| `reactive.py` | closed-loop **kinematic** forest-flight sim (avoidance ON vs OFF, drift, VTRN) |
+| `strikes.py` | **did the flight hit anything?** Scores a flown track against its trunk manifest by *dynamic signature* (a >2 g transient at a trunk it is vertically level with), not by proximity. `droneflight b2-score`. Threshold calibrated against the tree-free B1 control, which never exceeds 0.50 g |
+| `reactive.py` | closed-loop **accel- and jerk-limited** forest-flight sim (avoidance ON vs OFF, drift, VTRN). 🔴 Was purely kinematic until B2; that one simplification made it predict the *wrong failure mode* |
 | `nav.py` | **the simulated error** — VIO drift + VTRN correction (idealised reset *and* fidelity-limited optical driver), plus yaw drift and EV lock loss |
 | `correction.py` | **optical terrain-relative correction** — data-driven fixes over a spatially varying basemap; confidence floor + innovation gate + Kalman fuse |
 | `ev_bridge.py` | **external-vision injection** — Gazebo truth + injected error → PX4 `VISION_POSITION_ESTIMATE`; ENU→NED frames, EV dropout, track recording, corridor analysis |
@@ -39,6 +40,11 @@ droneflight nav      --plan .../mission.plan --forest-frac 0.7 --stale-frac 0.3 
 droneflight tether-check --plan .../mission.plan                        # payout tension: speed policy vs flat cruise
 droneflight tether-plugin-check --log tether-on.csv                     # Gazebo plugin log vs the model (exact-parity gate)
 droneflight simfly   --plan .../mission.plan --density 25               # forest flight: avoidance ON vs OFF
+droneflight b2-score --ulog sim-logs/b2/13_47_06.ulg \
+                     --trunks ../droneplanner/worlds/forest_dense_trunks.csv   # tree strikes from a flown ULog
+# needs the optional analysis extra:  pip install -e '.[analysis]'   (pyulog)
+# exit 0 only if CLEAN. Score an arm against the OTHER manifest too — impacts
+# align with the world that actually loaded, which catches a stale gz server.
 droneflight simfly   --plan .../mission.plan --drift-rate 0.02 --vtrn-interval 150
 eval "$(droneflight sitl-env --plan .../mission.plan)"                  # PX4 SITL home = plan home
 droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # constant alt for PX4's FLAT world
@@ -105,9 +111,47 @@ constant** — `reactive.py` shares `AvoidanceConfig`, so its reaction distance
 moved 6.0 → 9.78 m at its 5.0 m/s cruise. Deliberate: the constant is *measured
 wrong*. `AvoidanceConfig(react_distance_override_m=6.0)` reproduces the old runs
 and is documented as historical-only, mirroring `tether-check --no-px4-prior`.
-⚠️ **`reactive.py` is still kinematic**, so even with the corrected distance its
-predictions remain non-predictive of flight — the accel/jerk limits are the next
-build item, not this one. All green offline: ruff, `mypy --strict`, **282 tests**.
+### ✅ `reactive.py` now has PX4's accel + jerk limits (2026-07-30) — and it reproduces B2
+The last prerequisite. Velocity is a state slewed under `MPC_ACC_HOR`/
+`MPC_JERK_AUTO`; a contact is resolved as a **sliding stop** and counted rather
+than aborting the run, because a harness that stops at the first collision cannot
+be compared with a flight that had 36. Scored on the **real 282-wp route and the
+real manifests**:
+
+| arm | old harness | corrected harness | **flown** |
+|---|---|---|---|
+| sparse, 50 stems/ha | 0 collisions, "reaches goal" | **15** strikes | **19** |
+| dense, 107 stems/ha | 0 collisions, "❌ 79 % blocked" | **22** strikes | **36** |
+
+So it now produces the right *phenomenon* and the right *ordering*, at 60–80 % of
+the measured count. That is the first time this harness has been comparable with
+a flight at all. Both halves of the defect are pinned by tests: instant response
+**hides a collision** (single trunk: +0.064 m clean vs −0.001 m graze) and
+**predicts paralysis** where the vehicle makes progress (trunk wall: stuck vs
+reached).
+
+🔴 **But it does NOT show the fix working, and that is a real result.** Re-run with
+the derived reaction distance and 91 rays, strikes go **15 → 16** (sparse) and
+**22 → 27** (dense) — no better, slightly worse. **Do not fly the fix expecting a
+clean run.** The likely reason is architectural and is the open question below.
+
+🐛 **Found while wiring the validation up: `reactive.py` projected to *absolute*
+metres (~1.1e6, 5.2e6) while every trunk manifest is home-relative (~0..3500).**
+A real forest therefore sat a million metres from the aircraft and every run came
+back clean with `min_clearance` of exactly 0.000 m. **This is the third instance
+of that frame mismatch** (after `ev_bridge.route_reference`'s degenerate basemap),
+and it is why the first validation attempt reported 0 strikes on both arms.
+`_to_local` is now home-relative and a test pins home to the origin.
+⚠️ It also means **every historical `simfly` result flew an emptier forest than it
+claimed** whenever a manifest was involved — the `scatter_forest` path was
+self-consistent and is unaffected.
+
+⚠️ Two harness bugs my own tests caught, worth knowing if you touch it: removing
+the *whole* velocity on contact pins the vehicle against the trunk forever (it
+reads as a stall, not a strike), and without release hysteresis a grind along one
+trunk counted **39 892 strikes**.
+
+All green offline: ruff, `mypy --strict`, **296 tests**.
 
 ## The central finding (from the closed-loop **kinematic** sim — see caveat above)
 - With **known position**, reactive avoidance reliably dodges unmapped obstacles:

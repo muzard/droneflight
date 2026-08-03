@@ -25,10 +25,18 @@ avoidance breaks, which turns it into a sensor requirement.
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from droneflight.perception import ObstacleField, Trunk
+
+_SEARCH_RADIUS_M = 30.0
+"""How far to look for a vertically-overlapping trunk. Wider than any clearance
+worth reporting, so the answer is never an artifact of the search."""
+
+_GROUND_RADIUS_M = 40.0
+"""How far a trunk base may be and still stand in for the terrain under a sample."""
 
 
 class TrunkManifestError(RuntimeError):
@@ -45,9 +53,86 @@ class ForestManifest:
     these, but a vertical check needs them and dropping them here would lose
     information the manifest carries."""
 
+    base_z_m: tuple[float, ...]
+    """World z of each trunk's base, parallel to ``trunks``. These are terrain
+    elevations by construction (the generator plants trunks on the DTM), which
+    makes them a frame-exact terrain reference — no DEM and no georeferencing
+    needed to ask "was the vehicle at ground level here". Validated against the
+    DEM to 0.107 m mean / 0.545 m RMS over 2500 trunks (TEST-PLAN B2)."""
+
+    _grid_cache: tuple[float, dict[tuple[int, int], list[int]]] | None = field(
+        default=None, repr=False, compare=False
+    )
+
     def obstacle_field(self, cell_size_m: float = 10.0) -> ObstacleField:
         """The indexed field ``perception.sense()`` queries."""
         return ObstacleField(trunks=self.trunks, cell_size_m=cell_size_m)
+
+    def top_z_m(self, index: int) -> float:
+        """World z of a trunk's crown."""
+        return self.base_z_m[index] + self.heights_m[index]
+
+    def _cell(self, x: float, y: float, cell_m: float) -> tuple[int, int]:
+        return math.floor(x / cell_m), math.floor(y / cell_m)
+
+    def _index(self, cell_m: float) -> dict[tuple[int, int], list[int]]:
+        if self._grid_cache is None or self._grid_cache[0] != cell_m:
+            grid: dict[tuple[int, int], list[int]] = {}
+            for i, t in enumerate(self.trunks):
+                grid.setdefault(self._cell(t.x, t.y, cell_m), []).append(i)
+            object.__setattr__(self, "_grid_cache", (cell_m, grid))
+        assert self._grid_cache is not None
+        return self._grid_cache[1]
+
+    def nearby(self, east_m: float, north_m: float, radius_m: float) -> list[int]:
+        """Indices of trunks whose *centre* is within ``radius_m``, via a grid index.
+
+        Pure-Python and O(local), which is what makes whole-flight scoring (70 k
+        samples x 2500 trunks) tractable without numpy or scipy.
+        """
+        cell_m = max(radius_m, 1.0)
+        grid = self._index(cell_m)
+        cx, cy = self._cell(east_m, north_m, cell_m)
+        out: list[int] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for i in grid.get((cx + dx, cy + dy), ()):
+                    t = self.trunks[i]
+                    if math.hypot(t.x - east_m, t.y - north_m) <= radius_m:
+                        out.append(i)
+        return out
+
+    def surface_clearance_m(self, east_m: float, north_m: float, up_m: float) -> float:
+        """Distance to the nearest trunk *surface*, counting only trunks the
+        sample is vertically level with. ``inf`` when above every crown or below
+        every base; negative when inside a trunk.
+
+        The vertical filter is the whole point: a 2D clearance says the vehicle
+        was next to a trunk when it may have been 20 m above it.
+        """
+        best = math.inf
+        for i in self.nearby(east_m, north_m, _SEARCH_RADIUS_M):
+            if not self.base_z_m[i] <= up_m <= self.top_z_m(i):
+                continue
+            t = self.trunks[i]
+            best = min(best, math.hypot(t.x - east_m, t.y - north_m) - t.radius)
+        return best
+
+    def ground_z_m(self, east_m: float, north_m: float) -> float | None:
+        """Terrain elevation from the nearest trunk base, or None if none is near.
+
+        A proxy, deliberately: trunks exist only where the planner found canopy,
+        so this is defined along a forested route and nowhere else. Good enough to
+        answer "did that impact happen at ground level"; not a DEM.
+        """
+        near = self.nearby(east_m, north_m, _GROUND_RADIUS_M)
+        if not near:
+            return None
+
+        def distance(i: int) -> float:
+            return math.hypot(self.trunks[i].x - east_m, self.trunks[i].y - north_m)
+
+        return self.base_z_m[min(near, key=distance)]
 
 
 def load_trunk_manifest(path: str | Path) -> ForestManifest:
@@ -67,6 +152,7 @@ def load_trunk_manifest(path: str | Path) -> ForestManifest:
 
     trunks: list[Trunk] = []
     heights: list[float] = []
+    bases: list[float] = []
     for line, row in enumerate(rows, start=2):
         try:
             trunks.append(
@@ -77,7 +163,8 @@ def load_trunk_manifest(path: str | Path) -> ForestManifest:
                 )
             )
             heights.append(float(row["height_m"]))
+            bases.append(float(row["base_z_m"]))
         except (KeyError, TypeError, ValueError) as exc:
             raise TrunkManifestError(f"{file}:{line} is malformed: {exc}") from exc
 
-    return ForestManifest(trunks=tuple(trunks), heights_m=tuple(heights))
+    return ForestManifest(trunks=tuple(trunks), heights_m=tuple(heights), base_z_m=tuple(bases))

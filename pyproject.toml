@@ -17,6 +17,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Reading flown ULogs (`b2-score`). Optional so the flight stack itself stays at
+# two runtime deps — the import is confined to the CLI adapter, and the scoring
+# logic in `strikes.py` is pure Python and testable without it.
+analysis = [
+    "pyulog>=1.0",
+]
 dev = [
     "ruff>=0.5",
     "mypy>=1.10",
@@ -53,7 +59,7 @@ strict = true
 files = ["src"]
 
 [[tool.mypy.overrides]]
-module = ["mavsdk.*"]
+module = ["mavsdk.*", "pyulog.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
