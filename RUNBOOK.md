@@ -1385,12 +1385,31 @@ Same world, same plan, tether off. **Vary only `--cruise`.** `--cruise` and
 | **test** | `--cruise 3.5 --n-rays 91` | **~8–10** |
 | floor | `--cruise 2.0 --n-rays 91` | **~1–2** |
 
+🔴 **The plan file is `canopy.plan`, NOT `mission.plan` — this VOIDED the first
+attempt (2026-08-04).** `~/drone/plans/mission.plan` on the VM is a stale
+pre-2026-07-27 route at a **flat 30 m AGL**. All three arms flew it, which put
+them **22–25 m above the canopy** (0 of 71 775 samples below crown level) and
+scored a meaningless **0 strikes** — you cannot hit trees you are flying over.
+The tell is `b2-score`'s `min AGL (from trunk bases)`: it read **30.15 / 29.85 /
+29.87 m**, i.e. dead flat 30 m, against ~12 m for the real below-canopy route.
+**Check that number first on every arm.** Re-`scp` the plan before flying:
+
+```bash
+scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/out_demo/mission.plan <vm>:~/drone/plans/canopy.plan
+```
+
 ```bash
 # on the VM, per arm — see §4.10 for the world/launch preamble it shares
-droneflight fly-corridor --plan ~/drone/plans/mission.plan \
+droneflight fly-corridor --plan ~/drone/plans/canopy.plan \
   --trunks ~/drone/plans/forest_dense_trunks.csv \
   --cruise 3.5 --n-rays 91 2>&1 | tee ~/drone/logs/b2b-3p5.log
 ```
+
+⚠️ **Confirm the arm before trusting it**, in this order: the console banner must
+say `282 route points`; `b2-score`'s min-AGL-from-trunk-bases must be ~12 m, not
+~30; and the flown p90 speed must match the `--cruise` you asked for (that is what
+identifies an arm — the 2026-08-04 attempt was identified purely from
+`p90 |v_h|` = 6.01 / 3.51 / 2.01 m/s after its console logs were lost).
 
 **Score every arm the same way** (on the Mac, after `scp`-ing the ULog):
 

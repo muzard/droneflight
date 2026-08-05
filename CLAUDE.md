@@ -165,6 +165,35 @@ All green offline: ruff, `mypy --strict`, **296 tests**.
   it (an earlier bug); avoidance must react at a *lookahead* distance, not the
   bare safety radius (another earlier bug) — both fixed.
 
+## 🔴 N2 attempt 2026-08-04 — VOID, wrong plan file. And it exposed a 2D-perception defect.
+The three speed arms flew (`sim-logs/b2/new_tests/`, identified from `p90 |v_h|` =
+**6.01 / 3.51 / 2.01 m/s** — their console logs were lost, so the flag is not
+evidence). **All three flew `~/drone/plans/mission.plan`, a stale flat-30 m AGL
+route**, not the 282-wp below-canopy `canopy.plan`. Consequences: **22–25 m above
+the canopy**, 0 of 71 775 samples below crown level, cross-track vs the real plan
+**mean 55–74 m / max 119.6 m**, and a meaningless **0 strikes** in all three arms
+against *both* manifests. None finished (18.5 / 30.0 / 30.0 % of route). Two of
+the five returned ULogs never armed at all; one is 1.07 GB of a parked vehicle
+loitering for 4533 s.
+**The cheap tell is `b2-score`'s `min AGL (from trunk bases)`** — it read
+30.15 / 29.85 / 29.87 m, dead flat 30, against ~12 m for the real route. Check it
+on every arm. Fixed path + verification checklist: RUNBOOK §4.11. The worlds and
+trunk manifests are still valid (max 46–54 m from the current route), so **only
+the `.plan` needs re-`scp`ing.**
+
+🐛 **Found in passing, real, and NOT fixed: `perception.Trunk` is 2D — it has
+`x, y, radius` and no vertical extent**, and `trunk_manifest` says outright that
+"the 2D avoidance layer ignores heights". So `perception.sense()` reacts to every
+trunk horizontally **regardless of the drone's altitude**: flying 15–25 m over the
+canopy, the executor still dodged the forest beneath it, which is the likely
+reason all three arms wandered off-route and stalled. This did **not** affect the
+original B2 arms (they flew below canopy, where every sensed trunk really is at
+flight altitude), so it is not a blocker for a correct re-fly — but it means
+avoidance can never use "climb over it", and it will keep reacting to obstacles it
+has already cleared vertically. `ForestManifest` already carries `base_z_m` /
+`top_z_m` and a vertical containment test, so the data is there; only `sense()`
+ignores it.
+
 ## Caveats / what's NOT done
 - `reactive.py` is a **2D horizontal kinematic** sim (no physics, no vertical
   avoidance) — a fast design tool, not fidelity. Real fidelity = PX4 SITL + Gazebo
