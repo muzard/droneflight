@@ -941,6 +941,8 @@ def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs 
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    from droneflight.avoidance import AvoidanceConfig
+
     print(f"forest: {len(manifest.trunks)} trunks from {args.trunks}")
     config = OffboardConfig(
         lookahead_m=args.lookahead,
@@ -949,6 +951,14 @@ def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs 
         sensor_range_m=args.sensor_range,
         n_rays=args.n_rays,
         stall_timeout_s=args.stall_timeout,
+        avoidance=AvoidanceConfig(
+            gap_policy=args.gap_policy,
+            transient_margin_m=args.transient_margin,
+        ),
+    )
+    print(
+        f"avoidance: gap={args.gap_policy}, transient margin={args.transient_margin:.2f} m, "
+        f"{args.n_rays} rays"
     )
     obstacles = manifest.obstacle_field()
     if args.no_avoidance:
@@ -1232,6 +1242,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rays across the FOV. 91 over 90 deg = 1.00 deg, which resolves a 0.15 m "
         "trunk to ~17 m. Use 31 to reproduce the B2 arms, which could not see one "
         "past ~6 m.",
+    )
+    fc.add_argument(
+        "--gap-policy",
+        choices=("widest", "nearest_goal"),
+        default="nearest_goal",
+        help="Which free gap to steer into. 'nearest_goal' (default) is the minimum "
+        "deviation that clears — the policy N2 flew into 34-41 strikes, kept as the "
+        "default only because 'widest' measured 3.3x WORSE offline (243 vs 73). Fly "
+        "'widest' to test that offline result in the loop.",
+    )
+    fc.add_argument(
+        "--transient-margin",
+        type=float,
+        default=0.0,
+        help="Metres of lateral room kept between the commanded heading and the edge "
+        "of the gap, so the turn transient has somewhere to overshoot. Measured a "
+        "wash offline (35 -> 38 strikes); 0.6 is the value worth flying.",
     )
     fc.add_argument(
         "--stall-timeout",

@@ -165,6 +165,24 @@ All green offline: ruff, `mypy --strict`, **296 tests**.
   it (an earlier bug); avoidance must react at a *lookahead* distance, not the
   bare safety radius (another earlier bug) — both fixed.
 
+## 🔴 N2 follow-up 2026-08-11 — three candidate fixes built, measured, and all REJECTED
+`avoidance.py` gained two knobs (`gap_policy`, `transient_margin_m`; `fly-corridor
+--gap-policy/--transient-margin`) and **both default to the existing behaviour**,
+because on the real route and real manifests every proposed change is worse:
+`nearest_goal`+no margin **35** strikes over six manifest×speed configs, +margin
+38, `widest` **142**, `widest`+margin 101, and correcting a real under-pad
+(0.95 → 1.10 m) 40. Gap policy alone: **73 vs 243, 3.3× worse**.
+🔑 **The three negatives share one mechanism and that is the finding: every change
+that makes the vehicle deviate MORE makes it hit more trees**, worst in the dense
+manifest. At ~4.6 m spacing the room needed to miss one trunk is comparable to the
+distance to the next, so **the dodge is the hazard** — which is why
+minimum-deviation steering keeps winning despite hitting 34 trees.
+🐛 Known under-pad left in deliberately at `avoidance.py:173` (0.95 m where
+`lateral_clearance_m` = 1.10 m is needed, omitting the trunk radius); corrected it
+measures worse, so it is recorded in a comment rather than silently changed.
+⚠️ Nothing shipped on harness evidence — it has twice predicted the wrong
+*mechanism* here. The knobs exist to be flown. **The defect is still open.**
+
 ## 🔴 N2 attempt 2026-08-04 — VOID, wrong plan file. And it exposed a 2D-perception defect.
 The three speed arms flew (`sim-logs/b2/new_tests/`, identified from `p90 |v_h|` =
 **6.01 / 3.51 / 2.01 m/s** — their console logs were lost, so the flag is not

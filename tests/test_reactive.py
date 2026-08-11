@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 
+from droneflight.avoidance import AvoidanceConfig
 from droneflight.maneuver import ManeuverLimits
 from droneflight.model import FlightMission, Waypoint
 from droneflight.nav import DriftConfig
@@ -112,18 +113,63 @@ def test_instant_response_predicts_paralysis_where_the_vehicle_makes_progress() 
     Against a line of trunks across the route, an instantly-responsive drone stops
     dead and is reported **stuck** — the "79 % steps blocked" that B2 falsified. A
     drone with momentum carries through and reaches the goal.
+
+    ⚠️ Both arms pin ``gap_policy="nearest_goal"``. This documents a *dynamics*
+    finding, so the steering policy has to be held at the one that was in force
+    when it was made — the widest-gap policy that replaced it in N2 escapes this
+    wall outright, which is the point of the test below.
     """
     m = _straight_mission()
     wp1 = _to_local(m.waypoints[1].lat, m.waypoints[1].lon, m.home_lat, m.home_lon)
     wall = ObstacleField(
         trunks=tuple(Trunk(x=wp1[0] + dx, y=wp1[1] - 20.0, radius=0.3) for dx in range(-12, 13, 2))
     )
+    historical = AvoidanceConfig(gap_policy="nearest_goal")
 
-    instant = fly_through_forest(m, wall, _instant(), reactive=True)
-    real = fly_through_forest(m, wall, ForestFlightConfig(), reactive=True)
+    instant = fly_through_forest(
+        m,
+        wall,
+        ForestFlightConfig(
+            avoidance=historical, limits=ManeuverLimits(max_accel_ms2=1e6, max_jerk_ms3=1e9)
+        ),
+        reactive=True,
+    )
+    real = fly_through_forest(m, wall, ForestFlightConfig(avoidance=historical), reactive=True)
 
     assert instant.stuck and not instant.reached_goal, "the old harness's prediction"
     assert real.reached_goal and not real.stuck, "the aircraft's actual behaviour"
+
+
+def test_widest_gap_escapes_a_wall_that_traps_the_nearest_goal_policy() -> None:
+    """TEST-PLAN N2: why the steering policy changed.
+
+    ``nearest_goal`` takes the minimum deviation that clears, so against a line of
+    trunks it noses into the first slot it finds and jams. ``widest`` picks the
+    largest opening and keeps a transient margin off both edges, so it goes round.
+    """
+    m = _straight_mission()
+    wp1 = _to_local(m.waypoints[1].lat, m.waypoints[1].lon, m.home_lat, m.home_lon)
+    wall = ObstacleField(
+        trunks=tuple(Trunk(x=wp1[0] + dx, y=wp1[1] - 20.0, radius=0.3) for dx in range(-12, 13, 2))
+    )
+    limits = ManeuverLimits(max_accel_ms2=1e6, max_jerk_ms3=1e9)
+
+    old = fly_through_forest(
+        m,
+        wall,
+        ForestFlightConfig(avoidance=AvoidanceConfig(gap_policy="nearest_goal"), limits=limits),
+        reactive=True,
+    )
+    new = fly_through_forest(
+        m,
+        wall,
+        ForestFlightConfig(avoidance=AvoidanceConfig(gap_policy="widest"), limits=limits),
+        reactive=True,
+    )
+
+    assert old.stuck and not old.reached_goal
+    assert new.reached_goal and not new.stuck
+    assert new.strikes <= old.strikes
 
 
 def test_a_sustained_grind_along_a_trunk_counts_as_one_strike() -> None:
