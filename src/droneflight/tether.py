@@ -56,6 +56,7 @@ from itertools import pairwise
 from pathlib import Path
 
 from droneflight.model import FlightMission
+from droneflight.perception import Trunk
 from droneflight.px4_profile import flown_deflection_deg, flown_speed_ms
 from droneflight.speed_policy import (
     SpeedPolicy,
@@ -239,7 +240,9 @@ def analyse_tether(
     """Payout tension along a mission, at the speeds the vehicle will actually fly.
 
     With ``policy`` set, each vertex's *commanded* speed is the tether-safe policy
-    speed; with ``policy=None`` every vertex is commanded ``cruise_speed_ms``.
+    speed; with ``policy=None`` every vertex is commanded the plan's speed — its
+    per-leg ``DO_CHANGE_SPEED`` where the ``.plan`` carries one, else
+    ``cruise_speed_ms``. The plan's speed caps the policy too, as in the executor.
 
     ``px4_corner_prior`` (default on) then caps each commanded speed by the speed
     PX4 imposes on itself at that bend — measured in flight, see
@@ -269,12 +272,19 @@ def analyse_tether(
         deflection = (
             0.0 if i == 0 or i == len(pts) - 1 else _deflection_deg(pts[i - 1], pts[i], pts[i + 1])
         )
+        # The plan's own leg speeds are a ceiling (the executor caps by them and
+        # the tether policy may only lower them — executor.prepare_items). Take
+        # the faster of the legs arriving at and leaving the vertex: it is the
+        # fastest the aircraft can be moving there.
+        ceiling = mission.leg_speed_ms(reps[i])
+        if i > 0:
+            ceiling = max(ceiling, mission.leg_speed_ms(reps[i - 1]))
         if policy is None:
-            speed = mission.cruise_speed_ms
+            speed = ceiling
         elif i == 0 or i == len(pts) - 1:
-            speed = policy.cruise_speed_ms
+            speed = min(ceiling, policy.cruise_speed_ms)
         else:
-            speed = _speed_for_bend(deflection, policy)
+            speed = min(ceiling, _speed_for_bend(deflection, policy))
         turn_deflection = deflection
         if px4_corner_prior:
             speed = flown_speed_ms(speed, deflection)
@@ -538,3 +548,158 @@ def check_plugin_parity(log: PluginLog) -> PluginParity:
         peak_turn_n=peak_turn,
         peak_speed_ms=peak_speed,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Below the canopy: does the airborne span touch trunks?
+# --------------------------------------------------------------------------- #
+#
+# The tension model above has no trees in it. Under the canopy the aircraft weaves
+# round trunks, and the fiber between the aircraft and the point where it touches
+# down is a straight-ish line (taut under back-tension) that CUTS the corners the
+# aircraft flew round. A trunk that line crosses is a contact — the snag mechanism
+# the v0 notes named and nothing measured.
+
+
+FIBER_LINEAR_MASS_KG_M = 6.9e-5
+"""250 um coated G657A2: 125 um glass (2200 kg/m3) + acrylate (~1150 kg/m3)."""
+
+
+def free_fall_touchdown_lag_m(
+    height_m: float,
+    speed_ms: float,
+    config: TetherConfig,
+    linear_mass_kg_m: float = FIBER_LINEAR_MASS_KG_M,
+) -> float:
+    """How far behind the aircraft paid-out fiber reaches the ground, falling freely.
+
+    Paid-out fiber is at rest over the ground and falls broadside at its terminal
+    speed ``sqrt(w / (0.5 rho Cd d))`` (~1.9 m/s for 250 um fiber), so it lands
+    ``height / v_fall * speed`` behind. ⚠️ An order-of-magnitude estimate only:
+    back-tension stretches the span longer, rotor downwash (several m/s under a
+    6.5 kg quad) shortens it, and neither is benched.
+    """
+    if height_m <= 0.0 or speed_ms <= 0.0:
+        return 0.0
+    weight = linear_mass_kg_m * 9.81
+    fall = math.sqrt(
+        weight
+        / (0.5 * config.air_density_kg_m3 * config.drag_coefficient * config.fiber_diameter_m)
+    )
+    return height_m / fall * speed_ms
+
+
+@dataclass(frozen=True)
+class SpanContacts:
+    """Trunks the airborne span would cross along a flown track."""
+
+    lag_m: float
+    trunks: tuple[int, ...]
+    """Indices into the field's trunks, each counted once."""
+    forest_length_m: float
+    """Track length with a trunk within ``forest_radius_m`` — the denominator."""
+
+    @property
+    def per_km(self) -> float:
+        return len(self.trunks) / self.forest_length_m * 1000.0 if self.forest_length_m else 0.0
+
+
+def airborne_span_contacts(
+    track: list[tuple[float, float]],
+    trunks: tuple[Trunk, ...],
+    lag_m: float,
+    *,
+    forest_radius_m: float = 15.0,
+    cell_m: float = 10.0,
+) -> SpanContacts:
+    """Trunks crossed by the chord from the touchdown point to the aircraft.
+
+    ``track`` is the TRUE plan-view track in the trunks' frame. At each sample
+    the fiber is taken to touch down ``lag_m`` of track behind the aircraft and
+    to run straight to it; a trunk disk that chord crosses is a contact. The
+    aircraft itself never touches the trunk (that is a strike, scored elsewhere):
+    this counts corners the fiber cuts that the aircraft flew round.
+    """
+    index: dict[tuple[int, int], list[int]] = {}
+    for k, t in enumerate(trunks):
+        index.setdefault((math.floor(t.x / cell_m), math.floor(t.y / cell_m)), []).append(k)
+
+    def near(x: float, y: float, r: float) -> list[int]:
+        n = math.ceil(r / cell_m)
+        cx, cy = math.floor(x / cell_m), math.floor(y / cell_m)
+        return [
+            k
+            for i in range(cx - n, cx + n + 1)
+            for j in range(cy - n, cy + n + 1)
+            for k in index.get((i, j), ())
+        ]
+
+    s = [0.0]
+    for p, q in pairwise(track):
+        s.append(s[-1] + math.dist(p, q))
+
+    in_forest = [
+        any(
+            math.hypot(x - trunks[k].x, y - trunks[k].y) <= forest_radius_m
+            for k in near(x, y, forest_radius_m)
+        )
+        for x, y in track
+    ]
+    forest_len = sum(s[i + 1] - s[i] for i in range(len(track) - 1) if in_forest[i + 1])
+
+    hit: set[int] = set()
+    back = 0
+    for i, (px, py) in enumerate(track):
+        while back < i and s[back + 1] <= s[i] - lag_m:
+            back += 1
+        if not in_forest[i] or s[i] < lag_m:
+            continue
+        qx, qy = track[back]
+        dx, dy = px - qx, py - qy
+        length_sq = dx * dx + dy * dy
+        if length_sq == 0.0:
+            continue
+        mid_r = math.sqrt(length_sq) / 2.0 + 0.5
+        for k in near((px + qx) / 2.0, (py + qy) / 2.0, mid_r):
+            t = trunks[k]
+            u = max(0.0, min(1.0, ((t.x - qx) * dx + (t.y - qy) * dy) / length_sq))
+            if math.hypot(qx + u * dx - t.x, qy + u * dy - t.y) < t.radius:
+                hit.add(k)
+    return SpanContacts(lag_m=lag_m, trunks=tuple(sorted(hit)), forest_length_m=forest_len)
+
+
+def free_fall_span_m(height_m: float, speed_ms: float, config: TetherConfig) -> float:
+    """Airborne span if the fiber free-falls: drone to touchdown, a straight line."""
+    return math.hypot(height_m, free_fall_touchdown_lag_m(height_m, speed_ms, config))
+
+
+def speed_ceiling_ms(height_m: float, config: TetherConfig, fraction: float = 1.0) -> float:
+    """Fastest straight-leg speed whose back-tension + drag stays under
+    ``fraction`` of break, with the span growing with speed as in free fall.
+
+    With a fixed span drag goes as v^2; with free fall the touchdown point moves
+    back in proportion to speed, so drag goes nearly as v^3 and the ceiling is
+    lower than the fixed-span model says. ⚠️ Same un-benched caveats as
+    :func:`free_fall_touchdown_lag_m`.
+    """
+    budget = fraction * config.break_tension_n - config.back_tension_n
+    if budget <= 0.0:
+        return 0.0
+
+    def drag(v: float) -> float:
+        span = free_fall_span_m(height_m, v, config)
+        return drag_tension_n(TetherConfig(airborne_span_m=span, **_drag_fields(config)), v)
+
+    lo, hi = 0.0, 100.0
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        lo, hi = (mid, hi) if drag(mid) <= budget else (lo, mid)
+    return lo
+
+
+def _drag_fields(config: TetherConfig) -> dict[str, float]:
+    return {
+        "fiber_diameter_m": config.fiber_diameter_m,
+        "drag_coefficient": config.drag_coefficient,
+        "air_density_kg_m3": config.air_density_kg_m3,
+    }

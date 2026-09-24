@@ -256,3 +256,77 @@ def test_the_corridor_floor_keeps_a_zero_width_vertex_passable() -> None:
     path = plan_local([(10.0, 0.0)], (0.0, 0.0), (20.0, 0.0), CFG, corridor)
     assert path is not None
     assert _min_dist(path, [(10.0, 0.0)]) >= CFG.hard_m - 1e-6
+
+
+def test_prediction_flies_the_setpoints_already_in_flight() -> None:
+    """🔴 PX4 acts on a velocity setpoint ~0.3 s after it is sent (measured,
+    px4_profile.OFFBOARD_*). A GPS-denied SITL flight carried 2 m/s east for half a
+    second after the command turned north and hit a trunk the prediction — which
+    assumed the new command took effect at once — had passed as clear."""
+    path = [(0.0, 0.5 * k) for k in range(40)]  # the new plan: due north
+    trunk = [(1.2, 0.9)]  # just east of it
+
+    def gap(issued: tuple[float, float]) -> float:
+        p = LocalPlanner()
+        p._now = 1.0
+        p._issued = [(0.7 + 0.1 * k, *issued) for k in range(4)]
+        return p._predict_gap((0.0, 0.0), (2.0, 0.0), path, 1.0, trunk)
+
+    still_east = gap((2.0, 0.0))  # the last 0.3 s of setpoints said east
+    already_north = gap((0.0, 1.0))
+    assert still_east < already_north - 0.1
+
+
+def test_slow_means_tight_the_lookahead_scales_with_speed() -> None:
+    """🔴 A fixed 2.5 m pursuit chord cuts inside a bend by the same amount at any
+    speed, so near a trunk no candidate was predicted clear and the aircraft sat
+    still for 700 s (800/ha). Creeping must track the path closely."""
+    p = LocalPlanner()
+    assert p._pursuit(0.4) == pytest.approx(CFG.min_pursuit_m)
+    assert p._pursuit(1.5) == pytest.approx(1.8)
+    assert p._pursuit(6.0) == pytest.approx(CFG.pursuit_m)
+    # Creeping round a corner with a trunk just inside it: the old fixed chord cut
+    # the corner into contact; the scaled one follows the path and clears.
+    from dataclasses import replace
+
+    path = [(0.5 * k, 0.0) for k in range(9)] + [(4.0, 0.5 * k) for k in range(1, 20)]
+    trunk = [(3.3, 0.8)]
+    fixed = LocalPlanner(config=replace(CFG, min_pursuit_m=CFG.pursuit_m))
+    assert fixed._predict_gap((3.0, 0.0), (0.4, 0.0), path, 0.4, trunk) < 0.0
+    assert p._predict_gap((3.0, 0.0), (0.4, 0.0), path, 0.4, trunk) > 0.0
+
+
+def test_momentum_caps_speed_toward_a_trunk_not_beside_one() -> None:
+    """🔴 fix3/fix4 (SITL): 2.9 m/s straight at a trunk from 1.6 m, when the
+    measured response needs ~2 m to stop."""
+    p = LocalPlanner()
+    p.memory.add(2.2, 0.0)
+    ahead = p._momentum_speed((0.0, 0.0), (2.9, 0.0))
+    stop_room = 2.2 - CFG.contact_m - CFG.hard_margin_m
+    assert p._stop_distance(ahead) == pytest.approx(stop_room, abs=1e-3)
+    assert ahead < 2.0  # must shed most of the 2.9 m/s it carries
+    beside = p._momentum_speed((0.0, 0.0), (0.0, 2.9))  # flying past it
+    assert beside == pytest.approx(CFG.cruise_speed_ms)
+
+
+def test_stopping_from_speed_includes_saturated_braking() -> None:
+    """🔴 From 5 m/s the measured response needs ~6 m, not v*(delay+tau)=3.5 m:
+    braking saturates at 3 m/s^2 above a*tau = 1.2 m/s. The 5 m/s MVP flight in
+    SITL touched a trunk the linear formula had cleared from 3.8 m."""
+    p = LocalPlanner()
+    assert p._stop_distance(1.0) == pytest.approx(1.0 * (0.3 + 0.4))  # below the knee
+    assert 5.5 < p._stop_distance(5.0) < 6.5
+    p.memory.add(4.4, 0.0)  # 3.8 m of air ahead
+    assert p._momentum_speed((0.0, 0.0), (5.0, 0.0)) < 4.0
+
+
+def test_the_feasibility_candidates_are_kept_for_the_flight_record() -> None:
+    """fly-local logs them so a SITL contact can be replayed exactly."""
+    field = ObstacleField(trunks=(Trunk(6.0, 0.8, 0.15),))
+    p = LocalPlanner()
+    p.observe(
+        sense(field, 0, 0, 0, math.radians(90), 91, 30), 0.0, 0.0, 0.0, velocity=(2.0, 0.0), t_s=0.0
+    )
+    p.command(0.0, 0.0, (22.0, 0.0), 0.0, velocity=(2.0, 0.0))
+    assert p.last_candidates
+    assert all(len(c) == 2 for c in p.last_candidates)

@@ -599,7 +599,7 @@ droneflight px4-params --file configs/px4/gps_denied_ekf2.params \
 Paste its output into pxh — it ends with `param save` — then `reboot`:
 
 ```
-param set EKF2_EV_CTRL 11
+param set EKF2_EV_CTRL 15      # 15 since 2026-09-24: also fuse the VIO velocity the bridge now sends
 param set EKF2_GPS_CTRL 0
 param set EKF2_HGT_REF 3
 param set EKF2_EV_DELAY 50.0
@@ -1690,7 +1690,7 @@ GPS-denied adds, before flying (params from §3b.2 plus the 8 s no-aiding timeou
 of §3f, then restart SITL; `mavlink start` after EVERY restart):
 
 ```
-param set EKF2_EV_CTRL 11
+param set EKF2_EV_CTRL 15      # 15 since 2026-09-24: also fuse the VIO velocity the bridge now sends
 param set EKF2_GPS_CTRL 0
 param set EKF2_HGT_REF 3
 param set EKF2_EV_DELAY 50.0
@@ -1787,6 +1787,55 @@ clone), launch helpers in `~/launch_sitl.sh`, `~/launch_ev.sh`, `~/launch_fly.sh
 `~/stop_df.sh`; worlds `forest_mvp`, `forest_mvp400`, `forest_mvp400n` in PX4's
 worlds dir; plans `mvp.plan`, `mvp400.plan`, `mvp400_forest.plan`.
 
+**Flight 4 — TETHER ON, GPS-aided, ✅ CLEAN (2026-09-24, `sim-logs/mvp_local/tether1_07_11_36.ulg`
++ `tether1.csv` + `tether1.jsonl`).** The user's check that full-speed flight is
+within the fiber budget. Same plan as flight 1 (the VM's `mvp.plan` predates the
+corridor block, so no corridor bound). SITL with the plugin:
+
+```bash
+# VM — as ~/launch_sitl.sh, but tether ON and logging (~/launch_sitl_tether.sh)
+~/launch_sitl_tether.sh ~/drone/plans/mvp.plan forest_mvp ~/logs/mvp/sitl-tether.log ~/logs/mvp/tether1.csv
+head -2 ~/logs/mvp/tether1.csv        # two '#' lines = plugin loaded (trap: a missing plugin is silent)
+~/launch_fly.sh tether1 --truth gazebo
+```
+
+`b2-score` 0 strikes / 0 ground impacts / **+1.282 m**; `tether-plugin-check` EXACT;
+applied tension peak **0.776 N (39 % of 2 N)** on the open legs at 6.1 m/s, forest
+turn transient peak 0.28 N. ⚠️ Copying the CSV while Gazebo still runs leaves a
+partial last line — `tether-plugin-check` rejects it; stop SITL first or drop it.
+
+**Flights fix1-fix5 — the planner-dynamics series (2026-09-24,
+`sim-logs/mvp_local/fix*`).** Detail and the table: `CLAUDE.md` → ONBOARD LOCAL
+PLANNER, "the loop found four more defects". fix1 GPS-aided clean (+0.69 m);
+fix2/fix3/fix4 GPS-denied each touched a trunk; **fix5 GPS-denied CLEAN, +0.676 m,
+18.6 min** with the momentum limit. Procedure is the GPS-denied one above, with
+the params saved once (`cat ~/px4_gps_denied.txt >> /tmp/pxcmds`, restart), then
+per run: `~/launch_sitl.sh …` (or `launch_sitl_tether.sh` for the plugin),
+`mavlink start …` into `/tmp/pxcmds`, `~/launch_ev.sh <tag>`, `~/launch_fly.sh <tag>
+--truth gazebo`. 🔑 **The EV noise is seeded, so a trouble spot recurs** (fix3 and
+fix4 hit the same trunk at waypoint 44, 163 s in) — A/B a change by flying to
+~waypoint 55 and stopping, ~5 min per arm.
+⚠️ **Replaying a record through the planner is approximate** (it diverged from
+the flown commands within seconds); use it for what the map held, not for exact
+candidate values.
+⚠️ **Do not run offline sweeps on the Mac during a flight you will score** — the
+VM shares its CPU; at RTF 0.4 MAVSDK's callback queue backs up. It did not cause
+the contacts here, but it did kill the EV bridge in fix2.
+
+**The GPS-denied seed sweep (2026-09-24, `s3*`, `s4*`, `s2f`, `q2f`).** One
+script does a whole run on the VM, SITL to landing:
+
+```bash
+# VM — tag, plan, world, trunks, EV seed, EV fidelity seed
+~/fly_case.sh s3g ~/drone/plans/mvp3ms.plan forest_mvp ~/drone/plans/forest_mvp_trunks.csv 6 7
+```
+
+(`~/launch_ev_seed.sh <tag> <seed> <fseed> [extra ev-bridge args]` is the bridge
+half.) The bridge now defaults to `--fix-ramp 30` and `--publish-velocity`.
+🔑 **One run is one noise draw — sweep seeds before trusting a speed.** At 3 m/s
+seeds 0/1, 2/3 and 6/7 flew clean and 4/5 grazed twice; the planner anchors on
+2 m/s because of that one set. Results table: `CLAUDE.md` → ONBOARD LOCAL PLANNER.
+
 #### Traps
 1. 🐛 **`pkill -f "gz sim"` inside `ssh '...'` kills the ssh session itself** — the
    remote `bash -c` command line contains the pattern. Launch from a script file
@@ -1816,6 +1865,8 @@ worlds dir; plans `mvp.plan`, `mvp400.plan`, `mvp400_forest.plan`.
    `gz topic -e -t /world/<w>/stats -n 1 | grep real_time_factor` before flying**;
    ~1560 trunks ran at 1.04×, ~3100 at 0.4×. Narrow the band (`--forest-band 15`)
    rather than fly a world the VM cannot run in real time.
+
+
 
 ### 4.13 ✅🌲 STEM-ROUTED — through 2500 trunks with **0 STRIKES**, 2026-09-14
 

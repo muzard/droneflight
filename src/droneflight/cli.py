@@ -179,7 +179,7 @@ def _tether_check(args: argparse.Namespace) -> int:
     closely with the prior on — acceptance §3 measured that null in flight.
     """
     from droneflight.speed_policy import SpeedPolicy
-    from droneflight.tether import TetherConfig, analyse_tether
+    from droneflight.tether import TetherConfig, analyse_tether, speed_ceiling_ms
 
     try:
         mission = load_qgc_plan(args.plan)
@@ -203,7 +203,7 @@ def _tether_check(args: argparse.Namespace) -> int:
         f"{config.back_tension_n:.1f} N, cruise {mission.cruise_speed_ms:.1f} m/s"
         f"{'' if prior else '  [PX4 corner prior OFF — uncalibrated]'}"
     )
-    for label, rep in (("no policy (flat cruise)", no_policy), ("speed policy", with_policy)):
+    for label, rep in (("no policy (plan speeds)", no_policy), ("speed policy", with_policy)):
         peak = rep.peak
         assert peak is not None  # a loaded mission always has >=1 waypoint
         verdict = (
@@ -225,6 +225,14 @@ def _tether_check(args: argparse.Namespace) -> int:
             "  → both arms survive: PX4 decelerates into corners on its own, so the "
             "policy is not what keeps the fiber intact here (acceptance §3, sim-logs/4.7)."
         )
+    fastest = max(mission.leg_speed_ms(i) for i in range(len(mission.waypoints)))
+    warn = speed_ceiling_ms(args.agl, config, config.warn_fraction)
+    snap = speed_ceiling_ms(args.agl, config)
+    print(
+        f"  straight-leg ceiling at {args.agl:.0f} m AGL if the span free-falls "
+        f"(drag ~v^3): warn {warn:.1f} m/s, break {snap:.1f} m/s — plan's fastest leg "
+        f"{fastest:.1f} m/s{'  ⚠️ ABOVE WARN' if fastest > warn else ''}"
+    )
     return 0 if with_policy.within_limit else 1
 
 
@@ -724,6 +732,7 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
         corridor_tolerance_m=args.corridor,
         timestamp_mode=args.timestamp,
         max_duration_s=args.duration,
+        publish_velocity=getattr(args, "publish_velocity", True),
     )
     try:
         with contextlib.ExitStack() as stack:
@@ -1133,6 +1142,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Reproduces pre-2026-07-26 numbers; over-predicts the flown corner load 7-18x."
         ),
     )
+    t.add_argument(
+        "--agl",
+        type=float,
+        default=12.0,
+        help="Height the fiber falls from on open legs, for the speed ceiling (m).",
+    )
     t.set_defaults(func=_tether_check)
 
     tp = sub.add_parser(
@@ -1200,9 +1215,19 @@ def build_parser() -> argparse.ArgumentParser:
     eb.add_argument(
         "--fix-ramp",
         type=float,
-        default=10.0,
+        default=30.0,
         help="Metres over which an accepted fix is bled into the published pose "
-        "(0 = instant, which EKF2 rejects as an outlier).",
+        "(0 = instant, which EKF2 rejects as an outlier). 30 since 2026-09-24: at "
+        "10 m a 4-5 m fix moved the estimate at ~1.4 m/s, EKF2's velocity took up "
+        "part of it, and GPS-denied local-planner flights grazed trunks (s3b); "
+        "the same seeds at 30 m flew clean with the same nav error (s3c).",
+    )
+    eb.add_argument(
+        "--publish-velocity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also send the VIO velocity (VISION_SPEED_ESTIMATE); set EKF2_EV_CTRL 15 "
+        "to fuse it. Without it a VTRN fix drags EKF2's velocity estimate.",
     )
     eb.add_argument("--forest-frac", type=float, default=0.4)
     eb.add_argument("--stale-frac", type=float, default=0.1)

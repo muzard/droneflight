@@ -536,7 +536,7 @@ def test_tether_check_reports_policy_validation(
     out = capsys.readouterr().out
     assert rc in (0, 1)
     assert "tether v0" in out
-    assert "no policy (flat cruise)" in out
+    assert "no policy (plan speeds)" in out
     assert "speed policy" in out
 
 

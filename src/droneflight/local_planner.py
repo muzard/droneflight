@@ -67,6 +67,7 @@ import math
 from dataclasses import dataclass, field
 
 from droneflight.perception import DepthScan
+from droneflight.px4_profile import OFFBOARD_DELAY_S, OFFBOARD_TAU_S
 
 Point = tuple[float, float]
 
@@ -147,7 +148,14 @@ class LocalPlannerConfig:
     at the preferred gap."""
 
     pursuit_m: float = 2.5
-    """Pure-pursuit lookahead along the local path."""
+    """Pure-pursuit lookahead along the local path — the ceiling; see ``pursuit_s``."""
+
+    pursuit_s: float = 1.2
+    min_pursuit_m: float = 0.8
+    """Lookahead scales with speed (``pursuit_s`` of travel, floored here). A fixed
+    2.5 m chord cuts inside every bend by the same amount at any speed, so near a
+    trunk no speed was predicted clear and the aircraft stopped for good (800/ha:
+    stationary for 700 s with a path 0.18 m clear). Slow now also means tight."""
 
     speed_rise_ms2: float = 1.5
     """How fast the commanded speed may rise. Falls are unlimited."""
@@ -170,12 +178,18 @@ class LocalPlannerConfig:
     max_accel_ms2: float = 3.0
     """PX4 ``MPC_ACC_HOR`` — the envelope the feasibility check flies candidates in."""
 
-    max_jerk_ms3: float = 4.0
-    """PX4 ``MPC_JERK_AUTO``."""
+    response_delay_s: float = OFFBOARD_DELAY_S
+    response_tau_s: float = OFFBOARD_TAU_S
+    """How the airframe answers a velocity setpoint — dead time, then a first-order
+    lag, saturating at ``max_accel_ms2``. Measured from the SITL records
+    (``px4_profile.OFFBOARD_*``); the feasibility check flies candidates in it."""
 
     predict_s: float = 2.5
-    predict_margin_m: float = 0.15
-    """Smallest predicted air gap a (path, speed) candidate may have."""
+    predict_margin_m: float = 0.30
+    """Smallest predicted air gap a (path, speed) candidate may have. It must cover
+    the prediction's own error: the measured response model is 0.18 m out at p95
+    one second ahead, and at the old 0.15 a GPS-denied SITL flight accepted
+    predictions of 0.22-0.44 m on the way into a trunk it then hit."""
 
     seen_cell_m: float = 0.6
     """Resolution of the observed-free-space grid behind the sight-distance limit."""
@@ -762,6 +776,13 @@ class LocalPlanner:
     """Times no candidate cleared the predicted-pass margin (the least-bad was flown)."""
     _last_speed: float = 0.0
     _last_cmd_t: float | None = None
+    _now: float = 0.0
+    last_candidates: list[tuple[float, float]] = field(default_factory=list)
+    """``(speed, predicted air gap)`` of every candidate the last feasibility check
+    scored — logged by ``fly-local`` so a SITL contact can be replayed exactly."""
+    _issued: list[tuple[float, float, float]] = field(default_factory=list)
+    """``(t, vx, vy)`` setpoints already sent: the airframe is still acting on the
+    last ``response_delay_s`` of them whatever is decided now."""
 
     def __post_init__(self) -> None:
         if self.seen is None:
@@ -875,6 +896,26 @@ class LocalPlanner:
         the local planner may fly slower than but never faster.
         """
         cfg = self.config
+        self._now = t_s
+        cmd = self._command(x, y, goal, t_s, added, velocity, max_speed_ms, corridor)
+        self._issued.append((t_s, cmd.vx, cmd.vy))
+        horizon = t_s - cfg.response_delay_s - 0.5
+        while self._issued and self._issued[0][0] < horizon:
+            self._issued.pop(0)
+        return cmd
+
+    def _command(
+        self,
+        x: float,
+        y: float,
+        goal: Point,
+        t_s: float,
+        added: list[Point] | None,
+        velocity: Point | None,
+        max_speed_ms: float | None,
+        corridor: Corridor | None,
+    ) -> PlannerCommand:
+        cfg = self.config
         replanned = False
         if (
             self.path is None
@@ -909,6 +950,7 @@ class LocalPlanner:
             "brake": self._brake_speed(path),
             "sight": self._sight_speed(path),
             "gap": self._gap_speed(gap),
+            "momentum": self._momentum_speed((x, y), velocity),
         }
         if max_speed_ms is not None:
             limits["mission"] = max_speed_ms
@@ -933,7 +975,7 @@ class LocalPlanner:
             if path is None or len(path) < 2:
                 return PlannerCommand(0.0, 0.0, 0.0, True, 0.0, replanned, "blocked")
             self._path_k = _nearest_index(path, (x, y), 0)
-            target, _ = _point_along(path, self._path_k, cfg.pursuit_m)
+            target, _ = _point_along(path, self._path_k, self._pursuit(speed))
             dx, dy = target[0] - x, target[1] - y
             norm = math.hypot(dx, dy) or 1.0
         self._last_speed, self._last_cmd_t = speed, t_s
@@ -943,6 +985,17 @@ class LocalPlanner:
 
     # -- dynamic feasibility --------------------------------------------------------
 
+    def _pursuit(self, speed: float) -> float:
+        cfg = self.config
+        return min(cfg.pursuit_m, max(cfg.min_pursuit_m, cfg.pursuit_s * speed))
+
+    def _issued_at(self, t: float, default: Point) -> Point:
+        """The setpoint in force at time ``t`` (the last one sent at or before it)."""
+        for ts, vx, vy in reversed(self._issued):
+            if ts <= t:
+                return (vx, vy)
+        return default
+
     def _feasible_speed(self, pos: Point, velocity: Point, speed: float) -> float:
         """Pick a (path, speed) the airframe can actually fly without a close pass.
 
@@ -951,8 +1004,8 @@ class LocalPlanner:
         turned the path 70 deg about a metre from the trunk, and a jerk-limited
         airframe needs ~0.75 s just to *build* lateral acceleration — so it went
         straight on. A path being clear is not the same as the aircraft being
-        able to follow it. So each candidate is flown forward ``predict_s`` under
-        PX4's accel/jerk limits (the envelope `maneuver` and `reactive` use) and
+        able to follow it. So each candidate is flown forward ``predict_s`` through
+        the measured offboard response (dead time + lag, ``px4_profile``) and
         scored by the closest predicted pass. Candidates, in order of preference:
         the new path at the chosen speed, then slower; the previous path; a stop.
         """
@@ -964,15 +1017,46 @@ class LocalPlanner:
             return speed
         candidates: list[tuple[list[Point] | None, float]] = []
         if self.path is not None:
-            candidates += [(self.path, speed), (self.path, speed * 0.6), (self.path, speed * 0.3)]
+            creep = min(speed, cfg.min_speed_ms * 0.5)
+            candidates += [
+                (self.path, speed),
+                (self.path, speed * 0.6),
+                (self.path, speed * 0.3),
+                (self.path, creep),
+            ]
+            # 🔴 Steer, don't brake: when every slower candidate fails, try keeping
+            # the speed the airframe already has. Braking and turning share
+            # MPC_ACC_HOR, so a hard stop in a curve slides the aircraft off its
+            # path — SITL r3e (2026-09-24): the momentum limit braked 3 -> 0.8
+            # m/s mid-curve round a trunk the path cleared by 1.0 m, and the
+            # aircraft slid 0.72 m off the path into it. Only slower candidates
+            # were on offer, and all of them predicted contact.
+            current = math.hypot(*velocity)
+            if current > speed + 0.1:
+                candidates.append((self.path, current))
         if self._prev_path is not None and self._prev_path is not self.path:
             candidates += [(self._prev_path, speed * 0.6), (self._prev_path, speed * 0.3)]
         candidates.append((self.path, 0.0))
         best: tuple[float, list[Point] | None, float] | None = None
+        self.last_candidates = []
         for path, v in candidates:
             if path is None:
                 continue
             gap = self._predict_gap(pos, velocity, path, v, near)
+            if v > 0.0 and gap >= cfg.predict_margin_m:
+                # 🔴 ...and after one replan period of it, a stop must still be
+                # clean. Each replan in fix3 (SITL, 2026-09-24) nudged the path
+                # 0.1-0.15 m closer to a trunk while the aircraft built momentum
+                # toward it; every prediction passed, and by the first that did
+                # not, stopping took more room than was left. This keeps the
+                # aircraft out of states from which no command avoids contact.
+                gap = min(
+                    gap,
+                    self._predict_gap(
+                        pos, velocity, path, v, near, stop_after_s=cfg.replan_period_s
+                    ),
+                )
+            self.last_candidates.append((v, gap))
             if gap >= cfg.predict_margin_m:
                 if path is not self.path:
                     self.reverts += 1
@@ -986,24 +1070,45 @@ class LocalPlanner:
         return best[2]
 
     def _predict_gap(
-        self, pos: Point, velocity: Point, path: list[Point], speed: float, near: list[Point]
+        self,
+        pos: Point,
+        velocity: Point,
+        path: list[Point],
+        speed: float,
+        near: list[Point],
+        *,
+        stop_after_s: float | None = None,
     ) -> float:
+        """Closest predicted air gap flying ``path`` at ``speed`` for ``predict_s``
+        — or, with ``stop_after_s``, flying it that long and then commanding a stop."""
         cfg = self.config
         dt = 0.1
         px, py = pos
         vx, vy = velocity
-        ax = ay = 0.0
+        # 🔴 The airframe is still flying the setpoints of the last
+        # ``response_delay_s`` — whatever is decided now lands after them. The
+        # jerk-limited model this replaced predicted SITL 1 s ahead to 0.40 m (p95);
+        # a GPS-denied flight hit a trunk the prediction had passed as clear while
+        # the aircraft carried 2 m/s east for 0.5 s after the command turned north.
         k = _nearest_index(path, pos, 0)
         worst = math.inf
-        for _ in range(int(cfg.predict_s / dt)):
-            k = _nearest_index(path, (px, py), k)
-            tgt, _ = _point_along(path, k, cfg.pursuit_m)
-            ex, ey = tgt[0] - px, tgt[1] - py
-            en = math.hypot(ex, ey)
-            wx, wy = (ex / en * speed, ey / en * speed) if en > 1e-6 and speed > 0 else (0.0, 0.0)
-            adx, ady = _clamp((wx - vx) / dt, (wy - vy) / dt, cfg.max_accel_ms2)
-            jx, jy = _clamp(adx - ax, ady - ay, cfg.max_jerk_ms3 * dt)
-            ax, ay = ax + jx, ay + jy
+        for step in range(int(cfg.predict_s / dt)):
+            tt = step * dt
+            if tt < cfg.response_delay_s:
+                wx, wy = self._issued_at(self._now - cfg.response_delay_s + tt, velocity)
+            elif stop_after_s is not None and tt >= cfg.response_delay_s + stop_after_s:
+                wx, wy = 0.0, 0.0
+            else:
+                k = _nearest_index(path, (px, py), k)
+                tgt, _ = _point_along(path, k, self._pursuit(speed))
+                ex, ey = tgt[0] - px, tgt[1] - py
+                en = math.hypot(ex, ey)
+                wx, wy = (
+                    (ex / en * speed, ey / en * speed) if en > 1e-6 and speed > 0 else (0.0, 0.0)
+                )
+            ax, ay = _clamp(
+                (wx - vx) / cfg.response_tau_s, (wy - vy) / cfg.response_tau_s, cfg.max_accel_ms2
+            )
             vx, vy = vx + ax * dt, vy + ay * dt
             px, py = px + vx * dt, py + vy * dt
             for qx, qy in near:
@@ -1079,6 +1184,68 @@ class LocalPlanner:
                     if tail is not None:
                         return _densify([pos, ahead], 0.5) + tail[1:]
         return plan_local(pts, pos, goal, cfg, corridor)
+
+    def _momentum_speed(self, pos: Point, velocity: Point | None) -> float:
+        """Never carry more speed at a trunk than the airframe can shed before it.
+
+        Along the CURRENT velocity — where momentum takes the aircraft whatever is
+        commanded — find the first remembered trunk the airframe would touch, and
+        cap speed so the measured response (dead time, saturated braking, lag)
+        stops it with ``hard_margin_m`` to spare (:meth:`_stop_distance`).
+        Passing beside a trunk does not bind it; heading at one does.
+
+        🔴 fix3 and fix4 (GPS-denied SITL, 2026-09-24) both touched the same trunk:
+        2.9 m/s straight at it from 1.6 m, when stopping takes ~2 m, while each
+        replan's path still went round it. The planner reversed the path at the
+        last moment and the airframe, 0.7 s behind its setpoints, went on.
+        """
+        cfg = self.config
+        if velocity is None:
+            return cfg.cruise_speed_ms
+        speed = math.hypot(*velocity)
+        if speed < 0.3:
+            return cfg.cruise_speed_ms
+        ux, uy = velocity[0] / speed, velocity[1] / speed
+        horizon = cfg.cruise_speed_ms * (cfg.response_delay_s + cfg.response_tau_s) + cfg.hard_m
+        room = math.inf
+        for px, py in self.memory.points():
+            dx, dy = px - pos[0], py - pos[1]
+            along = dx * ux + dy * uy
+            if along <= 0.0 or along > horizon:
+                continue
+            lateral = abs(dx * uy - dy * ux)
+            if lateral >= cfg.contact_m:
+                continue
+            room = min(room, along - math.sqrt(cfg.contact_m**2 - lateral**2))
+        if room == math.inf:
+            return cfg.cruise_speed_ms
+        budget = room - cfg.hard_margin_m
+        if budget <= 0.0:
+            return 0.0
+        # Largest v whose stop fits the budget (stop distance is monotone in v).
+        lo, hi = 0.0, cfg.cruise_speed_ms
+        if self._stop_distance(hi) <= budget:
+            return hi
+        for _ in range(30):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if self._stop_distance(mid) <= budget else (lo, mid)
+        return lo
+
+    def _stop_distance(self, v: float) -> float:
+        """Distance to stop from ``v`` through the measured response: the dead time
+        at full speed, then braking saturated at ``max_accel_ms2`` down to the
+        speed where the lag stops saturating (``a * tau``), then the lag's tail.
+
+        🔴 The first version used ``v * (delay + tau)`` — right at 3 m/s, but it
+        ignores saturation and says 3.5 m from 5 m/s where the airframe needs
+        ~6 m. The 5 m/s MVP flight (SITL, 2026-09-24) touched a trunk the limit
+        had cleared from 3.8 m away.
+        """
+        cfg = self.config
+        a, tau = cfg.max_accel_ms2, cfg.response_tau_s
+        knee = a * tau
+        tail = v * tau if v <= knee else (v * v - knee * knee) / (2.0 * a) + knee * tau
+        return v * cfg.response_delay_s + tail
 
     def _alignment_speed(self, direction: Point, velocity: Point | None) -> float:
         """Slow while the velocity is swinging onto the path.

@@ -34,6 +34,7 @@ collision cannot be compared against a flight that had 37.
 
 from __future__ import annotations
 
+import collections
 import itertools
 import math
 import random
@@ -45,6 +46,7 @@ from droneflight.maneuver import ManeuverLimits
 from droneflight.model import FlightMission
 from droneflight.nav import DriftConfig, VtrnConfig
 from droneflight.perception import ObstacleField, sense
+from droneflight.px4_profile import OFFBOARD_DELAY_S, OFFBOARD_TAU_S
 
 _EARTH_R = 6_371_000.0
 
@@ -449,6 +451,8 @@ def fly_with_local_planner(
     max_time_s: float = 7200.0,
     fix_ramp_m: float = 0.0,
     use_corridor: bool = True,
+    plant_seed: int | None = None,
+    control_hz: float = 10.0,
 ) -> LocalFlightResult:
     """Fly ``mission`` through ``obstacles`` with the onboard local planner.
 
@@ -465,7 +469,7 @@ def fly_with_local_planner(
     * ``start_m``/``stop_m`` fly only a slice of the route, because only the
       concealed opening is in the forest;
     * ``fix_ramp_m`` bleeds each VTRN fix in over that many metres of travel, as
-      the live EV bridge does (``ev-bridge --fix-ramp``, default 10 m). 0 = an
+      the live EV bridge does (``ev-bridge --fix-ramp``, default 30 m since 2026-09-24). 0 = an
       instantaneous jump — which is what hid the "clear observed space on every
       correction" defect offline until SITL found it.
     """
@@ -504,6 +508,18 @@ def fly_with_local_planner(
     path = [pos]
     vel = (0.0, 0.0)
     acc = (0.0, 0.0)
+    # The airframe's response. ``plant_seed`` draws it from inside the fit's
+    # uncertainty (px4_profile.OFFBOARD_*) so the planner's own prediction — which
+    # assumes the nominal values — is never exactly right, as in the loop. With a
+    # perfect match the harness could not show a prediction-error strike at all.
+    delay_s, tau_s = OFFBOARD_DELAY_S, OFFBOARD_TAU_S
+    if plant_seed is not None:
+        prng = random.Random(plant_seed)
+        delay_s, tau_s = prng.uniform(0.2, 0.4), prng.uniform(0.3, 0.55)
+    # Setpoints sent but not yet acted on; the aircraft starts at rest.
+    in_flight: collections.deque[tuple[float, float]] = collections.deque(
+        [(0.0, 0.0)] * max(0, round(delay_s / dt))
+    )
     strikes = 0
     min_gap = math.inf
     max_xt = 0.0
@@ -515,22 +531,31 @@ def fly_with_local_planner(
     goal = route[-1]
     events: list[StrikeEvent] = []
 
+    # The live executor runs at ~10 Hz and holds each setpoint in between; at the
+    # harness's 20 Hz step the planner used to react twice as often as it can.
+    control_every = max(1, round(1.0 / (control_hz * dt))) if control_hz > 0 else 1
+    step_n = 0
+    cmd: PlannerCommand | None = None
     while t < max_time_s:
         t += dt
         est = (pos[0] + err_x, pos[1] + err_y)
-        scan = sense(obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m)
-        added = planner.observe(scan, est[0], est[1], heading, velocity=vel, t_s=t)
         carrot = guidance.advance(*est)
-        cmd = planner.command(
-            est[0],
-            est[1],
-            (carrot.east_m, carrot.north_m),
-            t,
-            added,
-            velocity=vel,
-            max_speed_ms=leg_speeds[min(guidance.index, len(leg_speeds) - 1)],
-            corridor=corridor,
-        )
+        if cmd is None or step_n % control_every == 0:
+            scan = sense(
+                obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m
+            )
+            added = planner.observe(scan, est[0], est[1], heading, velocity=vel, t_s=t)
+            cmd = planner.command(
+                est[0],
+                est[1],
+                (carrot.east_m, carrot.north_m),
+                t,
+                added,
+                velocity=vel,
+                max_speed_ms=leg_speeds[min(guidance.index, len(leg_speeds) - 1)],
+                corridor=corridor,
+            )
+        step_n += 1
         if cmd.blocked:
             blocked_s += dt
             want = (0.0, 0.0)
@@ -542,11 +567,16 @@ def fly_with_local_planner(
         # The sensor looks where the aircraft is going (yaw follows the command).
         heading = _wrap(heading + max(-max_turn, min(max_turn, _wrap(desired - heading))))
 
-        a_des = _clamp_norm(
-            ((want[0] - vel[0]) / dt, (want[1] - vel[1]) / dt), config.limits.max_accel_ms2
+        # The measured OFFBOARD response (px4_profile): the setpoint takes effect
+        # after a dead time, then through a first-order lag. Not the AUTO-mode
+        # jerk-limited generator `fly_through_forest` uses — offboard velocity
+        # setpoints bypass it, and that model mispredicted SITL 1 s ahead by 0.4 m.
+        in_flight.append(want)
+        applied = in_flight.popleft()
+        acc = _clamp_norm(
+            ((applied[0] - vel[0]) / tau_s, (applied[1] - vel[1]) / tau_s),
+            config.limits.max_accel_ms2,
         )
-        d_acc = _clamp_norm((a_des[0] - acc[0], a_des[1] - acc[1]), config.limits.max_jerk_ms3 * dt)
-        acc = (acc[0] + d_acc[0], acc[1] + d_acc[1])
         vel = (vel[0] + acc[0] * dt, vel[1] + acc[1] * dt)
         prev = pos
         pos = (pos[0] + vel[0] * dt, pos[1] + vel[1] * dt)

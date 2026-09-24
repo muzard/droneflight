@@ -402,6 +402,20 @@ async def fly_local(
                             if true_pose
                             else None,
                             "mem": len(planner.memory),
+                            # What the planner believed, so a contact replays
+                            # exactly (replaying inputs diverged within seconds).
+                            "path": [
+                                [round(px, 2), round(py, 2)]
+                                for px, py in (planner.path or [])[:30:2]
+                            ],
+                            "cands": [
+                                [round(cv, 2), round(cg, 3)] for cv, cg in planner.last_candidates
+                            ],
+                            "mem_near": [
+                                [round(mx, 2), round(my, 2)]
+                                for mx, my in planner.memory.points()
+                                if abs(mx - east) < 5.0 and abs(my - north) < 5.0
+                            ][:40],
                         }
                     )
                     + "\n"
