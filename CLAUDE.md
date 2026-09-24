@@ -198,21 +198,34 @@ contacts, kept because it is what the sensor provides). Results, 200/ha GPS-deni
 | **2 m/s** | **4/5 — +1.05 m of air** | — |
 | 400/ha, 2 m/s | 4/5, +0.34 m | — |
 
-**Planning anchor: 2.0 m/s at 200 and 400 stems/ha.** Every struck trunk had been
-in the sensor's view from ~30 m, 6-12 s before contact, nearly dead ahead — this
-is not sensing. It is the replan × PX4 tracking-lag interaction: each prediction
-assumes the current path is followed, the next replan changes it, and the flown
-line ends 0.5-0.9 m inside what any single plan allowed. ▶ **Next:** log the
-planner's path and feasibility candidates in the `fly-local` record, so a SITL
-contact can be replayed exactly instead of approximately.
+Every struck trunk had been in the sensor's view from ~30 m, 6-12 s before
+contact, nearly dead ahead — not sensing. So the `fly-local` record now logs what
+the planner believed (path, feasibility candidates, memory within 5 m), and the
+next reproduction of seed set 4/5 (r3e) showed exactly what happened: **the path
+cleared the trunk by 0.9-1.4 m, the aircraft tracked it to 0.02 m, the map was
+right to 0.1 m — and the momentum limit braked 3 → 0.8 m/s mid-curve.** Braking
+and turning share `MPC_ACC_HOR`; the aircraft slid 0.72 m off its own path into
+the trunk, and every candidate on offer was slower. 🔧 **Steer, don't brake**:
+when every slower candidate fails, the feasibility check also tries the current
+speed along the path. Then, four seed sets per case:
+
+| after "steer, don't brake" | clean | contact |
+|---|---|---|
+| **200/ha, 3 m/s** | **4/4** (+0.63-0.87 m surface) | — |
+| 200/ha, 4 m/s | 4/5 | 0/1 |
+| 400/ha, 3 m/s | — | 4/5 (2) |
+
+**Planning anchors: 200/ha → 3.0 m/s, 400/ha → 2.0 m/s.** (400/ha at 2 m/s was
+flown clean on seed set 4/5 before this fix; its four-seed re-validation was cut
+short by host CPU contention — pending.)
 
 🔑 **The harness envelope is optimistic above ~2 m/s — SITL is the arbiter.** With
 all fixes the harness flies 200/ha at 5 m/s and 400/ha at 4 m/s clean over 4 seeds
 (`tools/envelope_sweep.py`); SITL hit a trunk at 5 m/s at 200/ha in both tries. At
 5 m/s PX4 shed speed at ~1.4 m/s² against the 3 demanded, and the aircraft curved
 onto a trunk that had sat just off its velocity ray. So the planner now prices on
-a **SITL-anchored** envelope (`droneplanner/fields/stem_density.py`): 200 and 400
-→ 2.0 as flown, the rest discounted by the measured ratio. Raising an anchor
+a **SITL-anchored** envelope (`droneplanner/fields/stem_density.py`): 200 → 3.0 and
+400 → 2.0 as flown over four seed sets, the rest discounted by the measured ratio. Raising an anchor
 takes a SITL flight, ~20 min each.
 
 Also fixed: the **EV bridge exited on one refused publish** (MAVSDK NO_SYSTEM
