@@ -599,7 +599,7 @@ droneflight px4-params --file configs/px4/gps_denied_ekf2.params \
 Paste its output into pxh — it ends with `param save` — then `reboot`:
 
 ```
-param set EKF2_EV_CTRL 11
+param set EKF2_EV_CTRL 15      # 15 since 2026-09-24: also fuse the VIO velocity the bridge now sends
 param set EKF2_GPS_CTRL 0
 param set EKF2_HGT_REF 3
 param set EKF2_EV_DELAY 50.0
@@ -1690,7 +1690,7 @@ GPS-denied adds, before flying (params from §3b.2 plus the 8 s no-aiding timeou
 of §3f, then restart SITL; `mavlink start` after EVERY restart):
 
 ```
-param set EKF2_EV_CTRL 11
+param set EKF2_EV_CTRL 15      # 15 since 2026-09-24: also fuse the VIO velocity the bridge now sends
 param set EKF2_GPS_CTRL 0
 param set EKF2_HGT_REF 3
 param set EKF2_EV_DELAY 50.0
@@ -1821,6 +1821,20 @@ candidate values.
 ⚠️ **Do not run offline sweeps on the Mac during a flight you will score** — the
 VM shares its CPU; at RTF 0.4 MAVSDK's callback queue backs up. It did not cause
 the contacts here, but it did kill the EV bridge in fix2.
+
+**The GPS-denied seed sweep (2026-09-24, `s3*`, `s4*`, `s2f`, `q2f`).** One
+script does a whole run on the VM, SITL to landing:
+
+```bash
+# VM — tag, plan, world, trunks, EV seed, EV fidelity seed
+~/fly_case.sh s3g ~/drone/plans/mvp3ms.plan forest_mvp ~/drone/plans/forest_mvp_trunks.csv 6 7
+```
+
+(`~/launch_ev_seed.sh <tag> <seed> <fseed> [extra ev-bridge args]` is the bridge
+half.) The bridge now defaults to `--fix-ramp 30` and `--publish-velocity`.
+🔑 **One run is one noise draw — sweep seeds before trusting a speed.** At 3 m/s
+seeds 0/1, 2/3 and 6/7 flew clean and 4/5 grazed twice; the planner anchors on
+2 m/s because of that one set. Results table: `CLAUDE.md` → ONBOARD LOCAL PLANNER.
 
 #### Traps
 1. 🐛 **`pkill -f "gz sim"` inside `ssh '...'` kills the ssh session itself** — the
