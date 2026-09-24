@@ -17,6 +17,8 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter. 🔴 **FLOWN 2026-07-28 and it COLLIDES — 19 strikes at 50 stems/ha, 37 at 107.** `react_distance_m=6.0` gives 0.66 m of lateral offset against 1.10 m needed (0.60×) — geometrically cannot miss. The earlier "hovers at ≥100 stems/ha" limit was a *kinematic-harness artifact* and is wrong: in flight it blocks 0.17 % of steps and hits trees instead. See TEST-PLAN B2 |
 | `offboard.py` + `mavsdk_offboard.py` | **corridor executor** — carrot guidance (projection onto the polyline, so a detour cannot leave it chasing a passed vertex), avoidance in the loop, altitude commanded by us not interpolated by PX4 (what A2 says a corridor needs). Logs progress every 5 s and aborts after 90 s without route progress — a silent loop got killed by hand once, mistaken for a hang. `droneflight fly-corridor` |
+| `local_planner.py` | **the onboard local planner (2026-09-23)** — remembers every trunk the depth sensor returns (odometry frame), A* through the gaps with a clearance cost, speed from curvature/sight/gap/dynamic feasibility. Replaces reactive `avoid()`; **0 strikes GPS-denied in SITL**. See the section below |
+| `local_offboard.py` | the live executor for it — truth-pose sensing, believed-pose planning, home-relative altitude with a datum check, per-leg speed from the `.plan`. `droneflight fly-local` |
 | `maneuver.py` | **the reaction-distance budget** — how far ahead an obstacle must be seen for the airframe to actually miss it, from the flown speed and PX4's `MPC_ACC_HOR`/`MPC_JERK_AUTO` (jerk-limited, so *not* ½at²). `react_distance_m` is now **derived from this, not a constant**; also `required_rays`, the angular-sampling companion. Built after B2 flew the constant into 19–37 tree strikes |
 | `trunk_manifest.py` | loads the trunk CSV the Gazebo world was built from, so perception senses what physics will hit |
 | `strikes.py` | **did the flight hit anything?** Scores a flown track against its trunk manifest by *dynamic signature* (a >2 g transient at a trunk it is vertically level with), not by proximity. `droneflight b2-score`. Threshold calibrated against the tree-free B1 control, which never exceeds 0.50 g |
@@ -51,7 +53,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 271 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 337 tests
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -76,6 +78,167 @@ ruff check . && ruff format --check . && mypy --strict src && pytest -q # 271 te
   inject *confident-but-wrong* fixes — the innovation gate is the only defence,
   and it weakens as drift grows. `nav.py`'s idealised path is kept as the
   optimistic baseline for the A/B.
+
+## 🟢 ONBOARD LOCAL PLANNER (2026-09-23) — avoidance without a prior map
+`local_planner.py` (the planner), `reactive.fly_with_local_planner` (harness),
+`local_offboard.py` + `droneflight fly-local` (live). **Why:** the user ruled out
+lidar ("assume no lidar unless absolutely necessary"), which removes the prior
+stem map the 0-strike 2026-09-14 flight depended on, and reactive avoidance is
+dead in flight (N2). So the aircraft now does the stem routing itself: it
+**remembers** every trunk its depth sensor has returned, **plans** an A* path
+through the gaps with a clearance cost, and **replans** every 0.4 s.
+
+**Offline, same harness and manifests that gave reactive avoidance 27 strikes:**
+
+| case | strikes | min gap | mean speed |
+|---|---|---|---|
+| dense 107/ha, whole 5.2 km route, 6 m/s | **0** | +0.81 m | 5.9 m/s |
+| sparse 50/ha, 6 m/s | 0 | +1.31 m | 6.0 |
+| dense, 2 % drift **no fixes** (3 seeds) | 0 | ≥ +0.67 m | 5.8 |
+| random 200/ha — 3.0 / 6.0 m/s | 0 / 1 per 1.2 km | +0.92 m | — |
+| random 400/ha — 2.0 / 3.0 / 6.0 m/s | 0 / 0 (+0.05 m) / 2 | +0.55 m | — |
+| random 800/ha — 2, 3, 6 m/s | **stalls or strikes at all** | — | — |
+| **MVP route + MVP forest (200/ha)**, truth | **0** | +0.43 m | 4.8 (18.1 min) |
+| MVP, 2 % drift + VTRN fixes (4 seeds) | **0** | +0.06 … +0.96 m | 4.6 |
+| MVP, VTRN fixes bled in over 10 m like the bridge (4 seeds) | **0** | +0.31 … +0.59 m | 4.8 |
+
+That envelope is now the planner's speed model
+(`droneplanner/fields/stem_density.ONBOARD_PLANNING_ENVELOPE`).
+
+**Every limit in it exists because of a specific strike, and the order matters:**
+1. **Strict hard margin, relaxed only to escape.** A* forbids cells inside
+   0.35 m of air gap except within 1.5 m of the aircraft.
+2. **String-pull without giving back clearance.** The raw 8-connected path made the
+   commanded speed flicker 2.8↔6.0 m/s per replan; the airframe averaged "fast".
+3. **Brake FOR the turn** (`v² ≤ v_turn² + 2as`). The first rule let it reach a 45°
+   bend at cruise and swing into a known trunk at 4.7 m/s.
+4. **Commit to momentum** — replan from where 0.4 s of velocity carries it. A late
+   south→north side-switch 4.5 m from a trunk at 5.5 m/s was unflyable.
+5. **Dynamic feasibility** — each (path, speed) candidate is flown 2.5 s forward
+   under PX4's `MPC_ACC_HOR`/`MPC_JERK_AUTO`; slower or the previous path win if
+   the fresh one would pass too close. At 800/ha a 70° replan a metre from a trunk
+   hit it at 2 m/s **with the trunk mapped to 0.2 m** — a clear path is not a
+   followable one. This took 400/ha 11 → 2 strikes at 6 m/s.
+6. **Sight limit** — never faster than can stop before the path's swept width
+   leaves *observed* space. Occlusion made trunks appear too close to stop for.
+
+🔑 **GPS-denied property, and the correction trap.** Scans are swept from the TRUE
+pose and placed from the BELIEVED pose, so slow drift moves trunks and aircraft
+together — avoidance is immune to it (0 strikes with 100 m of unfixed drift). But
+a **VTRN fix** moves the aircraft in the believed frame without moving the
+remembered trunks, and the EV bridge bleeds a fix in over ~10 m, so no step looks
+like a jump. `observe()` therefore predicts each position from velocity and shifts
+the whole map by the unexplained part — memory lives in the continuous odometry
+frame, as a real VIO stack would hold it.
+
+**IN THE LOOP (PX4 SITL + Gazebo, forest_mvp 200/ha, RUNBOOK §4.14):**
+
+| flight | `b2-score` strikes | min air gap | time |
+|---|---|---|---|
+| GPS-aided | **0** | +0.54 m | 21.5 min |
+| **GPS-denied** (EV + VTRN, nav error up to **11.8 m**) | **0** | +0.33 m | 18.6 min |
+
+Harness predicted 0 strikes / +0.43 m / 18.1 min — the right answer this time, and
+the first time the harness has been confirmed in the loop for an avoidance layer.
+
+🐛 **Three defects the loop found that the harness could not:**
+1. **EV altitude datum** — `position_velocity_ned` z sat 124.6 m (home AMSL) below
+   truth under external vision. Now `relative_altitude_m`, plus a refuse-to-fly
+   check (>25 m disagreement at offboard start).
+2. **Clearing observed space on every correction** — bled-in VTRN fixes made every
+   step a correction; the sight limit then crawled at 0.8 m/s in open ground. The
+   grid now shifts by an accumulated offset.
+3. **The correction detector missed slow bleeds** — at a 0.05 m/step threshold a
+   fix under ~1.7 m was never detected. Threshold is now **0**: any displacement
+   velocity does not explain *is* an estimate correction. (Harness, 6 seeds at
+   400/ha GPS-denied: 0.05 → 2 grazes, 0 → 1; 200/ha 4/4 clean.)
+The harness now bleeds fixes in like the bridge (`fix_ramp_m`), which is what
+exposed 2 and 3 offline.
+
+🧪 **B4 sensor ladder (`tools/sensor_ladder.py`, 2026-09-24) — the oracle is not
+load-bearing.** MVP forest, 200/ha, 3 m/s, GPS-denied, 2 seeds per rung: **0 strikes
+at every rung** — range noise 0.1/0.3/0.6 m at 10 m (growing with range), 30 % and
+60 % dropped returns, max range 15 m and 8 m, and a stereo-like combination (0.3 m
+@ 10 m, 30 % dropout, 15 m). The only failure: 0.6 m noise **stalled** one seed
+(noise smeared the map shut) — the safe direction. Untested: phantom returns and
+systematically missed trunks; and only at 200/ha / 3 m/s.
+⚠️ **400 stems/ha is MARGINAL GPS-denied** — 1 graze (−0.016 m) in 6 harness seeds,
+clean on truth. The 1500 m zone decision rests on 400/ha at 2.0 m/s.
+⚠️ **Still oracle** (`perception.sense`: perfect ranges, no noise/dropout, but real
+occlusion). ⚠️ 800/ha is outside the envelope, and the canopy-height model puts
+the demo AO's real stands at 520–1290/ha.
+
+## ✅ STEM-MAP LOCALISATION BUILT (2026-09-15) — `stem_localizer.py`
+**The gap this closes.** The stem-routed plan flew **330/330 with 0 strikes** —
+but **GPS-aided** (`EKF2_GPS_CTRL=7`, `EKF2_EV_CTRL=0`, fix type 3 throughout),
+and this programme is GPS-denied. The margins make that decisive: the route was
+planned with **1.387 m** of clearance and flew with **0.708 m**, so PX4's own
+tracking consumed **0.679 m** with a near-perfect position estimate. Any
+navigation error lands on top. GPS-denied VTRN holds **11.8 m** on a good seed —
+**~17x too coarse**.
+
+So: match the trunks you can see against the trunks you expected, and the
+disagreement is your pose error. One instrument does routing *and* localisation,
+and it works exactly where optical VTRN starves (the conflict arm declined
+**76.5 %** of fixes for `no_features` — in the forest that is supposed to be
+hiding the aircraft).
+
+**Measured against a known offset (6.0, −4.0) m and 8° of yaw:**
+
+| condition | fixes accepted | mean error | max error | yaw error |
+|---|---|---|---|---|
+| pristine map | 12/12 | **0.034 m** | 0.062 m | 0.04° |
+| 40 % of mapped stems **felled** | 12/12 | 0.025 m | 0.039 m | 0.07° |
+| 60 % felled | 12/12 | 0.050 m | 0.109 m | 0.09° |
+| 80 % felled | **4/12** | 0.043 m | 0.067 m | 0.10° |
+| 100 % **unmapped** stems appear | 12/12 | 0.033 m | 0.067 m | 0.07° |
+| **200 %** unmapped (2/3 of what it sees is not on the map) | 12/12 | 0.032 m | 0.048 m | 0.04° |
+| 50 % felled + 100 % unmapped | 5/12 | 0.019 m | 0.026 m | 0.05° |
+| survey **0.5 m** position error | 11/12 | 0.220 m | 0.429 m | 0.37° |
+| survey **1.5 m** position error | 4/12 | 1.304 m | **1.907 m** | 1.58° |
+
+🟢 **0.03 m against VTRN's 11.8 m — roughly 350x better, and it degrades the right
+way.** Up to 60 % of the map being wrong costs nothing; past that it **declines**
+rather than guessing (80 % felled: 4/12 accepted, and the 4 it accepts are still
+good to 0.067 m). `tools/stem_localizer_sweep.py` reproduces the table.
+
+**Why RANSAC consensus and not least squares.** Per the user (2026-09-15) a
+government survey may *validate* stem mapping but **the drone cannot rely on one in
+flight, because the battlespace is modified and changes**. A large, unknown share
+of the map will be wrong in both directions — felled stems missing, unmapped ones
+present. Least-squares and nearest-neighbour fitting are dragged off by exactly
+that; consensus simply does not count it as evidence. Inter-stem *distance* seeds
+the hypotheses because it is invariant to the pose being solved for, which is what
+makes two correspondences enough.
+
+🔴 **The failure mode that matters, and it nearly shipped.** On a map with **1.5 m**
+of position error the matcher first accepted **11/12** fixes with a **20.8 m**
+maximum error — confidently, silently wrong, which is far worse than no fix (dead
+reckoning degrades predictably; a 20 m "fix" steers into a trunk). The defence is
+an **ambiguity test**: keep the best *rival* hypothesis as well as the best one and
+refuse when a materially different alignment explains nearly as much. That took it
+to 4/12 accepted at 1.9 m max.
+🔑 **And `distinct_m` must be several metres, not the match tolerance.** Set to
+1.0 m it compared the best solution against a *noisier copy of itself* — two seed
+pairs describing the same alignment do not agree exactly, since a 4 m baseline
+carrying 0.05 m of sensor noise fixes heading to only ~0.7°, which over a 25 m lever
+arm scatters the translation half a metre. Availability on a **pristine** map fell
+to 7/12 before that was corrected. The rival that matters is an alignment a whole
+stem away — metres.
+
+➡️ **Requirement this establishes: stem-map position accuracy must be ≲0.5 m.**
+At 0.5 m the fix still works (0.22 m mean) but eats a third of the 0.708 m flown
+clearance; at 1.5 m it is unusable *and only partly self-detecting*. The detector
+(`droneplanner/forest/stem_detect.py`) measures **0.017–0.029 m** on synthetic
+scans, so a UAV-lidar map qualifies and **ALS crown-centroid inference (1–2 m) does
+not** — it fails localisation as well as clearance.
+
+⚠️ **Not yet in the loop.** This is scored offline against synthetic stands. It has
+not been wired to `perception.py`, not run against detections from a real scan, and
+not flown — the GPS-denied stem-routed flight is the test it exists for. A regular
+plantation is the hard case (an alignment one row over fits almost as well) and is
+pinned by `test_a_regular_plantation_is_reported_as_AMBIGUOUS`, which asserts it
+**declines**.
 
 ## 🔴 The central finding is now PARTLY FALSIFIED IN THE LOOP (B2, 2026-07-28)
 **"Reactive avoidance reliably dodges obstacles" was measured in a kinematic

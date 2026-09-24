@@ -77,3 +77,48 @@ def test_rejects_bad_json(tmp_path: Path) -> None:
 def test_missing_file(tmp_path: Path) -> None:
     with pytest.raises(PlanLoadError, match="cannot read"):
         load_qgc_plan(tmp_path / "nope.plan")
+
+
+def test_do_change_speed_sets_the_leg_leaving_the_previous_waypoint(tmp_path: Path) -> None:
+    """The planner's forest speed cap reaches the vehicle (2026-09-23): before, the
+    .plan carried one cruise speed and the endurance verdict assumed another."""
+    import json
+
+    def wp(lat: float) -> dict[str, object]:
+        return {"command": 16, "params": [0, 0, 0, None, lat, 15.0, 10.0]}
+
+    def spd(v: float) -> dict[str, object]:
+        return {"command": 178, "params": [1, v, -1, 0, 0, 0, 0]}
+
+    doc = {
+        "fileType": "Plan",
+        "mission": {
+            "cruiseSpeed": 6.0,
+            "plannedHomePosition": [47.0, 15.0, 100.0],
+            "items": [wp(47.0), spd(3.0), wp(47.001), wp(47.002), spd(6.0), wp(47.003)],
+        },
+    }
+    path = tmp_path / "s.plan"
+    path.write_text(json.dumps(doc))
+    m = load_qgc_plan(path)
+    assert [m.leg_speed_ms(i) for i in range(4)] == [3.0, 3.0, 6.0, 6.0]
+    assert len(m.waypoints) == 4  # speed items are not waypoints
+
+
+def test_corridor_widths_are_read_from_the_side_block(tmp_path: Path) -> None:
+    import json
+
+    wp = {"command": 16, "params": [0, 0, 0, None, 47.0, 15.0, 10.0]}
+    doc = {
+        "fileType": "Plan",
+        "mission": {
+            "cruiseSpeed": 6.0,
+            "plannedHomePosition": [47.0, 15.0, 100.0],
+            "items": [wp, wp],
+        },
+        "droneplanner": {"version": 1, "corridor_half_width_m": [0.0, 12.5]},
+    }
+    path = tmp_path / "c.plan"
+    path.write_text(json.dumps(doc))
+    m = load_qgc_plan(path)
+    assert [w.corridor_half_width_m for w in m.waypoints] == [0.0, 12.5]

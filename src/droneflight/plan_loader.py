@@ -14,6 +14,7 @@ from typing import Any
 from droneflight.model import FlightMission, Waypoint
 
 _MAV_CMD_NAV_WAYPOINT = 16
+_MAV_CMD_DO_CHANGE_SPEED = 178
 
 
 class PlanLoadError(ValueError):
@@ -96,13 +97,36 @@ def load_qgc_plan(path: str | Path, name: str | None = None) -> FlightMission:
     if not isinstance(home, list) or len(home) < 3:
         raise PlanLoadError(f"{path} has no valid plannedHomePosition")
 
-    waypoints = [
-        wp
-        for item in mission.get("items", [])
-        if isinstance(item, dict) and (wp := _waypoint_from_item(item)) is not None
-    ]
+    # A DO_CHANGE_SPEED between two waypoints sets the speed of the leg leaving
+    # the one before it, and persists until the next change (PX4 semantics).
+    cruise = float(mission.get("cruiseSpeed", 5.0))
+    current: float | None = None
+    waypoints: list[Waypoint] = []
+    for item in mission.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("command") == _MAV_CMD_DO_CHANGE_SPEED:
+            params = item.get("params")
+            if isinstance(params, list) and len(params) >= 2 and params[1] is not None:
+                speed = float(params[1])
+                if speed > 0:
+                    current = speed
+                    if waypoints:
+                        waypoints[-1] = waypoints[-1].model_copy(update={"speed_ms": speed})
+            continue
+        wp = _waypoint_from_item(item)
+        if wp is not None:
+            waypoints.append(wp.model_copy(update={"speed_ms": current}) if current else wp)
     if not waypoints:
         raise PlanLoadError(f"{path} contains no NAV_WAYPOINT items")
+    # The planner's corridor widths ride in a side block PX4 never sees.
+    extra = doc.get("droneplanner")
+    widths = extra.get("corridor_half_width_m") if isinstance(extra, dict) else None
+    if isinstance(widths, list) and len(widths) == len(waypoints):
+        waypoints = [
+            wp.model_copy(update={"corridor_half_width_m": float(w)}) if w is not None else wp
+            for wp, w in zip(waypoints, widths, strict=True)
+        ]
 
     try:
         return FlightMission(
@@ -110,7 +134,7 @@ def load_qgc_plan(path: str | Path, name: str | None = None) -> FlightMission:
             home_lat=float(home[0]),
             home_lon=float(home[1]),
             home_alt_m=float(home[2]),
-            cruise_speed_ms=float(mission.get("cruiseSpeed", 5.0)),
+            cruise_speed_ms=cruise,
             waypoints=tuple(waypoints),
         )
     except Exception as exc:

@@ -40,6 +40,7 @@ import random
 from dataclasses import dataclass, field
 
 from droneflight.avoidance import AvoidanceCommand, AvoidanceConfig, avoid
+from droneflight.local_planner import LocalPlanner, LocalPlannerConfig, PlannerCommand
 from droneflight.maneuver import ManeuverLimits
 from droneflight.model import FlightMission
 from droneflight.nav import DriftConfig, VtrnConfig
@@ -374,3 +375,335 @@ def _result(
         endpoint_offset_m=endpoint_offset,
         path=tuple(path),
     )
+
+
+@dataclass(frozen=True)
+class StrikeEvent:
+    """One contact, with what the planner knew about that trunk at the time."""
+
+    t_s: float
+    east_m: float
+    north_m: float
+    speed_ms: float
+    trunk_in_memory: bool
+    """Had the sensor ever returned a point on the struck trunk? False means it
+    was hit *unseen* (outside the FOV or occluded) — a sensing failure; True
+    means it was known and the path or the tracking failed to clear it."""
+
+    commanded_speed_ms: float
+    gap_ahead_m: float
+
+
+@dataclass(frozen=True)
+class LocalFlightResult:
+    """What a local-planner run did, scored against the TRUE trunks and route."""
+
+    reached_goal: bool
+    strikes: int
+    min_clearance_m: float
+    """Closest true airframe-to-trunk-surface gap over the flight."""
+
+    flight_time_s: float
+    path_length_m: float
+    max_cross_track_m: float
+    """Worst true distance from the planned route — corridor keeping."""
+
+    replans: int
+    plan_failures: int
+    blocked_s: float
+    memory_resets: int
+    max_nav_error_m: float
+    path: tuple[tuple[float, float], ...]
+    strike_log: tuple[StrikeEvent, ...] = ()
+
+    @property
+    def clean(self) -> bool:
+        return self.reached_goal and self.strikes == 0
+
+    @property
+    def mean_speed_ms(self) -> float:
+        return self.path_length_m / self.flight_time_s if self.flight_time_s > 0 else 0.0
+
+
+def _distance_to_route(p: tuple[float, float], route: list[tuple[float, float]]) -> float:
+    best = math.inf
+    for a, b in itertools.pairwise(route):
+        abx, aby = b[0] - a[0], b[1] - a[1]
+        denom = abx * abx + aby * aby
+        t = 0.0 if denom == 0.0 else ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / denom
+        t = max(0.0, min(1.0, t))
+        best = min(best, math.hypot(p[0] - a[0] - abx * t, p[1] - a[1] - aby * t))
+    return best
+
+
+def fly_with_local_planner(
+    mission: FlightMission,
+    obstacles: ObstacleField,
+    planner_config: LocalPlannerConfig | None = None,
+    config: ForestFlightConfig | None = None,
+    *,
+    drift: DriftConfig | None = None,
+    vtrn: VtrnConfig | None = None,
+    start_m: float = 0.0,
+    stop_m: float | None = None,
+    max_time_s: float = 7200.0,
+    fix_ramp_m: float = 0.0,
+    use_corridor: bool = True,
+) -> LocalFlightResult:
+    """Fly ``mission`` through ``obstacles`` with the onboard local planner.
+
+    Same dynamics and contact model as :func:`fly_through_forest` (velocity slewed
+    under PX4's accel/jerk limits; a contact is counted and slid along, not
+    aborted), so strike counts compare directly with the reactive numbers on
+    record. Differences, all deliberate:
+
+    * the sensor is swept from the **true** pose but its returns are placed in the
+      map from the **believed** pose — exactly what a real aircraft does, and the
+      property that should make this immune to slow navigation drift;
+    * progress is by projection onto the route (`offboard.CarrotGuidance`), the
+      same guidance the live offboard executor uses, not waypoint capture;
+    * ``start_m``/``stop_m`` fly only a slice of the route, because only the
+      concealed opening is in the forest;
+    * ``fix_ramp_m`` bleeds each VTRN fix in over that many metres of travel, as
+      the live EV bridge does (``ev-bridge --fix-ramp``, default 10 m). 0 = an
+      instantaneous jump — which is what hid the "clear observed space on every
+      correction" defect offline until SITL found it.
+    """
+    from droneflight.offboard import CarrotGuidance, RoutePoint
+
+    config = config or ForestFlightConfig()
+    planner = LocalPlanner(config=planner_config or LocalPlannerConfig())
+    pcfg = planner.config
+    lat0, lon0 = mission.home_lat, mission.home_lon
+    full = [_to_local(w.lat, w.lon, lat0, lon0) for w in mission.waypoints]
+    route = _slice_polyline(full, start_m, stop_m)
+    guidance = CarrotGuidance(
+        route=[RoutePoint(east_m=x, north_m=y, up_m=0.0) for x, y in route],
+        lookahead_m=pcfg.horizon_m,
+    )
+    # The plan's per-leg speed (DO_CHANGE_SPEED), mapped onto the sliced route by
+    # arc length so start_m/stop_m slices keep the right speeds.
+    leg_speeds = _sliced_leg_speeds(full, route, mission)
+    corridor = _sliced_corridor(full, route, mission) if use_corridor else None
+
+    pos = route[0]
+    heading = _heading_of(route[0], route[1])
+    fov = math.radians(config.fov_deg)
+    max_turn = math.radians(config.max_turn_rate_dps) * config.dt_s
+    rd = config.avoidance.drone_radius_m
+    dt = config.dt_s
+
+    rng = random.Random(drift.seed) if drift else None
+    drift_heading = rng.uniform(0.0, 2.0 * math.pi) if rng else 0.0
+    err_x = err_y = 0.0
+    dist_since_fix = 0.0
+    max_err = 0.0
+    pend_x = pend_y = 0.0
+    bleed_per_m = 0.0
+
+    path = [pos]
+    vel = (0.0, 0.0)
+    acc = (0.0, 0.0)
+    strikes = 0
+    min_gap = math.inf
+    max_xt = 0.0
+    blocked_s = 0.0
+    release_steps = max(1, int(config.contact_release_s / dt))
+    steps_clear = release_steps
+    reached = False
+    t = 0.0
+    goal = route[-1]
+    events: list[StrikeEvent] = []
+
+    while t < max_time_s:
+        t += dt
+        est = (pos[0] + err_x, pos[1] + err_y)
+        scan = sense(obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m)
+        added = planner.observe(scan, est[0], est[1], heading, velocity=vel, t_s=t)
+        carrot = guidance.advance(*est)
+        cmd = planner.command(
+            est[0],
+            est[1],
+            (carrot.east_m, carrot.north_m),
+            t,
+            added,
+            velocity=vel,
+            max_speed_ms=leg_speeds[min(guidance.index, len(leg_speeds) - 1)],
+            corridor=corridor,
+        )
+        if cmd.blocked:
+            blocked_s += dt
+            want = (0.0, 0.0)
+            # Hovering: turn toward the goal to look for a way through.
+            desired = math.atan2(carrot.north_m - est[1], carrot.east_m - est[0])
+        else:
+            want = (cmd.vx, cmd.vy)
+            desired = math.atan2(cmd.vy, cmd.vx)
+        # The sensor looks where the aircraft is going (yaw follows the command).
+        heading = _wrap(heading + max(-max_turn, min(max_turn, _wrap(desired - heading))))
+
+        a_des = _clamp_norm(
+            ((want[0] - vel[0]) / dt, (want[1] - vel[1]) / dt), config.limits.max_accel_ms2
+        )
+        d_acc = _clamp_norm((a_des[0] - acc[0], a_des[1] - acc[1]), config.limits.max_jerk_ms3 * dt)
+        acc = (acc[0] + d_acc[0], acc[1] + d_acc[1])
+        vel = (vel[0] + acc[0] * dt, vel[1] + acc[1] * dt)
+        prev = pos
+        pos = (pos[0] + vel[0] * dt, pos[1] + vel[1] * dt)
+        moved = math.hypot(pos[0] - prev[0], pos[1] - prev[1])
+        path.append(pos)
+
+        if drift and rng and moved > 0.0:
+            drift_heading += rng.gauss(0.0, math.radians(drift.wander_deg_per_100m) * moved / 100.0)
+            err_x += drift.rate * moved * math.cos(drift_heading)
+            err_y += drift.rate * moved * math.sin(drift_heading)
+            dist_since_fix += moved
+            if vtrn and dist_since_fix >= vtrn.fix_interval_m:
+                mag = math.hypot(err_x, err_y)
+                if mag > vtrn.residual_error_m:
+                    scale = vtrn.residual_error_m / mag
+                    if fix_ramp_m > 0.0:
+                        pend_x, pend_y = err_x * (scale - 1.0), err_y * (scale - 1.0)
+                        bleed_per_m = math.hypot(pend_x, pend_y) / fix_ramp_m
+                    else:
+                        err_x *= scale
+                        err_y *= scale
+                dist_since_fix = 0.0
+            pend = math.hypot(pend_x, pend_y)
+            if pend > 0.0:
+                step = min(pend, bleed_per_m * moved)
+                err_x += pend_x / pend * step
+                err_y += pend_y / pend * step
+                pend_x -= pend_x / pend * step
+                pend_y -= pend_y / pend * step
+            max_err = max(max_err, math.hypot(err_x, err_y))
+
+        gap = obstacles.clearance(pos[0], pos[1]) - rd
+        min_gap = min(min_gap, gap)
+        if gap < 0.0:
+            if steps_clear >= release_steps:
+                strikes += 1
+                events.append(
+                    _strike_event(
+                        t, pos, vel, obstacles, planner, (err_x, err_y), cmd.speed_ms, cmd
+                    )
+                )
+            steps_clear = 0
+            nx, ny = _surface_normal(obstacles, pos)
+            pos = (pos[0] + nx * (-gap + _CONTACT_EPS_M), pos[1] + ny * (-gap + _CONTACT_EPS_M))
+            path[-1] = pos
+            into = vel[0] * nx + vel[1] * ny
+            if into < 0.0:
+                vel = (vel[0] - into * nx, vel[1] - into * ny)
+            into_a = acc[0] * nx + acc[1] * ny
+            if into_a < 0.0:
+                acc = (acc[0] - into_a * nx, acc[1] - into_a * ny)
+        else:
+            steps_clear += 1
+
+        if int(t / dt) % 20 == 0:
+            max_xt = max(max_xt, _distance_to_route(pos, route))
+        if guidance.finished and math.dist(est, goal) <= config.capture_radius_m:
+            reached = True
+            break
+
+    length = sum(math.dist(a, b) for a, b in itertools.pairwise(path))
+    return LocalFlightResult(
+        reached_goal=reached,
+        strikes=strikes,
+        min_clearance_m=min_gap,
+        flight_time_s=t,
+        path_length_m=length,
+        max_cross_track_m=max_xt,
+        replans=planner.replans,
+        plan_failures=planner.failures,
+        blocked_s=blocked_s,
+        memory_resets=planner.memory_resets,
+        max_nav_error_m=max_err,
+        path=tuple(path),
+        strike_log=tuple(events),
+    )
+
+
+def _strike_event(
+    t: float,
+    pos: tuple[float, float],
+    vel: tuple[float, float],
+    obstacles: ObstacleField,
+    planner: LocalPlanner,
+    err: tuple[float, float],
+    commanded: float,
+    cmd: PlannerCommand,
+) -> StrikeEvent:
+    near = min(
+        obstacles._nearby(pos[0], pos[1], 2.0) or obstacles.trunks,
+        key=lambda tr: math.hypot(tr.x - pos[0], tr.y - pos[1]),
+    )
+    # Memory is in the believed frame: shift the true trunk by the nav error.
+    cx, cy = near.x + err[0], near.y + err[1]
+    seen = any(
+        math.hypot(px - cx, py - cy) < near.radius + 0.35 for px, py in planner.memory.points()
+    )
+    return StrikeEvent(
+        t_s=t,
+        east_m=pos[0],
+        north_m=pos[1],
+        speed_ms=math.hypot(*vel),
+        trunk_in_memory=seen,
+        commanded_speed_ms=commanded,
+        gap_ahead_m=cmd.min_gap_ahead_m,
+    )
+
+
+def _sliced_leg_speeds(
+    full: list[tuple[float, float]], route: list[tuple[float, float]], mission: FlightMission
+) -> list[float]:
+    """Planned speed for each leg of ``route`` (a slice of ``full``).
+
+    A slice keeps the original vertices between its cut points, so each sliced
+    vertex (the cut points included) takes the leg speed of the nearest original
+    vertex — exact for interior vertices, and the containing leg's at the cuts
+    whenever the cut is nearer its start than its end.
+    """
+    out = []
+    for p in route[:-1]:
+        k = min(range(len(full)), key=lambda i: math.dist(full[i], p))
+        out.append(mission.leg_speed_ms(k))
+    return out or [mission.cruise_speed_ms]
+
+
+def _sliced_corridor(
+    full: list[tuple[float, float]], route: list[tuple[float, float]], mission: FlightMission
+) -> list[tuple[tuple[float, float], float]] | None:
+    """The plan's corridor widths on the sliced route (nearest original vertex)."""
+    widths = [w.corridor_half_width_m for w in mission.waypoints]
+    if any(w is None for w in widths):
+        return None
+    out = []
+    for p in route:
+        k = min(range(len(full)), key=lambda i: math.dist(full[i], p))
+        out.append((p, float(widths[k] or 0.0)))
+    return out
+
+
+def _heading_of(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.atan2(b[1] - a[1], b[0] - a[0])
+
+
+def _slice_polyline(
+    pts: list[tuple[float, float]], start_m: float, stop_m: float | None
+) -> list[tuple[float, float]]:
+    """The part of a polyline between two arc lengths (interpolated at the cuts)."""
+    cum = [0.0]
+    for a, b in itertools.pairwise(pts):
+        cum.append(cum[-1] + math.dist(a, b))
+    stop = cum[-1] if stop_m is None else min(stop_m, cum[-1])
+    start = max(0.0, min(start_m, stop))
+
+    def at(s: float) -> tuple[float, float]:
+        x, y, _, _ = _point_tangent(pts, cum, s)
+        return x, y
+
+    inner = [p for p, c in zip(pts, cum, strict=True) if start < c < stop]
+    out = [at(start), *inner, at(stop)]
+    return out if len(out) >= 2 else [pts[0], pts[-1]]

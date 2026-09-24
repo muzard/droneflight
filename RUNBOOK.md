@@ -1652,6 +1652,299 @@ no branches, no crown, no understory, no lean. It flatters the aircraft.
 
 ---
 
+### 4.14 🌲 MVP — one sortie, onboard local planner, NO prior stem map (2026-09-23)
+
+Everything since 4.13 in one flight: the concealment-zone route
+(`droneplanner/demo_ao/mission_mvp.yaml`, 1500 m zone, 200 stems/ha), per-leg speed
+in the `.plan` (`DO_CHANGE_SPEED`, 3.0 m/s in the forest, 6.0 in the open), and
+`droneflight fly-local` — the local planner that maps trunks with its own sensor
+and plans through the gaps. No stem manifest is given to the *planner*; the trunk
+CSV feeds only the oracle depth sensor, exactly as in B2.
+
+**Stage it: GPS-aided first, then GPS-denied** — the first isolates the local
+planner in PX4 dynamics, the second adds the EV bridge.
+
+```bash
+# MAC — plan, world, ship. The new flight code goes to ~/droneflight-dev (NOT the
+# git clone, which tracks the user's commits) and is put first on PYTHONPATH.
+droneplanner plan --mission demo_ao/mission_mvp.yaml --out out/mvp
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out/mvp/mission.plan \
+  --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif \
+  --stems-per-ha 200 --forest-radius 1500 \
+  --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_mvp_dem.tif \
+  --out worlds/forest_mvp.sdf
+rsync -a --delete --exclude __pycache__ ../droneflight/src/ <vm>:droneflight-dev/src/
+scp worlds/forest_mvp.sdf worlds/forest_mvp_dem.tif <vm>:drone/PX4-Autopilot/Tools/simulation/gz/worlds/
+scp worlds/forest_mvp_trunks.csv <vm>:drone/plans/ && scp out/mvp/mission.plan <vm>:drone/plans/mvp.plan
+```
+
+```bash
+# VM — SITL (see trap 1), then fly
+~/launch_sitl.sh ~/drone/plans/mvp.plan forest_mvp ~/logs/mvp/sitl.log
+PYTHONPATH=~/droneflight-dev/src python -m droneflight.cli fly-local \
+  --plan ~/drone/plans/mvp.plan --trunks ~/drone/plans/forest_mvp_trunks.csv \
+  --world forest_mvp --record ~/logs/mvp/run.jsonl
+```
+
+GPS-denied adds, before flying (params from §3b.2 plus the 8 s no-aiding timeout
+of §3f, then restart SITL; `mavlink start` after EVERY restart):
+
+```
+param set EKF2_EV_CTRL 11
+param set EKF2_GPS_CTRL 0
+param set EKF2_HGT_REF 3
+param set EKF2_EV_DELAY 50.0
+param set COM_ARM_WO_GPS 1
+param set EKF2_NOAID_TOUT 8000000
+param save
+mavlink start -x -u 14581 -r 4000000 -f -m onboard -o 14541
+```
+
+and the EV bridge (realistic 40/10 basemap, acceptance seeds) started first:
+
+```bash
+PYTHONPATH=~/droneflight-dev/src python -m droneflight.cli ev-bridge \
+  --plan ~/drone/plans/mvp.plan --url udpin://0.0.0.0:14541 --world forest_mvp \
+  --forest-frac 0.4 --stale-frac 0.1 --seed 0 --fidelity-seed 1 --record ~/logs/mvp/ev.jsonl
+```
+
+#### Results
+
+**Flight 1 — GPS-aided, ✅ CLEAN (2026-09-23, `sim-logs/mvp_local/gps1_23_23_26.ulg`
++ `gps1.jsonl`).** `b2-score`: **0 tree strikes, 0 ground impacts**, min
+trunk-surface clearance **+0.984 m** (= +0.54 m air gap, matching the executor's
+oracle), min AGL 7.99 m. Reached the goal, 287/287 route points, 0 plan failures,
+0 blocked steps. **The first forest traverse in this programme with no prior stem
+map.**
+
+| | planned / harness | **flown** |
+|---|---|---|
+| forest stretch | 1166 m below canopy at ≤3.0 m/s | **1362 m in 546 s, 2.49 m/s mean** |
+| min air gap | harness +0.43 m | **+0.54 m** (p1 1.16 m, median 3.11 m) |
+| total time | planner 19.0 min, harness 18.1 | **21.5 min** (1289 s) |
+
+Slower than the plan in the forest: replaying the record through the planner
+attributes most forest steps to the plan's 3.0 cap and ~25 % to the **sight limit**
+(PX4 yaws slower than the harness's 60°/s, so the FOV lags the path and the
+aircraft slows for space it has not looked at — the intended behaviour, and a
+cost the endurance model does not yet charge). Still 0.87 of usable endurance.
+⚠️ GPS-aided, PX4's estimate drifted from Gazebo truth by **~0.24 % of distance**
+(9.7 m at 3.6 km) — a projection/scale mismatch between PX4's GPS-derived local
+frame and Gazebo's world, not navigation error. Harmless here (sensor and manifest
+are both Gazebo-frame), but do not read it as drift.
+
+**Flight 2 — GPS-DENIED, ✅ CLEAN (2026-09-24, `sim-logs/mvp_local/denied3_23_54_52.ulg`
++ `denied3.jsonl` + `denied3-ev.jsonl`).** EV bridge on the realistic 40/10 basemap,
+acceptance seeds 0/1, `EKF2_GPS_CTRL 0`. `b2-score`: **0 tree strikes, 0 ground
+impacts**, min trunk-surface clearance **+0.777 m** (+0.33 m air gap), min AGL
+8.39 m. Reached the goal in **18.6 min** (1115 s) — faster than flight 1, because
+the observed-space fix below removed needless slowdowns.
+
+| navigation, from the EV record | |
+|---|---|
+| injected error | **max 11.8 m**, final 1.9 m |
+| VTRN fixes | 32/67 accepted (48 %), 0 stale blunders |
+| true track vs plan | max 11.9 m, mean 2.9 m — within 15 m |
+
+🔑 **Avoidance held with up to 11.8 m of absolute position error** — the property
+the local planner was designed for (trunks and aircraft share the believed frame),
+now measured in the loop. Prior-map routing needed ≲0.5 m.
+
+**Flight 3 — the ENVELOPE EDGE, 400 stems/ha, GPS-denied, ✅ CLEAN (2026-09-24,
+`sim-logs/mvp_local/d400n_00_36_29.ulg` + `d400n*.jsonl`).** Forest-only cut of the
+400/ha MVP plan (`out/mvp400/forest_only.plan`, first 1.76 km, 2.0 m/s legs) in
+`forest_mvp400n` (1150 trunks, ±15 m band — see trap 6). `b2-score`: **0 strikes,
+0 ground impacts**, min trunk-surface clearance **+1.000 m** (+0.55 m air gap), min
+AGL 7.97 m; 12.7 min (harness 12.3). Injected nav error up to 8.3 m, 6/15 fixes.
+This is the density the 1500 m concealment zone was sized for.
+The true track reached **15.6 m** off the route line (4 of 1522 samples beyond
+`ev-report`'s fixed 15 m tolerance) — the planner's own detour to find gaps (the
+believed track was already 14.8 m off there, nav error 2.6 m). **That tolerance is
+not the concealment corridor:** measured per segment against the widths the plan
+actually granted (floored at 4 m), the track stayed **inside the granted corridor
+100 % of the time** (the plan grants 46 m where the detour happened). An earlier
+reading of "4.7 % outside by up to 13 m" came from a nearest-vertex metric with no
+floor and is withdrawn.
+The corridor widths now reach the executor anyway (`.plan` → `droneplanner` block →
+`fly-local` bounds its search), which clears B3's blocker — but a harness A/B at
+400/ha shows **identical** results with and without the bound, so its benefit is
+not demonstrated at these densities.
+⚠️ Harness at this world: 1 graze (−0.006 m) in 6 GPS-denied seeds. One SITL seed
+clean is consistent with that, not proof the edge is safe.
+
+It took three attempts, and both failures were real defects, now fixed and tested:
+* **`denied1` — altitude datum (trap 4).** Aborted climbing through 43 m.
+* **`denied2` — every bled-in VTRN fix cleared the observed-space grid**, so the
+  sight limit saw nothing and the aircraft crawled through *open ground* at the
+  0.8 m/s floor. Now the grid shifts with the correction (an O(1) offset). The
+  harness had missed it because its fixes were instantaneous; it now bleeds them in
+  like the bridge (`fix_ramp_m`).
+
+**VM state left behind (2026-09-24):** EKF2 back to GPS-aided defaults
+(`EKF2_GPS_CTRL 7`, `EKF2_EV_CTRL 0`, `EKF2_HGT_REF 1`); `EKF2_NOAID_TOUT` stays
+8 s and `COM_ARM_WO_GPS` 1. New code lives in `~/droneflight-dev/src` (not the git
+clone), launch helpers in `~/launch_sitl.sh`, `~/launch_ev.sh`, `~/launch_fly.sh`,
+`~/stop_df.sh`; worlds `forest_mvp`, `forest_mvp400`, `forest_mvp400n` in PX4's
+worlds dir; plans `mvp.plan`, `mvp400.plan`, `mvp400_forest.plan`.
+
+#### Traps
+1. 🐛 **`pkill -f "gz sim"` inside `ssh '...'` kills the ssh session itself** — the
+   remote `bash -c` command line contains the pattern. Launch from a script file
+   (`~/launch_sitl.sh`), never inline.
+2. **`--truth gazebo` is the default and required GPS-denied.** The oracle sensor
+   must see the real trees from the real aircraft; `none` senses from PX4's
+   estimate, which the EV bridge corrupts on purpose.
+3. **Score with `b2-score` on the ULog**, not the executor's own `contacts` — the
+   oracle count is a live indicator, the dynamic signature is the authority.
+4. 🔴 **Under external vision, EKF2's local z is offset by home AMSL.** The first
+   GPS-denied attempt read altitude from `position_velocity_ned` and believed it
+   was at −106 m while really at +10 m (124.6 m = the origin the EV bridge sets),
+   then climbed at full rate through 43 m before it was aborted. `fly-local` now
+   reads `relative_altitude_m` (the plan's frame) and **refuses to fly** if
+   believed altitude disagrees with the plan or with truth by >25 m at offboard
+   start. GPS-aided flights never showed it, because there local z ≈ home-relative.
+5. `pkill -f fly-local` over ssh also matches the ssh command itself; use
+   `~/stop_df.sh`.
+6. 🔴 **The planner must run on SIM time, and the VM caps world size.** A 400/ha
+   world with 3125 trunks ran Gazebo at **0.34–0.40× real time** with 7.3 GB
+   resident on the 8 GB VM (111 MB free). PX4 reports velocity in sim time, so a
+   wall-clock planner saw ~0.36 m of "unexplained" displacement every step, shifted
+   its map by it 1606 times (558 m in total), smeared a trunk 11 m away to 2.3 m
+   and **stalled with every plan failing** — twice (the second time because the CLI
+   edit that passes `t_s` had silently not applied; verify on the VM with `grep`).
+   `fly-local` now clocks on Gazebo's stamp and logs `rtf` every 5 s. **Check
+   `gz topic -e -t /world/<w>/stats -n 1 | grep real_time_factor` before flying**;
+   ~1560 trunks ran at 1.04×, ~3100 at 0.4×. Narrow the band (`--forest-band 15`)
+   rather than fly a world the VM cannot run in real time.
+
+### 4.13 ✅🌲 STEM-ROUTED — through 2500 trunks with **0 STRIKES**, 2026-09-14
+
+`../sim-logs/stems/17_45_54.ulg` + `fly2.log`. World `forest_dense` (2500 trunks,
+107 stems/ha), **mission mode — no avoidance in the loop**, tether off,
+`NAV_MC_ALT_RAD` 4.0. **COMPLETED 330/330.**
+
+```
+TREE STRIKES   0
+GROUND IMPACTS 0
+min trunk-surface clearance  +0.708 m
+VERDICT: CLEAN
+```
+
+**The A/B is clean because only the route changed.** Same world, same executor,
+same manifest:
+
+| route | tree strikes | min clearance | outcome |
+|---|---|---|---|
+| B2 corridor arm, reactive avoidance ON | **36** | −0.060 m | NOT CLEAN |
+| **stem-routed, no avoidance** | **0** | **+0.708 m** | ✅ CLEAN 330/330 |
+
+#### Procedure
+
+```bash
+# MAC — plan with a stem map (layers.stem_map -> the *_trunks.csv the world uses)
+droneplanner plan --mission demo_ao/mission_stems.yaml --out out/stems
+scp out/stems/mission.plan arttudrone@<vm>:~/drone/plans/stems.plan
+```
+
+```bash
+# VM — shell A: the forest world, NOT planner_terrain
+: > /tmp/pxcmds
+cd ~/droneflight/sitl
+DRONEFLIGHT_TETHER_ENABLED=0 HEADLESS=1 \
+  tail -f /tmp/pxcmds | ./run_sitl.sh ~/drone/plans/stems.plan ~/drone/PX4-Autopilot forest_dense
+printf 'param set NAV_DLL_ACT 0\nparam set SIM_BAT_DRAIN 0.0\nparam set NAV_MC_ALT_RAD 4.0\nparam save\n' >> /tmp/pxcmds
+# shell B — AFTER settling (§4.12 trap 1; it bit again here)
+droneflight fly --plan ~/drone/plans/stems.plan --url udp://:14540
+```
+
+```bash
+# MAC — score. Validate the scorer first by reproducing B2's known arm:
+droneflight b2-score --ulog sim-logs/b2/13_47_06.ulg --trunks droneplanner/worlds/forest_dense_trunks.csv
+#   -> 36 strikes, 9 ground impacts  (the control)
+droneflight b2-score --ulog sim-logs/stems/17_45_54.ulg --trunks droneplanner/worlds/forest_dense_trunks.csv
+#   -> 0 strikes, CLEAN
+```
+
+🔑 **PX4 ate half the clearance: planned +1.387 m, flown +0.708 m.** Plan roughly
+twice the gap you intend to fly. And the margin cannot simply be raised — at
+107 stems/ha the search starts failing above ~1.95 m of required air gap.
+
+⚠️ The stem map is synthetic and is the same file that places the trunks. This
+shows the planner can use a stem map, not that it will miss real trees.
+
+---
+
+### 4.12 ✅ MVP — the CURRENT below-canopy route: FLOWN 2026-09-14, **COMPLETED 287/287**
+
+`../sim-logs/mvp/16_53_04.ulg` + `fly2.log`. Terrain world, tether OFF, GPS on,
+`NAV_MC_ALT_RAD` 4.0. **947.8 s of AUTO_MISSION, no stalls, no RTL.**
+
+**Why re-fly at all:** B1 flew a 282-waypoint / 5299 m route. C0 (threat margin),
+C2 (detection range) and C3 (sectors) all moved the demo route since; the current
+one is **287 waypoints / 5167 m** and had never been flown.
+
+| | predicted | **flown** |
+|---|---|---|
+| completion | — | **287/287** |
+| min AGL after climb-out | 6.59 m | **7.05 m** (0 under 5 m, 0 CFIT) |
+| max true climb (AMSL) | 2.17 m/s | **2.82 m/s** (limit 3.0) |
+| max true descent (AMSL) | **2.56 m/s** | **1.51 m/s** (limit 2.0, 0 over) |
+
+🔴 **The per-leg AMSL rate model is wrong in both directions.** PX4 clamps descent
+at `MPC_Z_VEL_MAX_DN` (**1.5**) and spreads a descent across neighbouring legs, so
+the per-leg figure over-predicts; but it sawtooths around each terrain-following
+step, so the per-leg figure *under*-predicts climb. Treat
+`vertical_rate_amsl_exceeded` as a **tracking-lag** flag, never as a violation.
+
+#### The procedure (reproducible)
+
+```bash
+# ON THE MAC — generate and check the plan, then ship it
+droneplanner plan --mission demo_ao/mission.yaml --out out/mvp_belowcanopy
+droneflight validate --plan out/mvp_belowcanopy/mission.plan
+scp out/mvp_belowcanopy/mission.plan arttudrone@<vm>:~/drone/plans/mvp_belowcanopy.plan
+```
+
+```bash
+# ON THE VM — shell A. The `tail -f` keeps px4's stdin open so params can be fed in.
+: > /tmp/pxcmds
+cd ~/droneflight/sitl
+DRONEFLIGHT_TETHER_ENABLED=0 HEADLESS=1 \
+  tail -f /tmp/pxcmds | ./run_sitl.sh ~/drone/plans/mvp_belowcanopy.plan \
+      ~/drone/PX4-Autopilot planner_terrain
+# then, from anywhere:
+printf 'param set NAV_DLL_ACT 0\nparam set SIM_BAT_DRAIN 0.0\nparam set NAV_MC_ALT_RAD 4.0\nparam save\n' >> /tmp/pxcmds
+```
+
+```bash
+# ON THE VM — shell B, AFTER the vehicle has settled (see trap 1)
+droneflight fly --plan ~/drone/plans/mvp_belowcanopy.plan --url udp://:14540
+```
+
+#### 🐛 Two traps this flight hit — both cost a run
+
+**1. `start_mission` DENIED if you fly too soon.** Starting `droneflight fly`
+~18 s after PX4 printed *"Ready for takeoff!"* failed with
+`start_mission failed: DENIED`, and PX4 logged *"Switching to Mission is currently
+not available"*. Upload and **arm both succeeded** — only the mode switch was
+refused — so the vehicle armed, RTL'd and disarmed. Retrying ~40 s later worked
+with no other change. **Wait for the vehicle to settle before flying**; a denial
+here is not a bad plan.
+
+**2. The aborted attempt closes the ULog, and the next arm opens a NEW one.** The
+SITL startup banner names the log it opened (`16_52_03.ulg`), but that file was
+closed when the failed attempt disarmed; the actual flight is in
+**`16_53_04.ulg`**. **Always score the newest `.ulg`, not the one in the banner** —
+scoring the banner's log here would have measured a 40-second non-flight. Same
+family as the `initial_parameters` vs `changed_parameters` trap in §4.8.
+
+⚠️ **What this flight does not test.** The `.plan` commands **6.0 m/s everywhere**
+— the stem-density speed cap is planner-side and never reaches the plan — and the
+world has **no trees**. It validates altitude tracking and sequencing over real
+terrain, nothing about endurance, the speed cap, or avoidance.
+
+---
+
 ### 4.9 ✅ B1 — below-canopy route: FLOWN 2026-07-27, **COMPLETED 282/282**
 
 `sim-logs/canopy/21_38_21.ulg` + `canopy.log`. Terrain world, tether off

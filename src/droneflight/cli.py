@@ -992,6 +992,91 @@ def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs 
     return 0 if result.reached_goal else 1
 
 
+def _fly_local(args: argparse.Namespace) -> int:  # pragma: no cover - needs a live autopilot
+    """Fly a .plan offboard with the onboard local planner (2026-09-23 MVP)."""
+    from droneflight.ev_bridge import GazeboTruthSource, wait_for_truth_topic
+    from droneflight.local_offboard import LocalOffboardConfig, Pose, fly_local
+    from droneflight.local_planner import LocalPlannerConfig
+    from droneflight.mavsdk_offboard import MavsdkOffboardConnector
+    from droneflight.trunk_manifest import TrunkManifestError, load_trunk_manifest
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        mission = load_qgc_plan(args.plan)
+        manifest = load_trunk_manifest(args.trunks)
+    except (PlanLoadError, TrunkManifestError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    speeds = sorted({round(mission.leg_speed_ms(i), 2) for i in range(len(mission.waypoints))})
+    print(
+        f"plan: {len(mission.waypoints)} waypoints, leg speeds {speeds} m/s; "
+        f"forest: {len(manifest.trunks)} trunks from {args.trunks}"
+    )
+    config = LocalOffboardConfig(
+        planner=LocalPlannerConfig(cruise_speed_ms=max(speeds)),
+        fov_deg=args.fov,
+        n_rays=int(args.fov) + 1,
+        sensor_range_m=args.sensor_range,
+        stall_timeout_s=args.stall_timeout,
+        max_speed_override_ms=args.max_speed,
+    )
+    obstacles = manifest.obstacle_field()
+    connector = MavsdkOffboardConnector(control_hz=args.control_hz)
+    latest: dict[str, Pose] = {}
+
+    async def pump_truth() -> None:
+        topic = await asyncio.to_thread(
+            wait_for_truth_topic, world=args.world, model=args.model, timeout_s=30.0
+        )
+        print(f"truth: {topic.topic} ({topic.kind})")
+        async for sample in GazeboTruthSource(topic).stream():
+            # t_s = SIMULATOR time: the planner must run on the vehicle's clock
+            # (Gazebo fell to 0.34x real time with 3125 trunks; see local_offboard).
+            latest["pose"] = Pose(
+                sample.east_m, sample.north_m, sample.up_m, sample.euler_enu()[2], t_s=sample.t_s
+            )
+
+    async def run() -> object:
+        truth_task = None
+        if args.truth == "gazebo":
+            truth_task = asyncio.create_task(pump_truth())
+            for _ in range(300):
+                if "pose" in latest or truth_task.done():
+                    break
+                await asyncio.sleep(0.1)
+            if "pose" not in latest:
+                if truth_task.done() and truth_task.exception() is not None:
+                    raise RuntimeError(f"truth source failed: {truth_task.exception()}")
+                raise RuntimeError("no ground truth from Gazebo after 30 s")
+        await connector.connect(args.url, ready_timeout_s=120.0)
+        await connector.arm()
+        await connector.takeoff(args.takeoff_alt)
+        try:
+            return await fly_local(
+                connector,
+                mission,
+                obstacles,
+                config,
+                truth=(lambda: latest.get("pose")) if truth_task is not None else None,
+                record=args.record,
+            )
+        finally:
+            await connector.stop_offboard()
+            if truth_task is not None:
+                # Await the cancellation so the gz subprocess is closed while the
+                # loop is still alive (else: "Event loop is closed" at exit).
+                truth_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await truth_task
+            await connector.disconnect()
+
+    result = asyncio.run(run())
+    print(result)
+    ok = getattr(result, "reached_goal", False) and getattr(result, "contacts", 1) == 0
+    print("VERDICT (oracle — confirm with b2-score):", "CLEAN" if ok else "NOT CLEAN")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The full CLI grammar.
 
@@ -1209,6 +1294,43 @@ def build_parser() -> argparse.ArgumentParser:
         "The control arm for the in-loop speed-policy test (RUNBOOK §4.7).",
     )
     f.set_defaults(func=_fly)
+
+    fl = sub.add_parser(
+        "fly-local",
+        help="Fly a .plan offboard with the onboard LOCAL PLANNER (remembers trunks, plans "
+        "through gaps) — the 2026-09-23 replacement for fly-corridor's reactive layer.",
+    )
+    fl.add_argument("--plan", type=Path, required=True)
+    fl.add_argument(
+        "--trunks",
+        type=Path,
+        required=True,
+        help="The trunk manifest the Gazebo world was built from (oracle depth sensor).",
+    )
+    fl.add_argument("--url", default="udpin://0.0.0.0:14540")
+    fl.add_argument("--control-hz", type=float, default=10.0)
+    fl.add_argument("--sensor-range", type=float, default=30.0)
+    fl.add_argument("--fov", type=float, default=90.0)
+    fl.add_argument("--takeoff-alt", type=float, default=10.0)
+    fl.add_argument("--stall-timeout", type=float, default=90.0)
+    fl.add_argument(
+        "--max-speed", type=float, default=None, help="Cap every leg (m/s), below the plan."
+    )
+    fl.add_argument(
+        "--truth",
+        choices=("gazebo", "none"),
+        default="gazebo",
+        help="Where the oracle sensor's pose comes from. 'gazebo' (default) = simulator "
+        "truth, required GPS-denied: PX4's estimate is deliberately wrong there, and a "
+        "camera sees the real trees from the real aircraft. 'none' = PX4's estimate "
+        "(GPS-aided runs only). Must run on the sim host (needs `gz`).",
+    )
+    fl.add_argument("--world", default="forest_mvp")
+    fl.add_argument("--model", default="x500_0")
+    fl.add_argument(
+        "--record", type=Path, default=None, help="Per-step JSONL (truth, estimate, commands)."
+    )
+    fl.set_defaults(func=_fly_local)
 
     fc = sub.add_parser(
         "fly-corridor",
