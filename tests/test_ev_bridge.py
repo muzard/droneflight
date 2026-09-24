@@ -27,6 +27,7 @@ from droneflight.ev_bridge import (
     ReplayTruthSource,
     TrackRecorder,
     TruthSample,
+    VisionPose,
     _JsonStreamSplitter,
     analyse_track,
     discover_gz_topics,
@@ -842,3 +843,24 @@ def test_load_track_defaults_the_new_fields_for_older_records(tmp_path: Path) ->
     (sample,) = load_track(path)
     assert sample.ev_down is False
     assert sample.yaw_error_rad == 0.0
+
+
+async def test_a_refused_publish_is_ridden_out_not_fatal() -> None:
+    """🔴 fix2 (2026-09-24): one NO_SYSTEM after a heartbeat timeout killed the
+    bridge and left a GPS-denied aircraft with no aiding at all."""
+
+    class Flaky(RecordingPublisher):
+        calls = 0
+
+        async def publish(self, pose: VisionPose) -> None:
+            self.calls += 1
+            if 20 <= self.calls < 40:
+                raise EvBridgeError("vision publish failed: NO_SYSTEM")
+            await super().publish(pose)
+
+    bridge = EvBridge(ErrorInjector(DriftConfig(rate=0.02, seed=3)), EvBridgeConfig(rate_hz=0.0))
+    pub = Flaky()
+    stats = await bridge.run(ReplayTruthSource(_straight_truth()), pub)
+    assert stats.publish_failures == 20
+    assert stats.published == 180
+    assert len(pub.poses) == 180

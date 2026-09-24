@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import shutil
 import subprocess
@@ -49,6 +50,8 @@ from typing import Any, Literal, Protocol, runtime_checkable
 from droneflight.correction import Fix
 from droneflight.model import FlightMission
 from droneflight.nav import DropoutModel, ErrorInjector, local_enu
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "BridgeSample",
@@ -634,6 +637,9 @@ class EvBridgeStats:
     corrupt_accepted: int = 0
     dropout_events: int = 0
     dropout_suppressed: int = 0  # publishes withheld because EV had lost lock
+    publish_failures: int = 0
+    """Publishes the autopilot link refused (e.g. MAVSDK ``NO_SYSTEM`` after a
+    heartbeat timeout). Counted and ridden out, never fatal — see :meth:`EvBridge.run`."""
     max_yaw_error_rad: float = 0.0
     track_enu: list[tuple[float, float]] = field(default_factory=list)
 
@@ -764,8 +770,21 @@ class EvBridge:
                 # mode that does not exist.
                 stats.dropout_suppressed += 1
             else:
-                await publisher.publish(pose)
-                stats.published += 1
+                # 🔴 A refused publish must not end the bridge. In a GPS-denied SITL
+                # flight (fix2, 2026-09-24) a MAVSDK heartbeat timeout under a
+                # CPU-starved VM made one publish fail with NO_SYSTEM; the bridge
+                # raised and exited, EKF2 lost its only aiding, and the estimate
+                # ran 181 m away. The link recovers on its own once heartbeats
+                # resume, so keep publishing.
+                try:
+                    await publisher.publish(pose)
+                    stats.published += 1
+                except EvBridgeError as exc:
+                    stats.publish_failures += 1
+                    if stats.publish_failures in (1, 10, 100) or stats.publish_failures % 1000 == 0:
+                        _log.warning(
+                            "vision publish refused (%d so far): %s", stats.publish_failures, exc
+                        )
 
             yaw_err = self.injector.yaw_error_rad
             stats.max_yaw_error_rad = max(stats.max_yaw_error_rad, abs(yaw_err))
