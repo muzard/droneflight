@@ -864,6 +864,8 @@ def read_groundtruth_track(
 
     NED -> ENU: east = y, north = x, up = -z.
     """
+    if not ulog_path.is_file():
+        raise OSError("no such file")
     from pyulog import ULog  # optional analysis dependency
 
     log = ULog(str(ulog_path), ["vehicle_local_position_groundtruth"])
@@ -897,6 +899,9 @@ def _b2_score(args: argparse.Namespace) -> int:
         t, east, north, up, ve, vn = read_groundtruth_track(args.ulog)
     except (OSError, ValueError, KeyError) as exc:
         print(f"ERROR: cannot read {args.ulog}: {exc}")
+        return 2
+    except ImportError:
+        print("ERROR: reading a ULog needs pyulog: pip install 'droneflight[analysis]'")
         return 2
 
     report = score_track(
