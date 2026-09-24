@@ -183,13 +183,36 @@ before and after, even with 10.5 m nav error. SITL is the arbiter for this class
 | mvp2 | fix5 code, forest legs at the harness's **5.0 m/s** | **1 strike** (waypoint 71) |
 | mvp3 | + stopping distance with saturated braking | **1 strike** (waypoint 54) |
 
-🔑 **The harness envelope is optimistic above ~3 m/s — SITL is the arbiter.** With
+**Then a seed sweep on the final stack** (`sim-logs/mvp_local/s*`, `q2f`; RUNBOOK
+§4.14): the EV noise is seeded, so each run is one draw. Two more stack changes
+came out of it — **fixes are bled over 30 m, not 10** (at 10 m a 4-5 m fix moved
+the estimate ~1.4 m/s and EKF2's velocity took part of it: same seeds 2/3 at 3 m/s
+grazed twice at 10 m, clean at 30 m with the same nav error), and the bridge now
+also publishes the **VIO velocity** (`EKF2_EV_CTRL 15`; measured no effect on the
+contacts, kept because it is what the sensor provides). Results, 200/ha GPS-denied:
+
+| speed | clean (seed set) | contact (seed set) |
+|---|---|---|
+| 4 m/s | 0/1 | 2/3 (at 10 m and at 30 m bleed) |
+| 3 m/s | 0/1, 2/3, 6/7 | **4/5, twice** |
+| **2 m/s** | **4/5 — +1.05 m of air** | — |
+| 400/ha, 2 m/s | 4/5, +0.34 m | — |
+
+**Planning anchor: 2.0 m/s at 200 and 400 stems/ha.** Every struck trunk had been
+in the sensor's view from ~30 m, 6-12 s before contact, nearly dead ahead — this
+is not sensing. It is the replan × PX4 tracking-lag interaction: each prediction
+assumes the current path is followed, the next replan changes it, and the flown
+line ends 0.5-0.9 m inside what any single plan allowed. ▶ **Next:** log the
+planner's path and feasibility candidates in the `fly-local` record, so a SITL
+contact can be replayed exactly instead of approximately.
+
+🔑 **The harness envelope is optimistic above ~2 m/s — SITL is the arbiter.** With
 all fixes the harness flies 200/ha at 5 m/s and 400/ha at 4 m/s clean over 4 seeds
 (`tools/envelope_sweep.py`); SITL hit a trunk at 5 m/s at 200/ha in both tries. At
 5 m/s PX4 shed speed at ~1.4 m/s² against the 3 demanded, and the aircraft curved
 onto a trunk that had sat just off its velocity ray. So the planner now prices on
-a **SITL-anchored** envelope (`droneplanner/fields/stem_density.py`): 200 → 3.0,
-400 → 2.0 as flown, the rest discounted by the measured ratio. Raising an anchor
+a **SITL-anchored** envelope (`droneplanner/fields/stem_density.py`): 200 and 400
+→ 2.0 as flown, the rest discounted by the measured ratio. Raising an anchor
 takes a SITL flight, ~20 min each.
 
 Also fixed: the **EV bridge exited on one refused publish** (MAVSDK NO_SYSTEM
