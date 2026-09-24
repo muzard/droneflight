@@ -258,19 +258,23 @@ def test_the_corridor_floor_keeps_a_zero_width_vertex_passable() -> None:
     assert _min_dist(path, [(10.0, 0.0)]) >= CFG.hard_m - 1e-6
 
 
-def test_prediction_starts_from_the_acceleration_the_airframe_has() -> None:
-    """🔴 At 500-600 stems/ha the predictor started every candidate from rest.
-    A built-up 3 m/s^2 toward a trunk takes ~1.5 s to unwind under the jerk
-    limit, so the aircraft slid 0.5 m off a path the check had passed as clear."""
-    p = LocalPlanner()
-    trunk = [(2.5, 1.4)]
-    path = [(0.5 * k, 0.0) for k in range(40)]
-    at_rest = p._predict_gap((0.0, 0.0), (1.5, 0.6), path, 1.5, trunk)
-    p._update_accel((1.5, 0.0), 0.0)
-    p._update_accel((1.5, 0.6), 0.2)  # accelerating north, toward the trunk
-    assert p.accel[1] > 2.0
-    loaded = p._predict_gap((0.0, 0.0), (1.5, 0.6), path, 1.5, trunk)
-    assert loaded < at_rest - 0.2
+def test_prediction_flies_the_setpoints_already_in_flight() -> None:
+    """🔴 PX4 acts on a velocity setpoint ~0.3 s after it is sent (measured,
+    px4_profile.OFFBOARD_*). A GPS-denied SITL flight carried 2 m/s east for half a
+    second after the command turned north and hit a trunk the prediction — which
+    assumed the new command took effect at once — had passed as clear."""
+    path = [(0.0, 0.5 * k) for k in range(40)]  # the new plan: due north
+    trunk = [(1.2, 0.9)]  # just east of it
+
+    def gap(issued: tuple[float, float]) -> float:
+        p = LocalPlanner()
+        p._now = 1.0
+        p._issued = [(0.7 + 0.1 * k, *issued) for k in range(4)]
+        return p._predict_gap((0.0, 0.0), (2.0, 0.0), path, 1.0, trunk)
+
+    still_east = gap((2.0, 0.0))  # the last 0.3 s of setpoints said east
+    already_north = gap((0.0, 1.0))
+    assert still_east < already_north - 0.1
 
 
 def test_slow_means_tight_the_lookahead_scales_with_speed() -> None:

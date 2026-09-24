@@ -67,6 +67,7 @@ import math
 from dataclasses import dataclass, field
 
 from droneflight.perception import DepthScan
+from droneflight.px4_profile import OFFBOARD_DELAY_S, OFFBOARD_TAU_S
 
 Point = tuple[float, float]
 
@@ -177,12 +178,18 @@ class LocalPlannerConfig:
     max_accel_ms2: float = 3.0
     """PX4 ``MPC_ACC_HOR`` — the envelope the feasibility check flies candidates in."""
 
-    max_jerk_ms3: float = 4.0
-    """PX4 ``MPC_JERK_AUTO``."""
+    response_delay_s: float = OFFBOARD_DELAY_S
+    response_tau_s: float = OFFBOARD_TAU_S
+    """How the airframe answers a velocity setpoint — dead time, then a first-order
+    lag, saturating at ``max_accel_ms2``. Measured from the SITL records
+    (``px4_profile.OFFBOARD_*``); the feasibility check flies candidates in it."""
 
     predict_s: float = 2.5
-    predict_margin_m: float = 0.15
-    """Smallest predicted air gap a (path, speed) candidate may have."""
+    predict_margin_m: float = 0.30
+    """Smallest predicted air gap a (path, speed) candidate may have. It must cover
+    the prediction's own error: the measured response model is 0.18 m out at p95
+    one second ahead, and at the old 0.15 a GPS-denied SITL flight accepted
+    predictions of 0.22-0.44 m on the way into a trunk it then hit."""
 
     seen_cell_m: float = 0.6
     """Resolution of the observed-free-space grid behind the sight-distance limit."""
@@ -769,11 +776,10 @@ class LocalPlanner:
     """Times no candidate cleared the predicted-pass margin (the least-bad was flown)."""
     _last_speed: float = 0.0
     _last_cmd_t: float | None = None
-    _accel_vel: Point | None = None
-    _accel_t: float | None = None
-    accel: Point = (0.0, 0.0)
-    """Estimated current acceleration (believed frame), from the velocity history.
-    Seeds the feasibility prediction — see :meth:`_predict_gap`."""
+    _now: float = 0.0
+    _issued: list[tuple[float, float, float]] = field(default_factory=list)
+    """``(t, vx, vy)`` setpoints already sent: the airframe is still acting on the
+    last ``response_delay_s`` of them whatever is decided now."""
 
     def __post_init__(self) -> None:
         if self.seen is None:
@@ -887,6 +893,26 @@ class LocalPlanner:
         the local planner may fly slower than but never faster.
         """
         cfg = self.config
+        self._now = t_s
+        cmd = self._command(x, y, goal, t_s, added, velocity, max_speed_ms, corridor)
+        self._issued.append((t_s, cmd.vx, cmd.vy))
+        horizon = t_s - cfg.response_delay_s - 0.5
+        while self._issued and self._issued[0][0] < horizon:
+            self._issued.pop(0)
+        return cmd
+
+    def _command(
+        self,
+        x: float,
+        y: float,
+        goal: Point,
+        t_s: float,
+        added: list[Point] | None,
+        velocity: Point | None,
+        max_speed_ms: float | None,
+        corridor: Corridor | None,
+    ) -> PlannerCommand:
+        cfg = self.config
         replanned = False
         if (
             self.path is None
@@ -937,7 +963,6 @@ class LocalPlanner:
             if self._last_speed + up < speed:
                 speed, limit = self._last_speed + up, "ramp"
         if velocity is not None:
-            self._update_accel(velocity, t_s)
             feasible = self._feasible_speed((x, y), velocity, speed)
             if feasible < speed - 1e-9:
                 limit = "feasibility"
@@ -960,22 +985,12 @@ class LocalPlanner:
         cfg = self.config
         return min(cfg.pursuit_m, max(cfg.min_pursuit_m, cfg.pursuit_s * speed))
 
-    def _update_accel(self, velocity: Point, t_s: float) -> None:
-        """Differentiate velocity, lightly smoothed (~0.2 s) and clamped to the envelope."""
-        if self._accel_vel is not None and self._accel_t is not None:
-            dt = t_s - self._accel_t
-            if dt > 1e-6:
-                raw = _clamp(
-                    (velocity[0] - self._accel_vel[0]) / dt,
-                    (velocity[1] - self._accel_vel[1]) / dt,
-                    self.config.max_accel_ms2,
-                )
-                w = min(1.0, dt / 0.2)
-                self.accel = (
-                    self.accel[0] + w * (raw[0] - self.accel[0]),
-                    self.accel[1] + w * (raw[1] - self.accel[1]),
-                )
-        self._accel_vel, self._accel_t = velocity, t_s
+    def _issued_at(self, t: float, default: Point) -> Point:
+        """The setpoint in force at time ``t`` (the last one sent at or before it)."""
+        for ts, vx, vy in reversed(self._issued):
+            if ts <= t:
+                return (vx, vy)
+        return default
 
     def _feasible_speed(self, pos: Point, velocity: Point, speed: float) -> float:
         """Pick a (path, speed) the airframe can actually fly without a close pass.
@@ -985,8 +1000,8 @@ class LocalPlanner:
         turned the path 70 deg about a metre from the trunk, and a jerk-limited
         airframe needs ~0.75 s just to *build* lateral acceleration — so it went
         straight on. A path being clear is not the same as the aircraft being
-        able to follow it. So each candidate is flown forward ``predict_s`` under
-        PX4's accel/jerk limits (the envelope `maneuver` and `reactive` use) and
+        able to follow it. So each candidate is flown forward ``predict_s`` through
+        the measured offboard response (dead time + lag, ``px4_profile``) and
         scored by the closest predicted pass. Candidates, in order of preference:
         the new path at the chosen speed, then slower; the previous path; a stop.
         """
@@ -1032,22 +1047,28 @@ class LocalPlanner:
         dt = 0.1
         px, py = pos
         vx, vy = velocity
-        # 🔴 Start from the acceleration the airframe HAS, not zero. Under a jerk
-        # limit a built-up 3 m/s^2 takes ~1.5 s to unwind; predicting from rest
-        # hid that overshoot, and at 500-600 stems/ha the aircraft slid 0.5 m off a
-        # path the predictor had passed as 0.15 m clear, into a trunk it had mapped.
-        ax, ay = self.accel
+        # 🔴 The airframe is still flying the setpoints of the last
+        # ``response_delay_s`` — whatever is decided now lands after them. The
+        # jerk-limited model this replaced predicted SITL 1 s ahead to 0.40 m (p95);
+        # a GPS-denied flight hit a trunk the prediction had passed as clear while
+        # the aircraft carried 2 m/s east for 0.5 s after the command turned north.
         k = _nearest_index(path, pos, 0)
         worst = math.inf
-        for _ in range(int(cfg.predict_s / dt)):
-            k = _nearest_index(path, (px, py), k)
-            tgt, _ = _point_along(path, k, self._pursuit(speed))
-            ex, ey = tgt[0] - px, tgt[1] - py
-            en = math.hypot(ex, ey)
-            wx, wy = (ex / en * speed, ey / en * speed) if en > 1e-6 and speed > 0 else (0.0, 0.0)
-            adx, ady = _clamp((wx - vx) / dt, (wy - vy) / dt, cfg.max_accel_ms2)
-            jx, jy = _clamp(adx - ax, ady - ay, cfg.max_jerk_ms3 * dt)
-            ax, ay = ax + jx, ay + jy
+        for step in range(int(cfg.predict_s / dt)):
+            tt = step * dt
+            if tt < cfg.response_delay_s:
+                wx, wy = self._issued_at(self._now - cfg.response_delay_s + tt, velocity)
+            else:
+                k = _nearest_index(path, (px, py), k)
+                tgt, _ = _point_along(path, k, self._pursuit(speed))
+                ex, ey = tgt[0] - px, tgt[1] - py
+                en = math.hypot(ex, ey)
+                wx, wy = (
+                    (ex / en * speed, ey / en * speed) if en > 1e-6 and speed > 0 else (0.0, 0.0)
+                )
+            ax, ay = _clamp(
+                (wx - vx) / cfg.response_tau_s, (wy - vy) / cfg.response_tau_s, cfg.max_accel_ms2
+            )
             vx, vy = vx + ax * dt, vy + ay * dt
             px, py = px + vx * dt, py + vy * dt
             for qx, qy in near:

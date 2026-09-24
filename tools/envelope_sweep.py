@@ -3,7 +3,8 @@
     python tools/envelope_sweep.py --density 500 600 800 --speed 1.0 1.5 2.0 \
         --seeds 0 1 2 3 --length 1200
 
-Flies `reactive.fly_with_local_planner` (PX4 accel/jerk limits, oracle depth
+Flies `reactive.fly_with_local_planner` (measured PX4 offboard response, drawn per
+seed from inside its fit uncertainty; oracle depth
 sensor, 90 deg FOV, 91 rays, 30 m range, truth navigation) along the first
 ``--length`` metres of the below-canopy MVP route through a uniform Poisson
 forest, trunk radii 0.08-0.25 m, in a +-40 m band. One JSON line per run.
@@ -85,6 +86,7 @@ def run(case: tuple[float, float, int, float]) -> dict[str, object]:
         config,
         stop_m=length,
         max_time_s=max(600.0, 3.0 * length / speed),
+        plant_seed=seed,
     )
     return {
         "per_ha": per_ha,
