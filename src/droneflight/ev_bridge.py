@@ -42,7 +42,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -515,6 +515,8 @@ class VisionPose:
     pitch_rad: float
     yaw_rad: float
     time_usec: int = 0
+    velocity_ned: tuple[float, float, float] | None = None
+    """VIO velocity, sent as ``VISION_SPEED_ESTIMATE`` (fused with EKF2_EV_CTRL bit 4)."""
 
 
 @runtime_checkable
@@ -551,6 +553,16 @@ class MavsdkMocapPublisher:  # pragma: no cover - requires a live autopilot
                     pose_covariance=Covariance([float("nan")]),
                 )
             )
+            if pose.velocity_ned is not None:
+                from mavsdk.mocap import SpeedNed, VisionSpeedEstimate
+
+                await self._system.mocap.set_vision_speed_estimate(
+                    VisionSpeedEstimate(
+                        time_usec=pose.time_usec,
+                        speed_ned=SpeedNed(*pose.velocity_ned),
+                        speed_covariance=Covariance([float("nan")]),
+                    )
+                )
         except Exception as exc:
             raise EvBridgeError(f"vision publish failed: {exc}") from exc
 
@@ -568,6 +580,13 @@ class EvBridgeConfig:
     corridor_tolerance_m: float = 15.0
     timestamp_mode: TimestampMode = "none"
     max_duration_s: float = 0.0  # 0 = run until the truth stream ends or stop is set
+    publish_velocity: bool = True
+    """Also publish the VIO's velocity. 🔴 Without it EKF2 fuses position only, so
+    every bled-in VTRN fix drags its VELOCITY estimate too (p90 1.4-2.0 m/s off
+    truth during bleeds, SITL 2026-09-24) — and PX4's velocity loop and the local
+    planner both act on that. A real VIO's velocity is locally accurate and a
+    map-frame fix is not part of it, so it is truth velocity here (drift adds
+    ~2 % of speed, ignored). Needs ``EKF2_EV_CTRL`` with the velocity bit (15)."""
 
 
 @dataclass(frozen=True)
@@ -728,6 +747,8 @@ class EvBridge:
         next_pub_t = -math.inf
         t0: float | None = None
         dist_since_pub = 0.0
+        prev: TruthSample | None = None
+        velocity_ned: tuple[float, float, float] | None = None
 
         async for sample in truth.stream():
             if stop is not None and stop.is_set():
@@ -747,6 +768,14 @@ class EvBridge:
                 fix = self.injector.advance(step, sample.east_m, sample.north_m)
                 dist_since_pub += step
             last_pos = (sample.east_m, sample.north_m)
+            if prev is not None and sample.t_s > prev.t_s:
+                dt = sample.t_s - prev.t_s
+                velocity_ned = enu_to_ned(
+                    (sample.east_m - prev.east_m) / dt,
+                    (sample.north_m - prev.north_m) / dt,
+                    (sample.up_m - prev.up_m) / dt,
+                )
+            prev = sample
 
             err_e, err_n = self.injector.error
             err = math.hypot(err_e, err_n)
@@ -764,6 +793,8 @@ class EvBridge:
             dist_since_pub = 0.0
 
             pose = self._pose_for(sample, (err_e, err_n))
+            if self.config.publish_velocity and velocity_ned is not None:
+                pose = replace(pose, velocity_ned=velocity_ned)
             if ev_down:
                 # A real estimator that has lost tracking sends nothing at all.
                 # Publishing a stale or degraded pose instead would test a failure

@@ -864,3 +864,24 @@ async def test_a_refused_publish_is_ridden_out_not_fatal() -> None:
     assert stats.publish_failures == 20
     assert stats.published == 180
     assert len(pub.poses) == 180
+
+
+async def test_the_vio_velocity_is_published_and_excludes_the_injected_error() -> None:
+    """🔴 Position-only EV let every bled-in VTRN fix drag EKF2's velocity (SITL,
+    2026-09-24). The published velocity is the VIO's: truth rate of change, in
+    NED, untouched by the error the position carries."""
+    injector = ErrorInjector(DriftConfig(rate=0.05, seed=3))
+    stats, pub = await _run(injector, _straight_truth(), rate_hz=0.0)
+    moving = [p for p in pub.poses if p.velocity_ned is not None]
+    assert len(moving) == stats.published - 1  # the first sample has no velocity yet
+    for pose in moving:
+        vn, ve, vd = pose.velocity_ned  # type: ignore[misc]
+        assert vn == pytest.approx(50.0)  # 5 m per 0.1 s, due north
+        assert ve == pytest.approx(0.0) and vd == pytest.approx(0.0)
+    off = await _run(
+        ErrorInjector(DriftConfig(rate=0.05, seed=3)),
+        _straight_truth(),
+        rate_hz=0.0,
+        publish_velocity=False,
+    )
+    assert all(p.velocity_ned is None for p in off[1].poses)

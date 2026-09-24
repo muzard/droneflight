@@ -732,6 +732,7 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
         corridor_tolerance_m=args.corridor,
         timestamp_mode=args.timestamp,
         max_duration_s=args.duration,
+        publish_velocity=getattr(args, "publish_velocity", True),
     )
     try:
         with contextlib.ExitStack() as stack:
@@ -1220,6 +1221,13 @@ def build_parser() -> argparse.ArgumentParser:
         "10 m a 4-5 m fix moved the estimate at ~1.4 m/s, EKF2's velocity took up "
         "part of it, and GPS-denied local-planner flights grazed trunks (s3b); "
         "the same seeds at 30 m flew clean with the same nav error (s3c).",
+    )
+    eb.add_argument(
+        "--publish-velocity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also send the VIO velocity (VISION_SPEED_ESTIMATE); set EKF2_EV_CTRL 15 "
+        "to fuse it. Without it a VTRN fix drags EKF2's velocity estimate.",
     )
     eb.add_argument("--forest-frac", type=float, default=0.4)
     eb.add_argument("--stale-frac", type=float, default=0.1)
