@@ -155,6 +155,36 @@ the first time the harness has been confirmed in the loop for an avoidance layer
 The harness now bleeds fixes in like the bridge (`fix_ramp_m`), which is what
 exposed 2 and 3 offline.
 
+🔴 **2026-09-24: the loop found four more defects, and the model behind them.**
+Chasing the envelope past 400/ha, then two GPS-denied SITL contacts:
+
+| # | found by | defect | fix |
+|---|---|---|---|
+| 4 | harness, 500-600/ha grazes | feasibility predicted from zero acceleration | (superseded by 6) |
+| 5 | harness, 800/ha: stationary 700 s | fixed 2.5 m pursuit chord cuts every bend by the same amount at any speed, so nothing was predicted clear and "stop" won forever | lookahead = 1.2 s of travel (0.8-2.5 m) + a creep candidate |
+| 6 | **SITL fix2**: contact, −0.17 m | the prediction model was PX4's AUTO-mode jerk generator; **offboard velocity setpoints bypass it** | measured response: **0.3 s dead time + 0.4 s lag** (`px4_profile.OFFBOARD_*`, fitted on 3225 SITL windows, 1 s position error 0.05 m mean / 0.18 p95; the jerk model 0.17 / 0.40). Predictor flies the setpoints already in flight; margin 0.15 → 0.30; harness plant = same model, drawn per seed from inside the fit |
+| 7 | **SITL fix3 + fix4**: contact at the SAME trunk | heading at a trunk at 2.9 m/s from 1.6 m when stopping takes ~2 m; replans kept going round it, then reversed | **momentum limit** `v ≤ (room along current velocity − margin) / (delay + lag)`; a moving candidate must also leave a clean stop after one replan |
+
+Replay of the SITL records (the planner stepped through the flown inputs)
+showed the **map was right every time** (trunk within 0.0-0.15 m) — the failures
+were all prediction/dynamics, the same class as [[px4-vs-offline-models]].
+Ruled out by measurement: telemetry staleness (est vs truth lag slope ≈ 0.00 s),
+the tether plugin (fix4 tether off, same spot), CPU starvation (fix4 on a quiet
+host). ⚠️ **The harness never reproduced 6 or 7** — 16/16 GPS-denied seeds clean
+before and after, even with 10.5 m nav error. SITL is the arbiter for this class.
+
+| SITL, GPS-denied, forest_mvp 200/ha | code | `b2-score` |
+|---|---|---|
+| denied3 (09-24 night) | pre-fixes | 0 strikes, +0.78 m |
+| fix2 | + accel seed + lookahead | **contact −0.17 m** (tether on) |
+| fix3 | + measured response model | **contact −0.23 m** (tether on) |
+| fix4 | same as fix3 | **2 contacts** (tether off, quiet host) |
+| **fix5** | + momentum limit + stop-after | **0 strikes, +0.676 m, 18.6 min** — +0.47 m at the fix3/4 trunk |
+
+Also fixed: the **EV bridge exited on one refused publish** (MAVSDK NO_SYSTEM
+after a heartbeat timeout under a starved VM, fix2) and left EKF2 with no aiding
+— the estimate ran 181 m off. It now counts and rides failures out.
+
 🧪 **B4 sensor ladder (`tools/sensor_ladder.py`, 2026-09-24) — the oracle is not
 load-bearing.** MVP forest, 200/ha, 3 m/s, GPS-denied, 2 seeds per rung: **0 strikes
 at every rung** — range noise 0.1/0.3/0.6 m at 10 m (growing with range), 30 % and

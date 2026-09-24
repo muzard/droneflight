@@ -1804,6 +1804,24 @@ applied tension peak **0.776 N (39 % of 2 N)** on the open legs at 6.1 m/s, fore
 turn transient peak 0.28 N. ⚠️ Copying the CSV while Gazebo still runs leaves a
 partial last line — `tether-plugin-check` rejects it; stop SITL first or drop it.
 
+**Flights fix1-fix5 — the planner-dynamics series (2026-09-24,
+`sim-logs/mvp_local/fix*`).** Detail and the table: `CLAUDE.md` → ONBOARD LOCAL
+PLANNER, "the loop found four more defects". fix1 GPS-aided clean (+0.69 m);
+fix2/fix3/fix4 GPS-denied each touched a trunk; **fix5 GPS-denied CLEAN, +0.676 m,
+18.6 min** with the momentum limit. Procedure is the GPS-denied one above, with
+the params saved once (`cat ~/px4_gps_denied.txt >> /tmp/pxcmds`, restart), then
+per run: `~/launch_sitl.sh …` (or `launch_sitl_tether.sh` for the plugin),
+`mavlink start …` into `/tmp/pxcmds`, `~/launch_ev.sh <tag>`, `~/launch_fly.sh <tag>
+--truth gazebo`. 🔑 **The EV noise is seeded, so a trouble spot recurs** (fix3 and
+fix4 hit the same trunk at waypoint 44, 163 s in) — A/B a change by flying to
+~waypoint 55 and stopping, ~5 min per arm.
+⚠️ **Replaying a record through the planner is approximate** (it diverged from
+the flown commands within seconds); use it for what the map held, not for exact
+candidate values.
+⚠️ **Do not run offline sweeps on the Mac during a flight you will score** — the
+VM shares its CPU; at RTF 0.4 MAVSDK's callback queue backs up. It did not cause
+the contacts here, but it did kill the EV bridge in fix2.
+
 #### Traps
 1. 🐛 **`pkill -f "gz sim"` inside `ssh '...'` kills the ssh session itself** — the
    remote `bash -c` command line contains the pattern. Launch from a script file
