@@ -256,3 +256,18 @@ def test_the_corridor_floor_keeps_a_zero_width_vertex_passable() -> None:
     path = plan_local([(10.0, 0.0)], (0.0, 0.0), (20.0, 0.0), CFG, corridor)
     assert path is not None
     assert _min_dist(path, [(10.0, 0.0)]) >= CFG.hard_m - 1e-6
+
+
+def test_prediction_starts_from_the_acceleration_the_airframe_has() -> None:
+    """🔴 At 500-600 stems/ha the predictor started every candidate from rest.
+    A built-up 3 m/s^2 toward a trunk takes ~1.5 s to unwind under the jerk
+    limit, so the aircraft slid 0.5 m off a path the check had passed as clear."""
+    p = LocalPlanner()
+    trunk = [(2.5, 1.4)]
+    path = [(0.5 * k, 0.0) for k in range(40)]
+    at_rest = p._predict_gap((0.0, 0.0), (1.5, 0.6), path, 1.5, trunk)
+    p._update_accel((1.5, 0.0), 0.0)
+    p._update_accel((1.5, 0.6), 0.2)  # accelerating north, toward the trunk
+    assert p.accel[1] > 2.0
+    loaded = p._predict_gap((0.0, 0.0), (1.5, 0.6), path, 1.5, trunk)
+    assert loaded < at_rest - 0.2
