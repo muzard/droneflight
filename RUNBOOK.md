@@ -1787,6 +1787,23 @@ clone), launch helpers in `~/launch_sitl.sh`, `~/launch_ev.sh`, `~/launch_fly.sh
 `~/stop_df.sh`; worlds `forest_mvp`, `forest_mvp400`, `forest_mvp400n` in PX4's
 worlds dir; plans `mvp.plan`, `mvp400.plan`, `mvp400_forest.plan`.
 
+**Flight 4 — TETHER ON, GPS-aided, ✅ CLEAN (2026-09-24, `sim-logs/mvp_local/tether1_07_11_36.ulg`
++ `tether1.csv` + `tether1.jsonl`).** The user's check that full-speed flight is
+within the fiber budget. Same plan as flight 1 (the VM's `mvp.plan` predates the
+corridor block, so no corridor bound). SITL with the plugin:
+
+```bash
+# VM — as ~/launch_sitl.sh, but tether ON and logging (~/launch_sitl_tether.sh)
+~/launch_sitl_tether.sh ~/drone/plans/mvp.plan forest_mvp ~/logs/mvp/sitl-tether.log ~/logs/mvp/tether1.csv
+head -2 ~/logs/mvp/tether1.csv        # two '#' lines = plugin loaded (trap: a missing plugin is silent)
+~/launch_fly.sh tether1 --truth gazebo
+```
+
+`b2-score` 0 strikes / 0 ground impacts / **+1.282 m**; `tether-plugin-check` EXACT;
+applied tension peak **0.776 N (39 % of 2 N)** on the open legs at 6.1 m/s, forest
+turn transient peak 0.28 N. ⚠️ Copying the CSV while Gazebo still runs leaves a
+partial last line — `tether-plugin-check` rejects it; stop SITL first or drop it.
+
 #### Traps
 1. 🐛 **`pkill -f "gz sim"` inside `ssh '...'` kills the ssh session itself** — the
    remote `bash -c` command line contains the pattern. Launch from a script file
@@ -1816,6 +1833,8 @@ worlds dir; plans `mvp.plan`, `mvp400.plan`, `mvp400_forest.plan`.
    `gz topic -e -t /world/<w>/stats -n 1 | grep real_time_factor` before flying**;
    ~1560 trunks ran at 1.04×, ~3100 at 0.4×. Narrow the band (`--forest-band 15`)
    rather than fly a world the VM cannot run in real time.
+
+
 
 ### 4.13 ✅🌲 STEM-ROUTED — through 2500 trunks with **0 STRIKES**, 2026-09-14
 

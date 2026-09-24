@@ -168,6 +168,70 @@ clean on truth. The 1500 m zone decision rests on 400/ha at 2.0 m/s.
 occlusion). ⚠️ 800/ha is outside the envelope, and the canopy-height model puts
 the demo AO's real stands at 520–1290/ha.
 
+## 🧵 TETHER AT FULL SPEED AND UNDER THE CANOPY (2026-09-24)
+User: *"Now that full-speed flight is in use, remember to check and simulate the
+tether drag."* The 1500 m zone means 6 m/s over open ground and weaving flight
+among trunks — neither existed when the tether was last flown (§3, a synthetic
+turn course in mission mode).
+
+**1. `tether-check` now scores the plan's own speeds.** It scored every vertex at
+flat cruise and ignored the `.plan`'s `DO_CHANGE_SPEED`; now each vertex takes the
+faster of its two legs, and the plan speed caps the policy arm (as
+`executor.prepare_items` does). MVP plan: **0.78 N peak, 39 % of the 2 N break.**
+
+**2. Drag at full speed is not v² — it is closer to v³.** Paid-out fiber is at rest
+over the ground and falls broadside at ~1.9 m/s (250 µm, 0.069 g/m), so it touches
+down `height / 1.9 × speed` behind the aircraft: **the airborne span grows with
+speed**. At 12 m AGL and 6 m/s that is ~39 m — which is why the model's 40 m
+default is about right today — but it doubles at 12 m/s. `speed_ceiling_ms`:
+
+| fall height | warn (60 % of break) | break | span at 6 m/s |
+|---|---|---|---|
+| 5 m | 11.3 m/s | 14.6 | 16 m |
+| 12 m (open-ground cruise) | **8.4 m/s** | **10.9** | 39 m |
+| 25 m | 6.5 m/s | 8.5 | 82 m |
+
+**Today's 6 m/s is inside it. Do not raise open-ground cruise past ~8 m/s, or fly
+higher, without payout-bench data** — the fixed-span model would have said 14 m/s.
+⚠️ Free fall ignores back-tension (lengthens the span) and rotor downwash
+(shortens it); both un-benched.
+
+**3. Under the canopy the risk is contact, not tension.**
+`tether.airborne_span_contacts` / `tools/fiber_contact.py`: on a flown track, the
+straight span from touchdown to aircraft cuts the corners the aircraft flew round.
+On the three SITL forest flights (true tracks, flown manifests):
+
+| touchdown behind aircraft | 200/ha GPS | 200/ha GPS-denied | 400/ha GPS-denied |
+|---|---|---|---|
+| ≤ 5 m | **0** | **0** | **0** |
+| 10 m | 0 | 2.3 / km | 5.9 / km |
+| 20 m | 9.3 / km | 14.4 / km | 38.9 / km |
+| 40 m | 37 / km | 43 / km | 108 / km |
+
+Free fall from 9 m puts touchdown **7 m behind at 1.5 m/s, 14 m at 3 m/s** — right on
+the knee. 🔑 **This is a payout requirement: below the canopy the fiber must reach
+the ground within ~5 m of the aircraft**, or slow flight is what gets it there.
+Slower forest speeds help the fiber as well as the avoidance. Whether a contact
+snags, abrades or just slides is unmodelled.
+
+**4. FLOWN in the loop — tether ON, full MVP route, ✅ CLEAN** (`sim-logs/mvp_local/tether1_07_11_36.ulg`
++ `tether1.csv` + `tether1.jsonl`, RUNBOOK §4.14 flight 4). forest_mvp 200/ha,
+GPS-aided, `fly-local`, Gazebo tether plugin on (span 40 m). `b2-score`: **0
+strikes, 0 ground impacts, +1.28 m** min trunk-surface clearance; reached the goal
+in 18.2 min. Plugin parity vs `tether.py`: **EXACT**.
+
+| stretch | peak tension | mean | peak turn transient | max speed |
+|---|---|---|---|---|
+| forest, weaving at ≤3 m/s | 0.67 N | 0.57 N | **0.28 N** (p99 0.19) | 4.9 m/s |
+| open ground, full speed | **0.78 N (39 % of break)** | 0.76 N | 0.05 N | 6.1 m/s |
+
+**At full speed the load is drag on the open legs, not turns among the trunks** —
+offboard weaving produces turn transients about the size of §3's mission-mode
+corners (0.315 N). The 0.6 N drag disturbance did not affect avoidance. So the
+tether is within budget at today's speeds; what limits it is (2) the ceiling if
+cruise rises and (3) trunk contact under the canopy — neither of which the
+plugin models (fixed span, no trees).
+
 ## ✅ STEM-MAP LOCALISATION BUILT (2026-09-15) — `stem_localizer.py`
 **The gap this closes.** The stem-routed plan flew **330/330 with 0 strikes** —
 but **GPS-aided** (`EKF2_GPS_CTRL=7`, `EKF2_EV_CTRL=0`, fix type 3 throughout),
