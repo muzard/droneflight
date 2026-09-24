@@ -452,6 +452,7 @@ def fly_with_local_planner(
     fix_ramp_m: float = 0.0,
     use_corridor: bool = True,
     plant_seed: int | None = None,
+    control_hz: float = 10.0,
 ) -> LocalFlightResult:
     """Fly ``mission`` through ``obstacles`` with the onboard local planner.
 
@@ -530,22 +531,31 @@ def fly_with_local_planner(
     goal = route[-1]
     events: list[StrikeEvent] = []
 
+    # The live executor runs at ~10 Hz and holds each setpoint in between; at the
+    # harness's 20 Hz step the planner used to react twice as often as it can.
+    control_every = max(1, round(1.0 / (control_hz * dt))) if control_hz > 0 else 1
+    step_n = 0
+    cmd: PlannerCommand | None = None
     while t < max_time_s:
         t += dt
         est = (pos[0] + err_x, pos[1] + err_y)
-        scan = sense(obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m)
-        added = planner.observe(scan, est[0], est[1], heading, velocity=vel, t_s=t)
         carrot = guidance.advance(*est)
-        cmd = planner.command(
-            est[0],
-            est[1],
-            (carrot.east_m, carrot.north_m),
-            t,
-            added,
-            velocity=vel,
-            max_speed_ms=leg_speeds[min(guidance.index, len(leg_speeds) - 1)],
-            corridor=corridor,
-        )
+        if cmd is None or step_n % control_every == 0:
+            scan = sense(
+                obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m
+            )
+            added = planner.observe(scan, est[0], est[1], heading, velocity=vel, t_s=t)
+            cmd = planner.command(
+                est[0],
+                est[1],
+                (carrot.east_m, carrot.north_m),
+                t,
+                added,
+                velocity=vel,
+                max_speed_ms=leg_speeds[min(guidance.index, len(leg_speeds) - 1)],
+                corridor=corridor,
+            )
+        step_n += 1
         if cmd.blocked:
             blocked_s += dt
             want = (0.0, 0.0)

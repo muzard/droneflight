@@ -294,3 +294,16 @@ def test_slow_means_tight_the_lookahead_scales_with_speed() -> None:
     fixed = LocalPlanner(config=replace(CFG, min_pursuit_m=CFG.pursuit_m))
     assert fixed._predict_gap((3.0, 0.0), (0.4, 0.0), path, 0.4, trunk) < 0.0
     assert p._predict_gap((3.0, 0.0), (0.4, 0.0), path, 0.4, trunk) > 0.0
+
+
+def test_momentum_caps_speed_toward_a_trunk_not_beside_one() -> None:
+    """🔴 fix3/fix4 (SITL): 2.9 m/s straight at a trunk from 1.6 m, when the
+    measured response needs ~2 m to stop."""
+    p = LocalPlanner()
+    p.memory.add(2.2, 0.0)
+    ahead = p._momentum_speed((0.0, 0.0), (2.9, 0.0))
+    stop_room = 2.2 - CFG.contact_m - CFG.hard_margin_m
+    assert ahead == pytest.approx(stop_room / (CFG.response_delay_s + CFG.response_tau_s))
+    assert ahead < 2.0  # must shed most of the 2.9 m/s it carries
+    beside = p._momentum_speed((0.0, 0.0), (0.0, 2.9))  # flying past it
+    assert beside == pytest.approx(CFG.cruise_speed_ms)

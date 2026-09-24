@@ -947,6 +947,7 @@ class LocalPlanner:
             "brake": self._brake_speed(path),
             "sight": self._sight_speed(path),
             "gap": self._gap_speed(gap),
+            "momentum": self._momentum_speed((x, y), velocity),
         }
         if max_speed_ms is not None:
             limits["mission"] = max_speed_ms
@@ -1028,6 +1029,19 @@ class LocalPlanner:
             if path is None:
                 continue
             gap = self._predict_gap(pos, velocity, path, v, near)
+            if v > 0.0 and gap >= cfg.predict_margin_m:
+                # 🔴 ...and after one replan period of it, a stop must still be
+                # clean. Each replan in fix3 (SITL, 2026-09-24) nudged the path
+                # 0.1-0.15 m closer to a trunk while the aircraft built momentum
+                # toward it; every prediction passed, and by the first that did
+                # not, stopping took more room than was left. This keeps the
+                # aircraft out of states from which no command avoids contact.
+                gap = min(
+                    gap,
+                    self._predict_gap(
+                        pos, velocity, path, v, near, stop_after_s=cfg.replan_period_s
+                    ),
+                )
             if gap >= cfg.predict_margin_m:
                 if path is not self.path:
                     self.reverts += 1
@@ -1041,8 +1055,17 @@ class LocalPlanner:
         return best[2]
 
     def _predict_gap(
-        self, pos: Point, velocity: Point, path: list[Point], speed: float, near: list[Point]
+        self,
+        pos: Point,
+        velocity: Point,
+        path: list[Point],
+        speed: float,
+        near: list[Point],
+        *,
+        stop_after_s: float | None = None,
     ) -> float:
+        """Closest predicted air gap flying ``path`` at ``speed`` for ``predict_s``
+        — or, with ``stop_after_s``, flying it that long and then commanding a stop."""
         cfg = self.config
         dt = 0.1
         px, py = pos
@@ -1058,6 +1081,8 @@ class LocalPlanner:
             tt = step * dt
             if tt < cfg.response_delay_s:
                 wx, wy = self._issued_at(self._now - cfg.response_delay_s + tt, velocity)
+            elif stop_after_s is not None and tt >= cfg.response_delay_s + stop_after_s:
+                wx, wy = 0.0, 0.0
             else:
                 k = _nearest_index(path, (px, py), k)
                 tgt, _ = _point_along(path, k, self._pursuit(speed))
@@ -1144,6 +1169,42 @@ class LocalPlanner:
                     if tail is not None:
                         return _densify([pos, ahead], 0.5) + tail[1:]
         return plan_local(pts, pos, goal, cfg, corridor)
+
+    def _momentum_speed(self, pos: Point, velocity: Point | None) -> float:
+        """Never carry more speed at a trunk than the airframe can shed before it.
+
+        Along the CURRENT velocity — where momentum takes the aircraft whatever is
+        commanded — find the first remembered trunk the airframe would touch, and
+        cap speed so the measured response (dead time + lag) stops it with
+        ``hard_margin_m`` to spare: ``v <= (room - margin) / (delay + tau)``.
+        Passing beside a trunk does not bind it; heading at one does.
+
+        🔴 fix3 and fix4 (GPS-denied SITL, 2026-09-24) both touched the same trunk:
+        2.9 m/s straight at it from 1.6 m, when stopping takes ~2 m, while each
+        replan's path still went round it. The planner reversed the path at the
+        last moment and the airframe, 0.7 s behind its setpoints, went on.
+        """
+        cfg = self.config
+        if velocity is None:
+            return cfg.cruise_speed_ms
+        speed = math.hypot(*velocity)
+        if speed < 0.3:
+            return cfg.cruise_speed_ms
+        ux, uy = velocity[0] / speed, velocity[1] / speed
+        horizon = cfg.cruise_speed_ms * (cfg.response_delay_s + cfg.response_tau_s) + cfg.hard_m
+        room = math.inf
+        for px, py in self.memory.points():
+            dx, dy = px - pos[0], py - pos[1]
+            along = dx * ux + dy * uy
+            if along <= 0.0 or along > horizon:
+                continue
+            lateral = abs(dx * uy - dy * ux)
+            if lateral >= cfg.contact_m:
+                continue
+            room = min(room, along - math.sqrt(cfg.contact_m**2 - lateral**2))
+        if room == math.inf:
+            return cfg.cruise_speed_ms
+        return max(0.0, room - cfg.hard_margin_m) / (cfg.response_delay_s + cfg.response_tau_s)
 
     def _alignment_speed(self, direction: Point, velocity: Point | None) -> float:
         """Slow while the velocity is swinging onto the path.
