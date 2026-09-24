@@ -469,7 +469,7 @@ def fly_with_local_planner(
     * ``start_m``/``stop_m`` fly only a slice of the route, because only the
       concealed opening is in the forest;
     * ``fix_ramp_m`` bleeds each VTRN fix in over that many metres of travel, as
-      the live EV bridge does (``ev-bridge --fix-ramp``, default 10 m). 0 = an
+      the live EV bridge does (``ev-bridge --fix-ramp``, default 30 m since 2026-09-24). 0 = an
       instantaneous jump — which is what hid the "clear observed space on every
       correction" defect offline until SITL found it.
     """

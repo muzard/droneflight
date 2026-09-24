@@ -1214,9 +1214,12 @@ def build_parser() -> argparse.ArgumentParser:
     eb.add_argument(
         "--fix-ramp",
         type=float,
-        default=10.0,
+        default=30.0,
         help="Metres over which an accepted fix is bled into the published pose "
-        "(0 = instant, which EKF2 rejects as an outlier).",
+        "(0 = instant, which EKF2 rejects as an outlier). 30 since 2026-09-24: at "
+        "10 m a 4-5 m fix moved the estimate at ~1.4 m/s, EKF2's velocity took up "
+        "part of it, and GPS-denied local-planner flights grazed trunks (s3b); "
+        "the same seeds at 30 m flew clean with the same nav error (s3c).",
     )
     eb.add_argument("--forest-frac", type=float, default=0.4)
     eb.add_argument("--stale-frac", type=float, default=0.1)
