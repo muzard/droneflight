@@ -1175,8 +1175,8 @@ class LocalPlanner:
 
         Along the CURRENT velocity — where momentum takes the aircraft whatever is
         commanded — find the first remembered trunk the airframe would touch, and
-        cap speed so the measured response (dead time + lag) stops it with
-        ``hard_margin_m`` to spare: ``v <= (room - margin) / (delay + tau)``.
+        cap speed so the measured response (dead time, saturated braking, lag)
+        stops it with ``hard_margin_m`` to spare (:meth:`_stop_distance`).
         Passing beside a trunk does not bind it; heading at one does.
 
         🔴 fix3 and fix4 (GPS-denied SITL, 2026-09-24) both touched the same trunk:
@@ -1204,7 +1204,33 @@ class LocalPlanner:
             room = min(room, along - math.sqrt(cfg.contact_m**2 - lateral**2))
         if room == math.inf:
             return cfg.cruise_speed_ms
-        return max(0.0, room - cfg.hard_margin_m) / (cfg.response_delay_s + cfg.response_tau_s)
+        budget = room - cfg.hard_margin_m
+        if budget <= 0.0:
+            return 0.0
+        # Largest v whose stop fits the budget (stop distance is monotone in v).
+        lo, hi = 0.0, cfg.cruise_speed_ms
+        if self._stop_distance(hi) <= budget:
+            return hi
+        for _ in range(30):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if self._stop_distance(mid) <= budget else (lo, mid)
+        return lo
+
+    def _stop_distance(self, v: float) -> float:
+        """Distance to stop from ``v`` through the measured response: the dead time
+        at full speed, then braking saturated at ``max_accel_ms2`` down to the
+        speed where the lag stops saturating (``a * tau``), then the lag's tail.
+
+        🔴 The first version used ``v * (delay + tau)`` — right at 3 m/s, but it
+        ignores saturation and says 3.5 m from 5 m/s where the airframe needs
+        ~6 m. The 5 m/s MVP flight (SITL, 2026-09-24) touched a trunk the limit
+        had cleared from 3.8 m away.
+        """
+        cfg = self.config
+        a, tau = cfg.max_accel_ms2, cfg.response_tau_s
+        knee = a * tau
+        tail = v * tau if v <= knee else (v * v - knee * knee) / (2.0 * a) + knee * tau
+        return v * cfg.response_delay_s + tail
 
     def _alignment_speed(self, direction: Point, velocity: Point | None) -> float:
         """Slow while the velocity is swinging onto the path.

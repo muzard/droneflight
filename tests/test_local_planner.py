@@ -303,7 +303,18 @@ def test_momentum_caps_speed_toward_a_trunk_not_beside_one() -> None:
     p.memory.add(2.2, 0.0)
     ahead = p._momentum_speed((0.0, 0.0), (2.9, 0.0))
     stop_room = 2.2 - CFG.contact_m - CFG.hard_margin_m
-    assert ahead == pytest.approx(stop_room / (CFG.response_delay_s + CFG.response_tau_s))
+    assert p._stop_distance(ahead) == pytest.approx(stop_room, abs=1e-3)
     assert ahead < 2.0  # must shed most of the 2.9 m/s it carries
     beside = p._momentum_speed((0.0, 0.0), (0.0, 2.9))  # flying past it
     assert beside == pytest.approx(CFG.cruise_speed_ms)
+
+
+def test_stopping_from_speed_includes_saturated_braking() -> None:
+    """🔴 From 5 m/s the measured response needs ~6 m, not v*(delay+tau)=3.5 m:
+    braking saturates at 3 m/s^2 above a*tau = 1.2 m/s. The 5 m/s MVP flight in
+    SITL touched a trunk the linear formula had cleared from 3.8 m."""
+    p = LocalPlanner()
+    assert p._stop_distance(1.0) == pytest.approx(1.0 * (0.3 + 0.4))  # below the knee
+    assert 5.5 < p._stop_distance(5.0) < 6.5
+    p.memory.add(4.4, 0.0)  # 3.8 m of air ahead
+    assert p._momentum_speed((0.0, 0.0), (5.0, 0.0)) < 4.0
