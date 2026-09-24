@@ -179,7 +179,7 @@ def _tether_check(args: argparse.Namespace) -> int:
     closely with the prior on — acceptance §3 measured that null in flight.
     """
     from droneflight.speed_policy import SpeedPolicy
-    from droneflight.tether import TetherConfig, analyse_tether
+    from droneflight.tether import TetherConfig, analyse_tether, speed_ceiling_ms
 
     try:
         mission = load_qgc_plan(args.plan)
@@ -203,7 +203,7 @@ def _tether_check(args: argparse.Namespace) -> int:
         f"{config.back_tension_n:.1f} N, cruise {mission.cruise_speed_ms:.1f} m/s"
         f"{'' if prior else '  [PX4 corner prior OFF — uncalibrated]'}"
     )
-    for label, rep in (("no policy (flat cruise)", no_policy), ("speed policy", with_policy)):
+    for label, rep in (("no policy (plan speeds)", no_policy), ("speed policy", with_policy)):
         peak = rep.peak
         assert peak is not None  # a loaded mission always has >=1 waypoint
         verdict = (
@@ -225,6 +225,14 @@ def _tether_check(args: argparse.Namespace) -> int:
             "  → both arms survive: PX4 decelerates into corners on its own, so the "
             "policy is not what keeps the fiber intact here (acceptance §3, sim-logs/4.7)."
         )
+    fastest = max(mission.leg_speed_ms(i) for i in range(len(mission.waypoints)))
+    warn = speed_ceiling_ms(args.agl, config, config.warn_fraction)
+    snap = speed_ceiling_ms(args.agl, config)
+    print(
+        f"  straight-leg ceiling at {args.agl:.0f} m AGL if the span free-falls "
+        f"(drag ~v^3): warn {warn:.1f} m/s, break {snap:.1f} m/s — plan's fastest leg "
+        f"{fastest:.1f} m/s{'  ⚠️ ABOVE WARN' if fastest > warn else ''}"
+    )
     return 0 if with_policy.within_limit else 1
 
 
@@ -1132,6 +1140,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Score at the commanded speed instead of PX4's measured corner speed. "
             "Reproduces pre-2026-07-26 numbers; over-predicts the flown corner load 7-18x."
         ),
+    )
+    t.add_argument(
+        "--agl",
+        type=float,
+        default=12.0,
+        help="Height the fiber falls from on open legs, for the speed ceiling (m).",
     )
     t.set_defaults(func=_tether_check)
 
