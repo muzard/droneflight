@@ -777,6 +777,9 @@ class LocalPlanner:
     _last_speed: float = 0.0
     _last_cmd_t: float | None = None
     _now: float = 0.0
+    last_candidates: list[tuple[float, float]] = field(default_factory=list)
+    """``(speed, predicted air gap)`` of every candidate the last feasibility check
+    scored — logged by ``fly-local`` so a SITL contact can be replayed exactly."""
     _issued: list[tuple[float, float, float]] = field(default_factory=list)
     """``(t, vx, vy)`` setpoints already sent: the airframe is still acting on the
     last ``response_delay_s`` of them whatever is decided now."""
@@ -1025,6 +1028,7 @@ class LocalPlanner:
             candidates += [(self._prev_path, speed * 0.6), (self._prev_path, speed * 0.3)]
         candidates.append((self.path, 0.0))
         best: tuple[float, list[Point] | None, float] | None = None
+        self.last_candidates = []
         for path, v in candidates:
             if path is None:
                 continue
@@ -1042,6 +1046,7 @@ class LocalPlanner:
                         pos, velocity, path, v, near, stop_after_s=cfg.replan_period_s
                     ),
                 )
+            self.last_candidates.append((v, gap))
             if gap >= cfg.predict_margin_m:
                 if path is not self.path:
                     self.reverts += 1

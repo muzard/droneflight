@@ -318,3 +318,15 @@ def test_stopping_from_speed_includes_saturated_braking() -> None:
     assert 5.5 < p._stop_distance(5.0) < 6.5
     p.memory.add(4.4, 0.0)  # 3.8 m of air ahead
     assert p._momentum_speed((0.0, 0.0), (5.0, 0.0)) < 4.0
+
+
+def test_the_feasibility_candidates_are_kept_for_the_flight_record() -> None:
+    """fly-local logs them so a SITL contact can be replayed exactly."""
+    field = ObstacleField(trunks=(Trunk(6.0, 0.8, 0.15),))
+    p = LocalPlanner()
+    p.observe(
+        sense(field, 0, 0, 0, math.radians(90), 91, 30), 0.0, 0.0, 0.0, velocity=(2.0, 0.0), t_s=0.0
+    )
+    p.command(0.0, 0.0, (22.0, 0.0), 0.0, velocity=(2.0, 0.0))
+    assert p.last_candidates
+    assert all(len(c) == 2 for c in p.last_candidates)
