@@ -271,3 +271,22 @@ def test_prediction_starts_from_the_acceleration_the_airframe_has() -> None:
     assert p.accel[1] > 2.0
     loaded = p._predict_gap((0.0, 0.0), (1.5, 0.6), path, 1.5, trunk)
     assert loaded < at_rest - 0.2
+
+
+def test_slow_means_tight_the_lookahead_scales_with_speed() -> None:
+    """🔴 A fixed 2.5 m pursuit chord cuts inside a bend by the same amount at any
+    speed, so near a trunk no candidate was predicted clear and the aircraft sat
+    still for 700 s (800/ha). Creeping must track the path closely."""
+    p = LocalPlanner()
+    assert p._pursuit(0.4) == pytest.approx(CFG.min_pursuit_m)
+    assert p._pursuit(1.5) == pytest.approx(1.8)
+    assert p._pursuit(6.0) == pytest.approx(CFG.pursuit_m)
+    # Creeping round a corner with a trunk just inside it: the old fixed chord cut
+    # the corner into contact; the scaled one follows the path and clears.
+    from dataclasses import replace
+
+    path = [(0.5 * k, 0.0) for k in range(9)] + [(4.0, 0.5 * k) for k in range(1, 20)]
+    trunk = [(3.3, 0.8)]
+    fixed = LocalPlanner(config=replace(CFG, min_pursuit_m=CFG.pursuit_m))
+    assert fixed._predict_gap((3.0, 0.0), (0.4, 0.0), path, 0.4, trunk) < 0.0
+    assert p._predict_gap((3.0, 0.0), (0.4, 0.0), path, 0.4, trunk) > 0.0

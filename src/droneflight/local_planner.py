@@ -147,7 +147,14 @@ class LocalPlannerConfig:
     at the preferred gap."""
 
     pursuit_m: float = 2.5
-    """Pure-pursuit lookahead along the local path."""
+    """Pure-pursuit lookahead along the local path — the ceiling; see ``pursuit_s``."""
+
+    pursuit_s: float = 1.2
+    min_pursuit_m: float = 0.8
+    """Lookahead scales with speed (``pursuit_s`` of travel, floored here). A fixed
+    2.5 m chord cuts inside every bend by the same amount at any speed, so near a
+    trunk no speed was predicted clear and the aircraft stopped for good (800/ha:
+    stationary for 700 s with a path 0.18 m clear). Slow now also means tight."""
 
     speed_rise_ms2: float = 1.5
     """How fast the commanded speed may rise. Falls are unlimited."""
@@ -939,7 +946,7 @@ class LocalPlanner:
             if path is None or len(path) < 2:
                 return PlannerCommand(0.0, 0.0, 0.0, True, 0.0, replanned, "blocked")
             self._path_k = _nearest_index(path, (x, y), 0)
-            target, _ = _point_along(path, self._path_k, cfg.pursuit_m)
+            target, _ = _point_along(path, self._path_k, self._pursuit(speed))
             dx, dy = target[0] - x, target[1] - y
             norm = math.hypot(dx, dy) or 1.0
         self._last_speed, self._last_cmd_t = speed, t_s
@@ -948,6 +955,10 @@ class LocalPlanner:
         )
 
     # -- dynamic feasibility --------------------------------------------------------
+
+    def _pursuit(self, speed: float) -> float:
+        cfg = self.config
+        return min(cfg.pursuit_m, max(cfg.min_pursuit_m, cfg.pursuit_s * speed))
 
     def _update_accel(self, velocity: Point, t_s: float) -> None:
         """Differentiate velocity, lightly smoothed (~0.2 s) and clamped to the envelope."""
@@ -987,7 +998,13 @@ class LocalPlanner:
             return speed
         candidates: list[tuple[list[Point] | None, float]] = []
         if self.path is not None:
-            candidates += [(self.path, speed), (self.path, speed * 0.6), (self.path, speed * 0.3)]
+            creep = min(speed, cfg.min_speed_ms * 0.5)
+            candidates += [
+                (self.path, speed),
+                (self.path, speed * 0.6),
+                (self.path, speed * 0.3),
+                (self.path, creep),
+            ]
         if self._prev_path is not None and self._prev_path is not self.path:
             candidates += [(self._prev_path, speed * 0.6), (self._prev_path, speed * 0.3)]
         candidates.append((self.path, 0.0))
@@ -1024,7 +1041,7 @@ class LocalPlanner:
         worst = math.inf
         for _ in range(int(cfg.predict_s / dt)):
             k = _nearest_index(path, (px, py), k)
-            tgt, _ = _point_along(path, k, cfg.pursuit_m)
+            tgt, _ = _point_along(path, k, self._pursuit(speed))
             ex, ey = tgt[0] - px, tgt[1] - py
             en = math.hypot(ex, ey)
             wx, wy = (ex / en * speed, ey / en * speed) if en > 1e-6 and speed > 0 else (0.0, 0.0)
