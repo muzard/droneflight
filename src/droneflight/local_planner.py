@@ -1024,6 +1024,16 @@ class LocalPlanner:
                 (self.path, speed * 0.3),
                 (self.path, creep),
             ]
+            # 🔴 Steer, don't brake: when every slower candidate fails, try keeping
+            # the speed the airframe already has. Braking and turning share
+            # MPC_ACC_HOR, so a hard stop in a curve slides the aircraft off its
+            # path — SITL r3e (2026-09-24): the momentum limit braked 3 -> 0.8
+            # m/s mid-curve round a trunk the path cleared by 1.0 m, and the
+            # aircraft slid 0.72 m off the path into it. Only slower candidates
+            # were on offer, and all of them predicted contact.
+            current = math.hypot(*velocity)
+            if current > speed + 0.1:
+                candidates.append((self.path, current))
         if self._prev_path is not None and self._prev_path is not self.path:
             candidates += [(self._prev_path, speed * 0.6), (self._prev_path, speed * 0.3)]
         candidates.append((self.path, 0.0))
