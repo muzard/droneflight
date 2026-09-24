@@ -180,6 +180,17 @@ before and after, even with 10.5 m nav error. SITL is the arbiter for this class
 | fix3 | + measured response model | **contact −0.23 m** (tether on) |
 | fix4 | same as fix3 | **2 contacts** (tether off, quiet host) |
 | **fix5** | + momentum limit + stop-after | **0 strikes, +0.676 m, 18.6 min** — +0.47 m at the fix3/4 trunk |
+| mvp2 | fix5 code, forest legs at the harness's **5.0 m/s** | **1 strike** (waypoint 71) |
+| mvp3 | + stopping distance with saturated braking | **1 strike** (waypoint 54) |
+
+🔑 **The harness envelope is optimistic above ~3 m/s — SITL is the arbiter.** With
+all fixes the harness flies 200/ha at 5 m/s and 400/ha at 4 m/s clean over 4 seeds
+(`tools/envelope_sweep.py`); SITL hit a trunk at 5 m/s at 200/ha in both tries. At
+5 m/s PX4 shed speed at ~1.4 m/s² against the 3 demanded, and the aircraft curved
+onto a trunk that had sat just off its velocity ray. So the planner now prices on
+a **SITL-anchored** envelope (`droneplanner/fields/stem_density.py`): 200 → 3.0,
+400 → 2.0 as flown, the rest discounted by the measured ratio. Raising an anchor
+takes a SITL flight, ~20 min each.
 
 Also fixed: the **EV bridge exited on one refused publish** (MAVSDK NO_SYSTEM
 after a heartbeat timeout under a starved VM, fix2) and left EKF2 with no aiding
