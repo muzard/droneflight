@@ -209,9 +209,14 @@ def test_a_big_climb_waits_for_its_vertex_then_climbs_in_place() -> None:
     ]
     g = CarrotGuidance(route=route, lookahead_m=15.0)
     g.advance(1.0, 0.0)  # before the opening vertex (10, 0)
-    assert window_altitude(route, g) == 6.0
+    under = lambda i: True  # noqa: E731 — every leg here is below the canopy
+    assert window_altitude(route, g, under) == 6.0
     g.advance(11.0, 0.0)  # past it
-    assert window_altitude(route, g) == 28.0
+    assert window_altitude(route, g, under) == 28.0
+    # Over the canopy (cruise legs) a big skim step keeps the early climb.
+    g2 = CarrotGuidance(route=route, lookahead_m=15.0)
+    g2.advance(1.0, 0.0)
+    assert window_altitude(route, g2, lambda i: False) == 28.0
 
 
 def test_an_altitude_datum_mismatch_refuses_to_fly() -> None:
@@ -510,8 +515,11 @@ def test_a_big_climb_is_flown_in_place() -> None:
         name="t",
         home_lat=60.0,
         home_lon=25.0,
-        cruise_speed_ms=1.0,
-        waypoints=(Waypoint(lat=60.0, lon=25.0, alt_agl_m=6.0),),
+        cruise_speed_ms=0.5,
+        waypoints=tuple(
+            Waypoint(lat=60.0, lon=25.0, alt_agl_m=6.0, speed_ms=0.5 if k < 2 else 6.0)
+            for k in range(4)
+        ),
     )
     g = CarrotGuidance(route=route, lookahead_m=15.0)
     g.advance(11.0, 0.0)

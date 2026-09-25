@@ -178,7 +178,11 @@ CLIMB_IN_PLACE_M = 3.0
 """Climb error above which horizontal motion waits for the climb."""
 
 
-def window_altitude(route: list[RoutePoint], guidance: CarrotGuidance) -> float:
+def window_altitude(
+    route: list[RoutePoint],
+    guidance: CarrotGuidance,
+    under_canopy: Callable[[int], bool] | None = None,
+) -> float:
     """Highest planned altitude from the current route leg to the carrot.
 
     Starts from the vertex *behind* the aircraft, so a descent begins only once
@@ -191,7 +195,11 @@ def window_altitude(route: list[RoutePoint], guidance: CarrotGuidance) -> float:
     remaining = guidance.lookahead_m
     while i < len(route) - 1 and remaining > 0.0:
         a, b = route[i], route[i + 1]
-        if b.up_m - a.up_m > CLIMB_AT_VERTEX_M and i > guidance.index:
+        if (
+            b.up_m - a.up_m > CLIMB_AT_VERTEX_M
+            and i > guidance.index
+            and (under_canopy is None or under_canopy(i))
+        ):
             # A big step is a climb OUT of the canopy (or over a stand); the planner
             # put it at a canopy opening at vertex ``i``. Do not start it early —
             # climbing before the opening means climbing into crowns (2026-09-25).
@@ -257,7 +265,16 @@ def local_step(
     which the caller arms and releases)."""
     sensor = truth or believed
     escaping = escape is not None and escape.up_m is not None
-    heading_to = window_altitude(route, guidance)
+    # Below-canopy legs are the plan's slow ones (stem-density caps); a big climb at
+    # the end of one is a climb out of the canopy. Over the canopy the skim profile
+    # has many > 4 m steps at cruise — those keep the early, moving climb (the first
+    # SITL try of the rule stopped at each and crawled at 0.35 m/s, o6e).
+    fastest = max(mission.leg_speed_ms(k) for k in range(len(mission.waypoints)))
+
+    def under_canopy(i: int) -> bool:
+        return i >= 1 and mission.leg_speed_ms(i - 1) < fastest - 1e-6
+
+    heading_to = window_altitude(route, guidance, under_canopy)
     if escape is not None and escape.up_m is not None:
         heading_to = max(heading_to, escape.up_m)
     # 🔴 Sense at the height the aircraft is GOING to, when that is lower: SITL o4e
@@ -303,7 +320,7 @@ def local_step(
         corridor=corridor,
     )
 
-    target_up = window_altitude(route, guidance)
+    target_up = window_altitude(route, guidance, under_canopy)
     if escape is not None and escape.up_m is not None:
         target_up = max(target_up, escape.up_m)
     err = target_up - believed.up_m
@@ -313,6 +330,7 @@ def local_step(
     # trunks, and the only free direction it has shown is up.
     climbing_out = (escaping and believed.up_m < target_up - 1.0) or (
         target_up - believed.up_m > CLIMB_IN_PLACE_M
+        and mission.leg_speed_ms(guidance.index) < fastest - 1e-6
     )
     if cmd.blocked or climbing_out:
         ve = vn = 0.0
