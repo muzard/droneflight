@@ -249,8 +249,10 @@ Fitted against Gazebo truth on six `fly-local` records (`sim-logs/mvp_local`):
   on 200/ha at 3 m/s, which SITL flew 4/4 clean).
 * **`predict_velocity_error_ms`** (opt-in, PR #3): margin grows with look-ahead
   time. **Uncapped it stalled SITL 2/2** (v3e 400/ha 3 m/s, v4a 200/ha 4 m/s — 0
-  contacts, stopped 0.97 m from a trunk for good); growth now capped at 1 s. The
-  capped A/B (w3) is queued.
+  contacts, stopped 0.97 m from a trunk for good); growth now capped at 1 s, and
+  capped it **still stalled 1/2** (w3e, wp 83) with the other at +0.04 m (w3a).
+  **Decision: stays 0 (off).** It trades contacts for stalls, not for a clean
+  envelope.
 * **Memory smear — the measured-density stall.** Askola measured zone (~1000
   stems/ha, 1.5 m median spacing, 0.5 m/s): **m3e, m3a and c3e all stopped for
   good at waypoint 4**, 0 contacts, nearest real trunk 2.5 m away. Consistent drift
