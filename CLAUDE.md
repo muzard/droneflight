@@ -278,6 +278,24 @@ clean on truth. The 1500 m zone decision rests on 400/ha at 2.0 m/s.
 occlusion). ⚠️ 800/ha is outside the envelope, and the canopy-height model puts
 the demo AO's real stands at 520–1290/ha.
 
+## ⬆️ IN-FLIGHT ESCAPE CLIMB (2026-09-25) — flown in SITL, 1/1 clean
+`fly-local --escape-after` (default 20 s): blocked among trunks, climb straight up
+to the tallest trunk top within 15 m + 3 m, hold 50 m of route, descend (sensing at
+the target height). Test world `askolam230w`: Askola's measured-zone forest + an
+**unmapped 90 m wall of trunks 1 m apart across the route at 150 m**
+(`droneplanner/tools/add_trunk_wall.py`), plan unchanged. Two defects found on the way:
+
+| run | defect | fix |
+|---|---|---|
+| x4e | **escaped 20 s after take-off at route 0** while flying normally — the trigger watched the vertex index, and a 25 m leg at 0.5 m/s shows no index progress for 50 s | trigger on along-route distance (`CarrotGuidance.along_m`, 1 m gain) |
+| x5e | escaped at the wall, then **stalled at height 90 s** (1130 failed plans) — memory still held every trunk mapped from below | drop the memory on reaching the escape height; anything that really reaches it is sensed afresh |
+| **x6e** | — | **reached the goal: 1 escape at route 5 (19.8 → 27.6 m), released at route 12, `b2-score` CLEAN +1.036 m, 0 samples inside a trunk** |
+
+The second seed (x6a) was voided at RTF 0.08 (host busy) — re-fly pending.
+⚠️ The escape height comes from the manifest's trunk tops (oracle); a real aircraft
+needs its own canopy-top sensing or the plan's over-canopy altitude. And the
+climb-through-crowns caveat applies: SITL trunks have no crowns.
+
 ## 🧵 TETHER ON OVER-CANOPY LEGS (2026-09-25)
 Flying over the canopy puts cruise legs at 25-35 m AGL (canopy + clearance), where
 the fiber's free-falling span is longer: the straight-leg ceiling is **warn 5.6 /
