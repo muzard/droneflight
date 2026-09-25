@@ -188,14 +188,30 @@ def test_window_altitude_climbs_early_and_leaves_guidance_alone() -> None:
     route = [
         RoutePoint(0, 0, 10),
         RoutePoint(10, 0, 10),
-        RoutePoint(20, 0, 30),
+        RoutePoint(20, 0, 13),  # a terrain-following step: climbed early
         RoutePoint(40, 0, 5),
     ]
     g = CarrotGuidance(route=route, lookahead_m=15.0)
     g.advance(1.0, 0.0)
     finished = g.finished
-    assert window_altitude(route, g) == 30.0  # the hill 19 m ahead is already in view
+    assert window_altitude(route, g) == 13.0  # the rise 19 m ahead is already in view
     assert g.finished == finished  # 🔴 an earlier version reset this flag
+
+
+def test_a_big_climb_waits_for_its_vertex_then_climbs_in_place() -> None:
+    """2026-09-25: a climb out of the canopy starts AT the lower vertex — where the
+    planner put the canopy opening — not a look-ahead early, into the crowns."""
+    route = [
+        RoutePoint(0, 0, 6),
+        RoutePoint(10, 0, 6),
+        RoutePoint(20, 0, 28),
+        RoutePoint(40, 0, 28),
+    ]
+    g = CarrotGuidance(route=route, lookahead_m=15.0)
+    g.advance(1.0, 0.0)  # before the opening vertex (10, 0)
+    assert window_altitude(route, g) == 6.0
+    g.advance(11.0, 0.0)  # past it
+    assert window_altitude(route, g) == 28.0
 
 
 def test_an_altitude_datum_mismatch_refuses_to_fly() -> None:
@@ -475,3 +491,42 @@ def test_escape_climb_clears_the_local_canopy_and_climbs_in_place() -> None:
     assert step.target_up_m == 21.0
     assert step.command.north_ms == 0.0 and step.command.east_ms == 0.0  # up first
     assert step.command.down_ms < 0.0  # climbing
+
+
+def test_a_big_climb_is_flown_in_place() -> None:
+    from droneflight.local_offboard import LocalOffboardConfig, Pose, local_step
+    from droneflight.model import FlightMission, Waypoint
+    from droneflight.offboard import CarrotGuidance, RoutePoint
+    from droneflight.perception import ObstacleField
+
+    route = [
+        RoutePoint(0, 0, 6),
+        RoutePoint(10, 0, 6),
+        RoutePoint(20, 0, 28),
+        RoutePoint(40, 0, 28),
+    ]
+    pose = Pose(east_m=11.0, north_m=0.0, up_m=6.0, heading_rad=0.0)
+    mission = FlightMission(
+        name="t",
+        home_lat=60.0,
+        home_lon=25.0,
+        cruise_speed_ms=1.0,
+        waypoints=(Waypoint(lat=60.0, lon=25.0, alt_agl_m=6.0),),
+    )
+    g = CarrotGuidance(route=route, lookahead_m=15.0)
+    g.advance(11.0, 0.0)
+    step = local_step(
+        believed=pose,
+        velocity_en=(0.0, 0.0),
+        truth=pose,
+        obstacles=ObstacleField(),
+        planner=LocalPlanner(),
+        guidance=g,
+        route=route,
+        mission=mission,
+        config=LocalOffboardConfig(),
+        t_s=0.0,
+    )
+    assert step.target_up_m == 28.0
+    assert step.command.east_ms == 0.0 and step.command.north_ms == 0.0
+    assert step.command.down_ms < 0.0

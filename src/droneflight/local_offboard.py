@@ -168,6 +168,16 @@ def escape_altitude(
     return believed.up_m + (max(tops) + margin_m - truth.up_m)
 
 
+CLIMB_AT_VERTEX_M = 4.0
+"""A climb step bigger than this between consecutive route points starts AT the
+lower point (where the planner put the canopy opening), not up to a look-ahead
+early, and is flown in place before moving on. Smaller steps — ordinary terrain
+following — keep the early climb."""
+
+CLIMB_IN_PLACE_M = 3.0
+"""Climb error above which horizontal motion waits for the climb."""
+
+
 def window_altitude(route: list[RoutePoint], guidance: CarrotGuidance) -> float:
     """Highest planned altitude from the current route leg to the carrot.
 
@@ -181,6 +191,11 @@ def window_altitude(route: list[RoutePoint], guidance: CarrotGuidance) -> float:
     remaining = guidance.lookahead_m
     while i < len(route) - 1 and remaining > 0.0:
         a, b = route[i], route[i + 1]
+        if b.up_m - a.up_m > CLIMB_AT_VERTEX_M and i > guidance.index:
+            # A big step is a climb OUT of the canopy (or over a stand); the planner
+            # put it at a canopy opening at vertex ``i``. Do not start it early —
+            # climbing before the opening means climbing into crowns (2026-09-25).
+            break
         best = max(best, b.up_m)
         remaining -= math.hypot(b.east_m - a.east_m, b.north_m - a.north_m)
         i += 1
@@ -296,7 +311,9 @@ def local_step(
 
     # An escape climbs straight up before it moves on: the aircraft is stuck among
     # trunks, and the only free direction it has shown is up.
-    climbing_out = escaping and believed.up_m < target_up - 1.0
+    climbing_out = (escaping and believed.up_m < target_up - 1.0) or (
+        target_up - believed.up_m > CLIMB_IN_PLACE_M
+    )
     if cmd.blocked or climbing_out:
         ve = vn = 0.0
         look = math.atan2(carrot.north_m - believed.north_m, carrot.east_m - believed.east_m)
