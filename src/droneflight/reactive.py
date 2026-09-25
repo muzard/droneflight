@@ -44,7 +44,7 @@ from droneflight.avoidance import AvoidanceCommand, AvoidanceConfig, avoid
 from droneflight.local_planner import LocalPlanner, LocalPlannerConfig, PlannerCommand
 from droneflight.maneuver import ManeuverLimits
 from droneflight.model import FlightMission
-from droneflight.nav import DriftConfig, VtrnConfig
+from droneflight.nav import DriftConfig, VelocityErrorConfig, VtrnConfig
 from droneflight.perception import ObstacleField, sense
 from droneflight.px4_profile import OFFBOARD_DELAY_S, OFFBOARD_TAU_S
 
@@ -453,6 +453,7 @@ def fly_with_local_planner(
     use_corridor: bool = True,
     plant_seed: int | None = None,
     control_hz: float = 10.0,
+    velocity_error: VelocityErrorConfig | None = None,
 ) -> LocalFlightResult:
     """Fly ``mission`` through ``obstacles`` with the onboard local planner.
 
@@ -468,6 +469,12 @@ def fly_with_local_planner(
       same guidance the live offboard executor uses, not waypoint capture;
     * ``start_m``/``stop_m`` fly only a slice of the route, because only the
       concealed opening is in the forest;
+    * ``velocity_error`` makes the ESTIMATED velocity wrong (`nav.VelocityErrorConfig`):
+      the planner predicts from true + error, and the plant tracks setpoint - error,
+      because PX4 closes its velocity loop on the estimate — so the aircraft really
+      moves off the velocity it believes it has — and the believed position
+      integrates the same error. GPS-denied SITL has this; without
+      it the harness has no way to show a braking-in-a-curve contact;
     * ``fix_ramp_m`` bleeds each VTRN fix in over that many metres of travel, as
       the live EV bridge does (``ev-bridge --fix-ramp``, default 30 m since 2026-09-24). 0 = an
       instantaneous jump — which is what hid the "clear observed space on every
@@ -516,6 +523,11 @@ def fly_with_local_planner(
     if plant_seed is not None:
         prng = random.Random(plant_seed)
         delay_s, tau_s = prng.uniform(0.2, 0.4), prng.uniform(0.3, 0.55)
+    ve = velocity_error
+    vrng = random.Random(ve.seed) if ve else None
+    ve_x = ve_y = 0.0
+    ve_keep = math.exp(-dt / ve.tau_s) if ve else 1.0
+    ve_kick = (ve.sigma_ms * math.sqrt(1.0 - ve_keep * ve_keep)) if ve else 0.0
     # Setpoints sent but not yet acted on; the aircraft starts at rest.
     in_flight: collections.deque[tuple[float, float]] = collections.deque(
         [(0.0, 0.0)] * max(0, round(delay_s / dt))
@@ -538,20 +550,31 @@ def fly_with_local_planner(
     cmd: PlannerCommand | None = None
     while t < max_time_s:
         t += dt
+        if vrng is not None:
+            ve_x = ve_x * ve_keep + ve_kick * vrng.gauss(0.0, 1.0)
+            ve_y = ve_y * ve_keep + ve_kick * vrng.gauss(0.0, 1.0)
+        believed_vel = (vel[0] + ve_x, vel[1] + ve_y)
+        # The estimator integrates its own velocity: GPS-denied SITL, the velocity
+        # error correlates 0.73-0.79 with the rate the position estimate drifts
+        # off truth, so the believed frame moves WITH the error (as odometry drift
+        # does) — only a ~0.05-0.1 m/s residual is inconsistent. Leaving position
+        # untouched made the harness strike trunks SITL flew clean past.
+        err_x += ve_x * dt
+        err_y += ve_y * dt
         est = (pos[0] + err_x, pos[1] + err_y)
         carrot = guidance.advance(*est)
         if cmd is None or step_n % control_every == 0:
             scan = sense(
                 obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m
             )
-            added = planner.observe(scan, est[0], est[1], heading, velocity=vel, t_s=t)
+            added = planner.observe(scan, est[0], est[1], heading, velocity=believed_vel, t_s=t)
             cmd = planner.command(
                 est[0],
                 est[1],
                 (carrot.east_m, carrot.north_m),
                 t,
                 added,
-                velocity=vel,
+                velocity=believed_vel,
                 max_speed_ms=leg_speeds[min(guidance.index, len(leg_speeds) - 1)],
                 corridor=corridor,
             )
@@ -573,8 +596,9 @@ def fly_with_local_planner(
         # setpoints bypass it, and that model mispredicted SITL 1 s ahead by 0.4 m.
         in_flight.append(want)
         applied = in_flight.popleft()
+        # PX4 drives its ESTIMATE to the setpoint, so truth settles at setpoint - error.
         acc = _clamp_norm(
-            ((applied[0] - vel[0]) / tau_s, (applied[1] - vel[1]) / tau_s),
+            ((applied[0] - ve_x - vel[0]) / tau_s, (applied[1] - ve_y - vel[1]) / tau_s),
             config.limits.max_accel_ms2,
         )
         vel = (vel[0] + acc[0] * dt, vel[1] + acc[1] * dt)

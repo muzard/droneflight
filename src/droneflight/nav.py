@@ -56,6 +56,23 @@ class VtrnConfig:
 
 
 @dataclass(frozen=True)
+class VelocityErrorConfig:
+    """Error of the ESTIMATED velocity — the one the planner predicts from and PX4
+    closes its velocity loop on. An Ornstein-Uhlenbeck process per axis.
+
+    MEASURED 2026-09-25 against Gazebo truth on the fly-local SITL records
+    (sim-logs/mvp_local): GPS-denied (EV + VIO velocity, r3e/s3e/r4e/d400n)
+    0.15-0.31 m/s per axis, 1/e correlation time 2.8-3.2 s, |e| p95 0.53-0.88;
+    GPS-aided (gps1) ~0.1 m/s, 1.0 s. Not a lag (best-fit lag 0.00 s). The harness
+    fed the planner the TRUE velocity and never reproduced a SITL contact.
+    """
+
+    sigma_ms: float = 0.22
+    tau_s: float = 3.0
+    seed: int = 0
+
+
+@dataclass(frozen=True)
 class YawDriftConfig:
     """Heading error of a GPS-denied estimator.
 

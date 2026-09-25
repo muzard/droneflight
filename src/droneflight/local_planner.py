@@ -202,6 +202,14 @@ class LocalPlannerConfig:
     frame. So the residual braking contacts are estimate error, which a better
     dynamics model cannot fix. 0 = off (the harness plant has no such error)."""
 
+    predict_velocity_error_horizon_s: float = 1.0
+    """The margin stops growing after this much look-ahead. 🔴 Uncapped over the
+    2.5 s horizon, 0.25 m/s demanded 0.93 m of predicted air, and SITL v3e
+    (400/ha, 3 m/s, 2026-09-25) stopped 0.97 m from a trunk and never moved again
+    — at creep speed the closest pass falls late in the horizon, so every moving
+    candidate failed. The velocity is re-measured every replan (0.4 s) and the
+    stop-after check still has to pass, so error further out is not committed to."""
+
     seen_cell_m: float = 0.6
     """Resolution of the observed-free-space grid behind the sight-distance limit."""
 
@@ -1122,7 +1130,9 @@ class LocalPlanner:
             )
             vx, vy = vx + ax * dt, vy + ay * dt
             px, py = px + vx * dt, py + vy * dt
-            grow = cfg.predict_velocity_error_ms * (tt + dt)
+            grow = cfg.predict_velocity_error_ms * min(
+                tt + dt, cfg.predict_velocity_error_horizon_s
+            )
             for qx, qy in near:
                 d = math.hypot(px - qx, py - qy) - grow
                 if d < worst:

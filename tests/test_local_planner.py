@@ -297,7 +297,9 @@ def test_velocity_error_margin_grows_with_lookahead_time() -> None:
     near_cost = gap(0.0, near_trunk) - gap(0.3, near_trunk)
     far_cost = gap(0.0, far_trunk) - gap(0.3, far_trunk)
     assert 0.0 < near_cost < far_cost
-    assert far_cost == pytest.approx(0.3 * 2.3, abs=0.1)  # closest pass ~2.2 s out
+    # Growth is capped at predict_velocity_error_horizon_s (1 s): uncapped, SITL
+    # v3e stopped for good 0.97 m from a trunk.
+    assert far_cost == pytest.approx(0.3 * CFG.predict_velocity_error_horizon_s, abs=0.05)
 
 
 def test_slow_means_tight_the_lookahead_scales_with_speed() -> None:
