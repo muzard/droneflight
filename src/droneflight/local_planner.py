@@ -122,6 +122,23 @@ class LocalPlannerConfig:
     memory_radius_m: float = 45.0
     """Remembered points further than this from the aircraft are forgotten."""
 
+    clear_range_m: float = 8.0
+    """Remembered points that the current scan sees THROUGH are deleted, out to
+    this range. 🔴 Why (SITL m3e/m3a, Askola measured zone, 2026-09-25): at
+    0.5 m/s in a 1000 stems/ha stand the aircraft stays among the same trunks for
+    minutes, and the GPS-denied estimate drifts smoothly (1-3 cm/s, consistent
+    with its own velocity, so no correction is detected). Each trunk's points
+    were laid down with a different error: memory grew to 2200-2700 points, every
+    trunk became a 1-3 m streak, the 1.5 m gaps closed, and both flights stopped
+    for good with the nearest real trunk 2.5 m away. Memory must be
+    re-confirmed by what the sensor sees now, not only added to. The range bound
+    keeps it safe against a thin trunk falling between rays: a 0.16 m trunk
+    subtends >= 1.1 deg inside 8 m, wider than the 1 deg ray spacing."""
+
+    clear_tolerance_m: float = 0.3
+    """A point is cleared only if the rays either side of it reach this much
+    beyond it — a trunk still standing there returns shorter than the point."""
+
     correction_threshold_m: float = 0.0
     """Per-step displacement that velocity does not explain, above which the
     memory is shifted by it. **0** — every unexplained displacement is by
@@ -281,6 +298,47 @@ class ObstacleMemory:
             if self.add(px, py):
                 added.append((px, py))
         return added
+
+    def clear_seen_through(
+        self,
+        scan: DepthScan,
+        x: float,
+        y: float,
+        heading: float,
+        *,
+        max_range_m: float,
+        tolerance_m: float,
+    ) -> int:
+        """Delete points the scan proves are empty; returns how many.
+
+        A point is cleared when it lies inside the field of view, within
+        ``max_range_m``, and the ray nearest its bearing AND both neighbours all
+        return more than ``tolerance_m`` beyond it. A point behind a return
+        (occluded) or outside the cone is kept — the scan says nothing about it.
+        """
+        bearings, ranges = scan.bearings_rel, scan.ranges
+        n = len(bearings)
+        if n < 3:
+            return 0
+        lo, hi = bearings[0], bearings[-1]
+        step = (hi - lo) / (n - 1)
+        if step <= 0.0:
+            return 0
+        doomed = []
+        for key, (px, py) in self._points.items():
+            dx, dy = px - x, py - y
+            d = math.hypot(dx, dy)
+            if d > max_range_m or d < 0.5:
+                continue
+            rel = _wrap(math.atan2(dy, dx) - heading)
+            if rel <= lo + step or rel >= hi - step:
+                continue
+            k = round((rel - lo) / step)
+            if all(ranges[j] > d + tolerance_m for j in (k - 1, k, k + 1)):
+                doomed.append(key)
+        for key in doomed:
+            del self._points[key]
+        return len(doomed)
 
     def forget_beyond(self, x: float, y: float, radius: float) -> None:
         r2 = radius * radius
@@ -777,6 +835,8 @@ class LocalPlanner:
     replans: int = 0
     failures: int = 0
     memory_resets: int = 0
+    cleared: int = 0
+    """Remembered points deleted because a scan saw through them."""
     _last_plan_t: float = -math.inf
     _path_k: int = 0
     _last_pos: Point | None = None
@@ -848,6 +908,15 @@ class LocalPlanner:
         self._last_pos = (x, y)
         self._last_t = t_s
         self._last_vel = velocity
+        if cfg.clear_range_m > 0.0:
+            self.cleared += self.memory.clear_seen_through(
+                scan,
+                x,
+                y,
+                heading,
+                max_range_m=cfg.clear_range_m,
+                tolerance_m=cfg.clear_tolerance_m,
+            )
         added = self.memory.add_scan(scan, x, y, heading, cfg.obstacle_radius_m)
         self._seen().add_scan(scan, x, y, heading)
         # The sensor cone starts at the nose; the flanks of the next metre or two

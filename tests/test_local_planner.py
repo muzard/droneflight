@@ -355,3 +355,31 @@ def test_the_feasibility_candidates_are_kept_for_the_flight_record() -> None:
     p.command(0.0, 0.0, (22.0, 0.0), 0.0, velocity=(2.0, 0.0))
     assert p.last_candidates
     assert all(len(c) == 2 for c in p.last_candidates)
+
+
+def test_memory_is_cleared_where_the_scan_sees_through_it() -> None:
+    """🔴 SITL m3e/m3a (Askola, 1000 stems/ha, 0.5 m/s): slow drift laid each trunk
+    down several times 1-3 m apart, memory grew to 2700 points, the gaps closed and
+    the aircraft stopped for good. A point the sensor now sees through is gone;
+    one behind a return, beyond the clearing range or outside the cone is kept."""
+    from droneflight.local_planner import ObstacleMemory
+    from droneflight.perception import DepthScan
+
+    n = 91
+    bearings = tuple(math.radians(-45 + k) for k in range(n))
+    ranges = [30.0] * n
+    ranges[45] = ranges[44] = ranges[46] = 4.0  # a trunk dead ahead at 4 m
+    scan = DepthScan(bearings, tuple(ranges), 30.0, math.radians(90))
+    mem = ObstacleMemory()
+    ghost = (3.0, 1.5)  # in the cone, 3.4 m out, rays there reach 30 m
+    trunk = (4.2, 0.0)  # the trunk the scan still sees
+    behind = (6.0, 0.0)  # occluded by it
+    far = (12.0, 3.0)  # in the cone but beyond clear_range_m
+    beside = (0.0, 3.0)  # outside the cone
+    for p in (ghost, trunk, behind, far, beside):
+        mem.add(*p)
+    cleared = mem.clear_seen_through(scan, 0.0, 0.0, 0.0, max_range_m=8.0, tolerance_m=0.3)
+    assert cleared == 1
+    kept = set(mem.points())
+    assert ghost not in kept
+    assert {trunk, behind, far, beside} <= kept
