@@ -103,7 +103,15 @@ def prepare_items(mission: FlightMission, config: FlightConfig) -> list[MissionI
             )
             for i, w in enumerate(mission.waypoints)
         ]
-    policy = replace(config.speed, cruise_speed_ms=mission.cruise_speed_ms)
+    # 🔴 Cruise is the plan's FASTEST leg, not its ``cruiseSpeed`` (= the first
+    # legs' speed): with the latter a plan opening at 0.5 m/s in the forest capped
+    # every leg at 0.5 — or raised, below the policy's own min_speed_ms.
+    cruise = mission.fastest_leg_speed_ms()
+    policy = replace(
+        config.speed,
+        cruise_speed_ms=cruise,
+        min_speed_ms=min(config.speed.min_speed_ms, cruise),
+    )
     # The planner's per-leg speed (forest stem density) is a ceiling the tether
     # policy may only lower — never raise back to cruise.
     return [

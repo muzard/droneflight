@@ -188,9 +188,10 @@ def _tether_check(args: argparse.Namespace) -> int:
         return 2
 
     config = TetherConfig(break_tension_n=args.break_tension, back_tension_n=args.back_tension)
+    cruise = mission.fastest_leg_speed_ms()
     policy = SpeedPolicy(
-        cruise_speed_ms=mission.cruise_speed_ms,
-        min_speed_ms=args.min_speed,
+        cruise_speed_ms=cruise,
+        min_speed_ms=min(args.min_speed, cruise),
         slow_above_deg=args.slow_above,
         reversal_deg=args.reversal_deg,
     )
@@ -200,7 +201,7 @@ def _tether_check(args: argparse.Namespace) -> int:
 
     print(
         f"tether v0: break {config.break_tension_n:.1f} N, back-tension "
-        f"{config.back_tension_n:.1f} N, cruise {mission.cruise_speed_ms:.1f} m/s"
+        f"{config.back_tension_n:.1f} N, cruise {cruise:.1f} m/s"
         f"{'' if prior else '  [PX4 corner prior OFF — uncalibrated]'}"
     )
     for label, rep in (("no policy (plan speeds)", no_policy), ("speed policy", with_policy)):
@@ -960,7 +961,7 @@ def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs 
     print(f"forest: {len(manifest.trunks)} trunks from {args.trunks}")
     config = OffboardConfig(
         lookahead_m=args.lookahead,
-        cruise_speed_ms=args.cruise if args.cruise is not None else mission.cruise_speed_ms,
+        cruise_speed_ms=args.cruise if args.cruise is not None else mission.fastest_leg_speed_ms(),
         control_hz=args.control_hz,
         sensor_range_m=args.sensor_range,
         n_rays=args.n_rays,

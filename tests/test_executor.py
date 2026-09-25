@@ -88,6 +88,20 @@ def test_prepare_items_uses_mission_cruise_speed() -> None:
     assert items[0].speed_ms == 6.0  # mission cruise speed honored
 
 
+def test_a_slow_opening_does_not_cap_the_whole_mission() -> None:
+    """🔴 Askola measured zone (2026-09-25): the planner writes ``cruiseSpeed`` = the
+    FIRST legs' speed, 0.5 m/s in a dense stand. Taking that as the policy's cruise
+    either raised (min_speed 1.0 > cruise) or flew the 6 m/s open legs at 0.5."""
+    wps = tuple(
+        Waypoint(lat=46.90 + 0.001 * i, lon=15.0, alt_agl_m=30.0, speed_ms=0.5 if i < 2 else 6.0)
+        for i in range(5)
+    )
+    m = FlightMission(name="t", home_lat=46.90, home_lon=15.0, cruise_speed_ms=0.5, waypoints=wps)
+    assert m.fastest_leg_speed_ms() == 6.0
+    items = prepare_items(m, FlightConfig())
+    assert [it.speed_ms for it in items] == [0.5, 0.5, 6.0, 6.0, 6.0]
+
+
 def _turning_mission() -> FlightMission:
     # A 90° corner at the middle waypoint so the speed policy has something to do.
     wps = (
