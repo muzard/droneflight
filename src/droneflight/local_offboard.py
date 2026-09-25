@@ -185,6 +185,8 @@ def local_step(
         fov_rad=math.radians(config.fov_deg),
         n_rays=config.n_rays,
         max_range=config.sensor_range_m,
+        # Only simulator truth shares the manifest's world z frame.
+        z=truth.up_m if truth is not None else None,
     )
     # The scan is body-relative: place it from the BELIEVED pose.
     added = planner.observe(
@@ -228,7 +230,12 @@ def local_step(
         blocked=cmd.blocked,
         clearance_ahead_m=cmd.min_gap_ahead_m,
     )
-    true_gap = obstacles.clearance(sensor.east_m, sensor.north_m) - drone_radius_m
+    true_gap = (
+        obstacles.clearance(
+            sensor.east_m, sensor.north_m, truth.up_m if truth is not None else None
+        )
+        - drone_radius_m
+    )
     return StepResult(
         command=command,
         speed_ms=cmd.speed_ms,
