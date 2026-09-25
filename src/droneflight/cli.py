@@ -225,6 +225,38 @@ def _tether_check(args: argparse.Namespace) -> int:
             "  → both arms survive: PX4 decelerates into corners on its own, so the "
             "policy is not what keeps the fiber intact here (acceptance §3, sim-logs/4.7)."
         )
+    if args.trajectory is not None:
+        # Per leg, at the leg's own height: over-canopy climbs fly cruise at 25-30 m
+        # AGL, where the free-falling span is longer and the ceiling lower than at
+        # the fixed --agl (2026-09-25: 5.6 m/s warn at 28 m vs a 6.0 m/s plan).
+        coords = json.loads(args.trajectory.read_text())["geometry"]["coordinates"]
+        if len(coords) != len(mission.waypoints):
+            print(
+                f"error: {args.trajectory} has {len(coords)} vertices, the plan "
+                f"{len(mission.waypoints)} — not the same route",
+                file=sys.stderr,
+            )
+            return 2
+        over_warn = over_break = 0
+        worst: tuple[float, int, float, float] | None = None
+        for i in range(len(coords) - 1):
+            agl = max(float(coords[i][2]), float(coords[i + 1][2]))
+            v = mission.leg_speed_ms(i)
+            w = speed_ceiling_ms(agl, config, config.warn_fraction)
+            b = speed_ceiling_ms(agl, config)
+            over_warn += int(v > w)
+            over_break += int(v > b)
+            margin = v / b
+            if worst is None or margin > worst[0]:
+                worst = (margin, i, agl, v)
+        assert worst is not None
+        print(
+            f"  per-leg ceiling at each leg's AGL: {over_warn} leg(s) above warn, "
+            f"{over_break} above break; tightest wp{worst[1]} at {worst[2]:.0f} m AGL, "
+            f"{worst[3]:.1f} m/s = {100 * worst[0]:.0f} % of the break speed"
+        )
+        if over_break:
+            return 1
     fastest = max(mission.leg_speed_ms(i) for i in range(len(mission.waypoints)))
     warn = speed_ceiling_ms(args.agl, config, config.warn_fraction)
     snap = speed_ceiling_ms(args.agl, config)
@@ -1145,6 +1177,13 @@ def build_parser() -> argparse.ArgumentParser:
         "tether-check", help="Validate the speed policy against the v0 payout-tension model."
     )
     t.add_argument("--plan", type=Path, required=True)
+    t.add_argument(
+        "--trajectory",
+        type=Path,
+        default=None,
+        help="droneplanner trajectory.geojson for the same route: check every leg's "
+        "straight-line ceiling at its own AGL (z), not at the fixed --agl.",
+    )
     t.add_argument("--break-tension", type=float, default=2.0, help="Fiber break tension (N).")
     t.add_argument("--back-tension", type=float, default=0.5, help="Spool back-tension (N).")
     t.add_argument("--min-speed", type=float, default=1.0, help="Speed-policy floor (m/s).")
