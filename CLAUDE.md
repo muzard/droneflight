@@ -232,6 +232,37 @@ Also fixed: the **EV bridge exited on one refused publish** (MAVSDK NO_SYSTEM
 after a heartbeat timeout under a starved VM, fix2) and left EKF2 with no aiding
 — the estimate ran 181 m off. It now counts and rides failures out.
 
+🔴 **2026-09-25: the estimate's VELOCITY is wrong GPS-denied — and slow flight smears the map.**
+Fitted against Gazebo truth on six `fly-local` records (`sim-logs/mvp_local`):
+
+* **Braking is not the dynamics.** With GPS the offboard model predicts braking with
+  ~0 bias (1166 windows); GPS-denied the aircraft ran **0.63 m further per second
+  of braking** than predicted. The estimated velocity is off by 0.15-0.31 m/s per
+  axis (1/e ≈ 3 s, p95 |e| 0.53-0.88) against ~0.1 GPS-aided — an error, not a lag
+  (best-fit lag 0.00 s). It is mostly **consistent**: it correlates 0.73-0.79 with
+  the rate the position estimate drifts, i.e. EKF position integrates it.
+* **Harness now models it** (`reactive.fly_with_local_planner(velocity_error=
+  nav.VelocityErrorConfig)`: planner sees true + e, plant tracks setpoint − e,
+  believed position integrates e). At 0.15 m/s it produces braking-type contacts
+  (400/ha at 3 m/s: 2/4 seeds) — **the first harness to reproduce a SITL contact
+  class** — and the smear stall below. It is somewhat pessimistic (grazes −0.01 m
+  on 200/ha at 3 m/s, which SITL flew 4/4 clean).
+* **`predict_velocity_error_ms`** (opt-in, PR #3): margin grows with look-ahead
+  time. **Uncapped it stalled SITL 2/2** (v3e 400/ha 3 m/s, v4a 200/ha 4 m/s — 0
+  contacts, stopped 0.97 m from a trunk for good); growth now capped at 1 s. The
+  capped A/B (w3) is queued.
+* **Memory smear — the measured-density stall.** Askola measured zone (~1000
+  stems/ha, 1.5 m median spacing, 0.5 m/s): **m3e, m3a and c3e all stopped for
+  good at waypoint 4**, 0 contacts, nearest real trunk 2.5 m away. Consistent drift
+  (1-3 cm/s) is never detected as a correction, and at 0.5 m/s the aircraft sits
+  among the same trunks for minutes — each trunk was laid down 1-3 m apart, memory
+  reached 2200-2700 points, every gap closed. **Fix: `clear_range_m`** — delete
+  remembered points the current scan sees through (in the cone, ≤ 8 m where a 1°
+  fan cannot miss a 0.16 m trunk, nearest ray and both neighbours past it by
+  0.3 m); occluded/out-of-cone points stay. **k3e (same plan, same seeds as m3e):
+  reached the goal, 0 strikes, +1.014 m, forest stretch at 0.49 m/s.** 21.4 min
+  armed against 17.5 planned — unexplained, the forest stretch itself was on pace.
+
 🧪 **B4 sensor ladder (`tools/sensor_ladder.py`, 2026-09-24) — the oracle is not
 load-bearing.** MVP forest, 200/ha, 3 m/s, GPS-denied, 2 seeds per rung: **0 strikes
 at every rung** — range noise 0.1/0.3/0.6 m at 10 m (growing with range), 30 % and
