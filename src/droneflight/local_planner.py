@@ -191,6 +191,17 @@ class LocalPlannerConfig:
     one second ahead, and at the old 0.15 a GPS-denied SITL flight accepted
     predictions of 0.22-0.44 m on the way into a trunk it then hit."""
 
+    predict_velocity_error_ms: float = 0.0
+    """Believed-velocity error the prediction allows for: the margin grows by this
+    times the look-ahead time, so a close pass 1.5 s out needs more air than one
+    0.3 s out. Measured 2026-09-25 against Gazebo truth: GPS-denied (EV/VIO) the
+    estimated velocity is off by 0.18-0.23 m/s mean, 0.3-0.6 m/s in braking
+    windows, against ~0.1 GPS-aided — not a lag (best-fit lag 0.00 s on every
+    flight), an error. With GPS the braking response fits the dynamics model with
+    no bias; GPS-denied it ran 0.63 m long per second of braking in the truth
+    frame. So the residual braking contacts are estimate error, which a better
+    dynamics model cannot fix. 0 = off (the harness plant has no such error)."""
+
     seen_cell_m: float = 0.6
     """Resolution of the observed-free-space grid behind the sight-distance limit."""
 
@@ -1111,8 +1122,9 @@ class LocalPlanner:
             )
             vx, vy = vx + ax * dt, vy + ay * dt
             px, py = px + vx * dt, py + vy * dt
+            grow = cfg.predict_velocity_error_ms * (tt + dt)
             for qx, qy in near:
-                d = math.hypot(px - qx, py - qy)
+                d = math.hypot(px - qx, py - qy) - grow
                 if d < worst:
                     worst = d
         return worst - cfg.contact_m

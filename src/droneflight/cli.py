@@ -1026,8 +1026,20 @@ def _fly_local(args: argparse.Namespace) -> int:  # pragma: no cover - needs a l
         f"plan: {len(mission.waypoints)} waypoints, leg speeds {speeds} m/s; "
         f"forest: {len(manifest.trunks)} trunks from {args.trunks}"
     )
+    overrides: dict[str, float] = {}
+    for item in args.planner_set or []:
+        key, _, value = item.partition("=")
+        if key not in LocalPlannerConfig.__dataclass_fields__ or not value:
+            print(
+                f"error: --planner-set {item!r}: not a LocalPlannerConfig field=value",
+                file=sys.stderr,
+            )
+            return 2
+        overrides[key] = float(value)
+    if overrides:
+        print(f"planner overrides: {overrides}")
     config = LocalOffboardConfig(
-        planner=LocalPlannerConfig(cruise_speed_ms=max(speeds)),
+        planner=LocalPlannerConfig(cruise_speed_ms=max(speeds), **overrides),  # type: ignore[arg-type]
         fov_deg=args.fov,
         n_rays=int(args.fov) + 1,
         sensor_range_m=args.sensor_range,
@@ -1359,6 +1371,13 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument("--model", default="x500_0")
     fl.add_argument(
         "--record", type=Path, default=None, help="Per-step JSONL (truth, estimate, commands)."
+    )
+    fl.add_argument(
+        "--planner-set",
+        action="append",
+        metavar="FIELD=VALUE",
+        help="Override a numeric LocalPlannerConfig field for an A/B flight, e.g. "
+        "predict_velocity_error_ms=0.25 (repeatable).",
     )
     fl.set_defaults(func=_fly_local)
 

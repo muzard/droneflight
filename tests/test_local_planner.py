@@ -277,6 +277,29 @@ def test_prediction_flies_the_setpoints_already_in_flight() -> None:
     assert still_east < already_north - 0.1
 
 
+def test_velocity_error_margin_grows_with_lookahead_time() -> None:
+    """GPS-denied, the believed velocity is off by 0.2-0.6 m/s (measured against
+    Gazebo truth, 2026-09-25), so a pass 2 s out is less certain than one 0.3 s out.
+    The allowance must cost more for a far pass than a near one, and nothing at 0."""
+    from dataclasses import replace
+
+    path = [(0.5 * k, 0.0) for k in range(40)]
+    near_trunk, far_trunk = [(0.9, 1.0)], [(4.5, 1.0)]
+
+    def gap(v_err: float, trunk: list[tuple[float, float]]) -> float:
+        p = LocalPlanner(config=replace(CFG, predict_velocity_error_ms=v_err))
+        p._now = 1.0
+        return p._predict_gap((0.0, 0.0), (2.0, 0.0), path, 2.0, trunk)
+
+    assert gap(0.0, near_trunk) == pytest.approx(
+        LocalPlanner()._predict_gap((0.0, 0.0), (2.0, 0.0), path, 2.0, near_trunk)
+    )
+    near_cost = gap(0.0, near_trunk) - gap(0.3, near_trunk)
+    far_cost = gap(0.0, far_trunk) - gap(0.3, far_trunk)
+    assert 0.0 < near_cost < far_cost
+    assert far_cost == pytest.approx(0.3 * 2.3, abs=0.1)  # closest pass ~2.2 s out
+
+
 def test_slow_means_tight_the_lookahead_scales_with_speed() -> None:
     """🔴 A fixed 2.5 m pursuit chord cuts inside a bend by the same amount at any
     speed, so near a trunk no candidate was predicted clear and the aircraft sat
