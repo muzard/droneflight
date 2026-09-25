@@ -133,6 +133,8 @@ class Escape:
     """Route arc length at which the escape ends."""
 
     count: int = 0
+    at_height: bool = False
+    """Reached the escape height (and dropped the memory mapped below it)."""
 
 
 ESCAPE_PROGRESS_M = 1.0
@@ -547,6 +549,15 @@ async def fly_local(
                     contacts,
                     rtf,
                 )
+            if escape.up_m is not None and not escape.at_height and up >= escape.up_m - 1.0:
+                # 🔴 SITL x5e: the escape climbed out and still stalled at height for
+                # 90 s (1130 failed plans) — the memory held every trunk mapped from
+                # below, wall included. At the escape height those are beneath the
+                # aircraft; anything that really reaches it is sensed afresh.
+                planner.memory.clear()
+                planner.path = None
+                escape.at_height = True
+                _log.warning("escape at height %.1f m: memory from below dropped", up)
             if escape.up_m is not None and arc[guidance.index] >= escape.release_at_m:
                 escape.up_m = None
                 _log.warning("escape climb released at route %d — descending", guidance.index)
@@ -565,6 +576,7 @@ async def fly_local(
                 )
                 if alt is not None:
                     escape.up_m = alt
+                    escape.at_height = False
                     escape.release_at_m = arc[guidance.index] + config.escape_hold_m
                     escape.count += 1
                     last_progress = last_along_progress = t
