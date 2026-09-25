@@ -136,6 +136,69 @@ class Escape:
     at_height: bool = False
     """Reached the escape height (and dropped the memory mapped below it)."""
 
+    best_along_m: float = 0.0
+    last_progress_t: float = 0.0
+
+    def update(
+        self,
+        *,
+        t_s: float,
+        along_m: float,
+        index: int,
+        arc_m: list[float],
+        believed: Pose,
+        truth: Pose | None,
+        obstacles: ObstacleField,
+        planner: LocalPlanner,
+        config: LocalOffboardConfig,
+    ) -> tuple[list[str], bool]:
+        """Advance the escape state machine one step; shared by ``fly_local`` and the
+        offline harness so the two fly the same logic. Returns (log lines, whether an
+        escape just started — the caller's stall timer restarts then)."""
+        logs: list[str] = []
+        # 🔴 Progress is DISTANCE along the route, not the vertex index: at 0.5 m/s a
+        # 25 m leg takes 50 s, and SITL x4e escaped 20 s after take-off at route 0.
+        if along_m > self.best_along_m + ESCAPE_PROGRESS_M:
+            self.best_along_m, self.last_progress_t = along_m, t_s
+        if self.up_m is not None and not self.at_height and believed.up_m >= self.up_m - 1.0:
+            # 🔴 SITL x5e: escaped, then stalled at height 90 s (1130 failed plans) —
+            # memory held every trunk mapped from below. At the escape height those
+            # are beneath the aircraft; anything that really reaches it is sensed afresh.
+            planner.memory.clear()
+            planner.path = None
+            self.at_height = True
+            logs.append(f"escape at height {believed.up_m:.1f} m: memory from below dropped")
+        if self.up_m is not None and arc_m[index] >= self.release_at_m:
+            self.up_m = None
+            logs.append(f"escape climb released at route {index} — descending")
+        started = False
+        if (
+            config.escape_after_s is not None
+            and self.up_m is None
+            and truth is not None
+            and t_s - self.last_progress_t > config.escape_after_s
+        ):
+            alt = escape_altitude(
+                obstacles,
+                truth,
+                believed,
+                radius_m=config.escape_radius_m,
+                margin_m=config.escape_margin_m,
+            )
+            if alt is not None:
+                self.up_m, self.at_height = alt, False
+                self.release_at_m = arc_m[index] + config.escape_hold_m
+                self.count += 1
+                self.last_progress_t = t_s
+                started = True
+                logs.append(
+                    f"ESCAPE CLIMB #{self.count} at route {index}: no progress for "
+                    f"{config.escape_after_s:.0f} s among trunks — climbing from "
+                    f"{believed.up_m:.1f} to {alt:.1f} m, holding for "
+                    f"{config.escape_hold_m:.0f} m of route"
+                )
+        return logs, started
+
 
 ESCAPE_PROGRESS_M = 1.0
 """Along-route gain that counts as progress for the escape trigger."""
@@ -413,7 +476,6 @@ async def fly_local(
     planner = LocalPlanner(config=config.planner)
     escape = Escape()
     arc = route_arc_m(route)
-    best_along, last_along_progress = 0.0, 0.0
     corridor = mission_corridor(mission, route) if config.use_corridor else None
     _log.info(
         "corridor: %s",
@@ -552,12 +614,6 @@ async def fly_local(
                 )
             if guidance.index > best_index:
                 best_index, last_progress = guidance.index, t
-            # 🔴 The escape watches DISTANCE along the route, not the vertex index: at
-            # 0.5 m/s a 25 m leg takes 50 s, and the first SITL try (x4e) climbed out
-            # 20 s after take-off at route 0 while flying normally.
-            along = guidance.along_m(arc)
-            if along > best_along + ESCAPE_PROGRESS_M:
-                best_along, last_along_progress = along, t
             if now - last_log >= config.progress_log_s:
                 rtf = (t - last_t) / max(now - last_log, 1e-6)
                 last_log, last_t = now, t
@@ -584,47 +640,21 @@ async def fly_local(
                     contacts,
                     rtf,
                 )
-            if escape.up_m is not None and not escape.at_height and up >= escape.up_m - 1.0:
-                # 🔴 SITL x5e: the escape climbed out and still stalled at height for
-                # 90 s (1130 failed plans) — the memory held every trunk mapped from
-                # below, wall included. At the escape height those are beneath the
-                # aircraft; anything that really reaches it is sensed afresh.
-                planner.memory.clear()
-                planner.path = None
-                escape.at_height = True
-                _log.warning("escape at height %.1f m: memory from below dropped", up)
-            if escape.up_m is not None and arc[guidance.index] >= escape.release_at_m:
-                escape.up_m = None
-                _log.warning("escape climb released at route %d — descending", guidance.index)
-            if (
-                config.escape_after_s is not None
-                and escape.up_m is None
-                and true_pose is not None
-                and t - last_along_progress > config.escape_after_s
-            ):
-                alt = escape_altitude(
-                    obstacles,
-                    true_pose,
-                    believed,
-                    radius_m=config.escape_radius_m,
-                    margin_m=config.escape_margin_m,
-                )
-                if alt is not None:
-                    escape.up_m = alt
-                    escape.at_height = False
-                    escape.release_at_m = arc[guidance.index] + config.escape_hold_m
-                    escape.count += 1
-                    last_progress = last_along_progress = t
-                    _log.warning(
-                        "ESCAPE CLIMB #%d at route %d: no progress for %.0f s among trunks "
-                        "— climbing from %.1f to %.1f m, holding for %.0f m of route",
-                        escape.count,
-                        guidance.index,
-                        config.escape_after_s,
-                        up,
-                        alt,
-                        config.escape_hold_m,
-                    )
+            logs, started = escape.update(
+                t_s=t,
+                along_m=guidance.along_m(arc),
+                index=guidance.index,
+                arc_m=arc,
+                believed=believed,
+                truth=true_pose,
+                obstacles=obstacles,
+                planner=planner,
+                config=config,
+            )
+            for line in logs:
+                _log.warning(line)
+            if started:
+                last_progress = t
             if t - last_progress > config.stall_timeout_s:
                 aborted = f"no route progress for {config.stall_timeout_s:.0f}s at {guidance.index}"
                 _log.error("local planner: %s", aborted)

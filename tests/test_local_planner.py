@@ -538,3 +538,41 @@ def test_a_big_climb_is_flown_in_place() -> None:
     assert step.target_up_m == 28.0
     assert step.command.east_ms == 0.0 and step.command.north_ms == 0.0
     assert step.command.down_ms < 0.0
+
+
+def test_escape_state_machine_triggers_drops_memory_and_releases() -> None:
+    """The shared escape logic (fly_local + harness): no along-route progress for
+    escape_after_s among trunks -> climb; memory dropped at height; released
+    escape_hold_m further along the route."""
+    from droneflight.local_offboard import Escape, LocalOffboardConfig, Pose
+    from droneflight.perception import ObstacleField, Trunk
+
+    field = ObstacleField(trunks=(Trunk(2.0, 0.0, 0.15, top_z=15.0),))
+    cfg = LocalOffboardConfig()
+    arc = [0.0, 25.0, 50.0, 75.0, 100.0]
+    esc, planner = Escape(), LocalPlanner()
+    planner.memory.add(2.0, 0.0)
+    low = Pose(0.0, 0.0, 6.0, 0.0)
+
+    def step(t: float, along: float, index: int, pose: Pose) -> tuple[list[str], bool]:
+        return esc.update(
+            t_s=t,
+            along_m=along,
+            index=index,
+            arc_m=arc,
+            believed=pose,
+            truth=pose,
+            obstacles=field,
+            planner=planner,
+            config=cfg,
+        )
+
+    assert step(0.0, 0.5, 0, low) == ([], False)
+    assert step(15.0, 0.9, 0, low)[1] is False  # < 1 m of progress, but only 15 s
+    logs, started = step(21.0, 0.9, 0, low)
+    assert started and esc.up_m == 15.0 + cfg.escape_margin_m
+    assert len(planner.memory) == 1
+    step(25.0, 0.9, 0, Pose(0.0, 0.0, 17.5, 0.0))  # at height
+    assert esc.at_height and len(planner.memory) == 0
+    step(40.0, 60.0, 2, Pose(0.0, 0.0, 18.0, 0.0))  # 50 m past the escape point
+    assert esc.up_m is None and esc.count == 1

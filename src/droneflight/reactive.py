@@ -39,9 +39,13 @@ import itertools
 import math
 import random
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from droneflight.avoidance import AvoidanceCommand, AvoidanceConfig, avoid
 from droneflight.local_planner import LocalPlanner, LocalPlannerConfig, PlannerCommand
+
+if TYPE_CHECKING:
+    from droneflight.local_offboard import LocalOffboardConfig
 from droneflight.maneuver import ManeuverLimits
 from droneflight.model import FlightMission
 from droneflight.nav import DriftConfig, VelocityErrorConfig, VtrnConfig
@@ -417,6 +421,11 @@ class LocalFlightResult:
     max_nav_error_m: float
     path: tuple[tuple[float, float], ...]
     strike_log: tuple[StrikeEvent, ...] = ()
+    escapes: int = 0
+    """In-flight escape climbs flown (vertical mode only)."""
+
+    max_up_m: float = 0.0
+    """Highest altitude reached (vertical mode; plan frame, home-relative)."""
 
     @property
     def clean(self) -> bool:
@@ -454,6 +463,7 @@ def fly_with_local_planner(
     plant_seed: int | None = None,
     control_hz: float = 10.0,
     velocity_error: VelocityErrorConfig | None = None,
+    vertical: LocalOffboardConfig | None = None,
 ) -> LocalFlightResult:
     """Fly ``mission`` through ``obstacles`` with the onboard local planner.
 
@@ -475,6 +485,12 @@ def fly_with_local_planner(
       moves off the velocity it believes it has — and the believed position
       integrates the same error. GPS-denied SITL has this; without
       it the harness has no way to show a braking-in-a-curve contact;
+    * ``vertical`` (a ``local_offboard.LocalOffboardConfig``) adds ALTITUDE: the plan's
+      heights, a first-order climb/descent response, the executor's altitude window
+      (climb early, but a big climb out of the canopy only AT its vertex, in place),
+      sensing at min(current, target) height, height-aware contacts and the SAME
+      escape-climb state machine ``fly_local`` runs (``local_offboard.Escape``). The
+      2D harness could test none of the 2026-09-25 vertical behaviour offline;
     * ``fix_ramp_m`` bleeds each VTRN fix in over that many metres of travel, as
       the live EV bridge does (``ev-bridge --fix-ramp``, default 30 m since 2026-09-24). 0 = an
       instantaneous jump — which is what hid the "clear observed space on every
@@ -488,13 +504,23 @@ def fly_with_local_planner(
     lat0, lon0 = mission.home_lat, mission.home_lon
     full = [_to_local(w.lat, w.lon, lat0, lon0) for w in mission.waypoints]
     route = _slice_polyline(full, start_m, stop_m)
-    guidance = CarrotGuidance(
-        route=[RoutePoint(east_m=x, north_m=y, up_m=0.0) for x, y in route],
-        lookahead_m=pcfg.horizon_m,
-    )
     # The plan's per-leg speed (DO_CHANGE_SPEED), mapped onto the sliced route by
     # arc length so start_m/stop_m slices keep the right speeds.
     leg_speeds = _sliced_leg_speeds(full, route, mission)
+    alts = [0.0] * len(route)
+    if vertical is not None:
+        full_up = [w.alt_agl_m for w in mission.waypoints]
+
+        def nearest(p: tuple[float, float]) -> int:
+            return min(range(len(full)), key=lambda k: math.dist(full[k], p))
+
+        alts = [full_up[nearest(p)] for p in route]
+    guidance = CarrotGuidance(
+        route=[
+            RoutePoint(east_m=x, north_m=y, up_m=u) for (x, y), u in zip(route, alts, strict=True)
+        ],
+        lookahead_m=pcfg.horizon_m,
+    )
     corridor = _sliced_corridor(full, route, mission) if use_corridor else None
 
     pos = route[0]
@@ -548,6 +574,27 @@ def fly_with_local_planner(
     control_every = max(1, round(1.0 / (control_hz * dt))) if control_hz > 0 else 1
     step_n = 0
     cmd: PlannerCommand | None = None
+    # Vertical state (only used when ``vertical`` is given).
+    from droneflight.local_offboard import (
+        CLIMB_IN_PLACE_M,
+        Escape,
+        Pose,
+        route_arc_m,
+        window_altitude,
+    )
+
+    z = alts[0]
+    vz = 0.0
+    max_up = z
+    escape = Escape()
+    arc = route_arc_m(guidance.route)
+    fastest_leg = max(leg_speeds) if leg_speeds else 0.0
+
+    def under_canopy(i: int) -> bool:
+        return i >= 1 and leg_speeds[min(i - 1, len(leg_speeds) - 1)] < fastest_leg - 1e-6
+
+    target_up = z
+    sense_z: float | None = None
     while t < max_time_s:
         t += dt
         if vrng is not None:
@@ -564,9 +611,38 @@ def fly_with_local_planner(
         est = (pos[0] + err_x, pos[1] + err_y)
         carrot = guidance.advance(*est)
         if cmd is None or step_n % control_every == 0:
-            scan = sense(
-                obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m
-            )
+            if vertical is not None:
+                target_up = window_altitude(guidance.route, guidance, under_canopy)
+                if escape.up_m is not None:
+                    target_up = max(target_up, escape.up_m)
+                sense_z = min(z, target_up)
+                here = Pose(est[0], est[1], z, heading)
+                _logs, _started = escape.update(
+                    t_s=t,
+                    along_m=guidance.along_m(arc),
+                    index=guidance.index,
+                    arc_m=arc,
+                    believed=here,
+                    truth=Pose(pos[0], pos[1], z, heading),
+                    obstacles=obstacles,
+                    planner=planner,
+                    config=vertical,
+                )
+            if vertical is not None:
+                scan = sense(
+                    obstacles,
+                    pos[0],
+                    pos[1],
+                    heading,
+                    fov,
+                    config.n_rays,
+                    config.sensor_range_m,
+                    z=sense_z,
+                )
+            else:  # 2D call: tools/sensor_ladder.py swaps in a 2D-signature sense()
+                scan = sense(
+                    obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m
+                )
             added = planner.observe(scan, est[0], est[1], heading, velocity=believed_vel, t_s=t)
             cmd = planner.command(
                 est[0],
@@ -587,6 +663,20 @@ def fly_with_local_planner(
         else:
             want = (cmd.vx, cmd.vy)
             desired = math.atan2(cmd.vy, cmd.vx)
+        if vertical is not None:
+            # Same rule as local_offboard.local_step: an escape, or a big climb out of
+            # the canopy, is flown in place before moving on.
+            escaping = escape.up_m is not None and z < target_up - 1.0
+            big_climb = target_up - z > CLIMB_IN_PLACE_M and under_canopy(guidance.index + 1)
+            if escaping or big_climb:
+                want = (0.0, 0.0)
+            vz_cmd = max(
+                -vertical.max_descent_ms,
+                min(vertical.max_climb_ms, (target_up - z) * vertical.climb_gain),
+            )
+            vz += (vz_cmd - vz) / tau_s * dt
+            z += vz * dt
+            max_up = max(max_up, z)
         # The sensor looks where the aircraft is going (yaw follows the command).
         heading = _wrap(heading + max(-max_turn, min(max_turn, _wrap(desired - heading))))
 
@@ -632,7 +722,7 @@ def fly_with_local_planner(
                 pend_y -= pend_y / pend * step
             max_err = max(max_err, math.hypot(err_x, err_y))
 
-        gap = obstacles.clearance(pos[0], pos[1]) - rd
+        gap = obstacles.clearance(pos[0], pos[1], z if vertical is not None else None) - rd
         min_gap = min(min_gap, gap)
         if gap < 0.0:
             if steps_clear >= release_steps:
@@ -676,6 +766,8 @@ def fly_with_local_planner(
         max_nav_error_m=max_err,
         path=tuple(path),
         strike_log=tuple(events),
+        escapes=escape.count,
+        max_up_m=max_up,
     )
 
 
