@@ -84,7 +84,11 @@ class LocalOffboardConfig:
     escape_margin_m: float = 3.0
     """Height kept above the tallest trunk top within ``escape_radius_m``."""
 
-    escape_radius_m: float = 15.0
+    escape_radius_m: float = 30.0
+    """Trunk tops within this radius set the escape height. 🔴 It was 15 m: the local
+    planner stops ~21 m short of a blockage it can see (22 m horizon), so in the
+    open in front of an impassable stand no trunk was within 15 m and the escape
+    never fired (harness, 2026-09-26). 30 m covers the horizon plus margin."""
     escape_hold_m: float = 50.0
     """Route distance flown at the escape height before descending again — past the
     stand that blocked it. The descent senses at its target height (o4e)."""

@@ -576,3 +576,37 @@ def test_escape_state_machine_triggers_drops_memory_and_releases() -> None:
     assert esc.at_height and len(planner.memory) == 0
     step(40.0, 60.0, 2, Pose(0.0, 0.0, 18.0, 0.0))  # 50 m past the escape point
     assert esc.up_m is None and esc.count == 1
+
+
+def test_harness_vertical_mode_escapes_over_an_impassable_wall() -> None:
+    """The harness with altitude (2026-09-26) runs the same escape state machine as
+    fly_local: a wall of 12 m trunks 1 m apart across the route is impassable at
+    6 m, so the aircraft climbs over it once and reaches the goal clean — the SITL
+    behaviour (x6*, 4/4) offline in seconds."""
+    from droneflight.local_offboard import LocalOffboardConfig
+
+    base = _line_mission(90.0)
+    mission = base.model_copy(
+        update={
+            "cruise_speed_ms": 1.0,
+            "waypoints": tuple(w.model_copy(update={"alt_agl_m": 6.0}) for w in base.waypoints),
+        }
+    )
+    wall = tuple(
+        Trunk(40.0 + 0.5 * row, 1.0 * k + 0.5 * row, 0.15, top_z=12.0)
+        for row in (0, 1)
+        for k in range(-25, 26)
+    )
+    cfg = ForestFlightConfig(fov_deg=90.0, n_rays=91, sensor_range_m=30.0)
+    r = fly_with_local_planner(
+        mission,
+        ObstacleField(trunks=wall),
+        config=cfg,
+        max_time_s=400,
+        vertical=LocalOffboardConfig(),
+        use_corridor=False,
+    )
+    assert r.reached_goal
+    assert r.strikes == 0
+    assert r.escapes == 1
+    assert r.max_up_m >= 12.0 + 3.0 - 0.5  # over the wall's tops with the margin
