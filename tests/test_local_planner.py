@@ -423,3 +423,55 @@ def test_descending_back_under_the_canopy_maps_the_trunks_first() -> None:
 
     assert mapped(14.0) == 0  # level over the trunk: rightly not an obstacle
     assert mapped(6.0) > 0  # descending to 6 m: the trunk is seen before it is reached
+
+
+def test_escape_climb_clears_the_local_canopy_and_climbs_in_place() -> None:
+    """In-flight escape (2026-09-25): blocked among trunks, climb straight up over
+    them rather than wait for the stall abort — and only if climbing can help."""
+    from droneflight.local_offboard import (
+        Escape,
+        LocalOffboardConfig,
+        Pose,
+        escape_altitude,
+        local_step,
+        route_arc_m,
+    )
+    from droneflight.model import FlightMission, Waypoint
+    from droneflight.offboard import CarrotGuidance, RoutePoint
+    from droneflight.perception import ObstacleField, Trunk
+
+    field = ObstacleField(
+        trunks=(Trunk(3.0, 1.0, 0.15, top_z=14.0), Trunk(3.0, -1.0, 0.15, top_z=18.0))
+    )
+    truth = Pose(east_m=0.0, north_m=0.0, up_m=7.0, heading_rad=0.0)
+    believed = Pose(east_m=0.0, north_m=0.0, up_m=8.0, heading_rad=0.0)  # 1 m datum offset
+    alt = escape_altitude(field, truth, believed, radius_m=15.0, margin_m=3.0)
+    assert alt is not None and abs(alt - (18.0 + 3.0 + 1.0)) < 1e-9  # in the believed frame
+    above = Pose(east_m=0.0, north_m=0.0, up_m=20.0, heading_rad=0.0)
+    assert escape_altitude(field, above, above, radius_m=15.0, margin_m=3.0) is None
+
+    route = [RoutePoint(float(x), 0.0, 7.0) for x in (0, 10, 20, 30)]
+    assert route_arc_m(route) == [0.0, 10.0, 20.0, 30.0]
+    mission = FlightMission(
+        name="t",
+        home_lat=60.0,
+        home_lon=25.0,
+        cruise_speed_ms=1.0,
+        waypoints=(Waypoint(lat=60.0, lon=25.0, alt_agl_m=7.0),),
+    )
+    step = local_step(
+        believed=truth,
+        velocity_en=(0.0, 0.0),
+        truth=truth,
+        obstacles=field,
+        planner=LocalPlanner(),
+        guidance=CarrotGuidance(route=route, lookahead_m=5.0),
+        route=route,
+        mission=mission,
+        config=LocalOffboardConfig(),
+        t_s=0.0,
+        escape=Escape(up_m=21.0),
+    )
+    assert step.target_up_m == 21.0
+    assert step.command.north_ms == 0.0 and step.command.east_ms == 0.0  # up first
+    assert step.command.down_ms < 0.0  # climbing

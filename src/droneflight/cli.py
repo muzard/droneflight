@@ -1045,6 +1045,7 @@ def _fly_local(args: argparse.Namespace) -> int:  # pragma: no cover - needs a l
         sensor_range_m=args.sensor_range,
         stall_timeout_s=args.stall_timeout,
         max_speed_override_ms=args.max_speed,
+        escape_after_s=args.escape_after if args.escape_after > 0 else None,
     )
     obstacles = manifest.obstacle_field()
     connector = MavsdkOffboardConnector(control_hz=args.control_hz)
@@ -1371,6 +1372,13 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument("--model", default="x500_0")
     fl.add_argument(
         "--record", type=Path, default=None, help="Per-step JSONL (truth, estimate, commands)."
+    )
+    fl.add_argument(
+        "--escape-after",
+        type=float,
+        default=20.0,
+        help="Seconds without route progress among trunks before an ESCAPE CLIMB over "
+        "them (0 = off; the stall abort still applies).",
     )
     fl.add_argument(
         "--planner-set",

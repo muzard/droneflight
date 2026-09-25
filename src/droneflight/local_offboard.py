@@ -36,6 +36,7 @@ unit-tested.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import math
@@ -55,7 +56,7 @@ from droneflight.offboard import (
     ned_yaw_to_enu,
     route_to_local,
 )
-from droneflight.perception import ObstacleField, sense
+from droneflight.perception import OVERFLY_MARGIN_M, ObstacleField, sense
 
 _log = logging.getLogger(__name__)
 
@@ -73,6 +74,21 @@ class LocalOffboardConfig:
     vehicle clamping descent there, not at the airframe's 2.0."""
 
     arrival_radius_m: float = 5.0
+    escape_after_s: float | None = 20.0
+    """ESCAPE CLIMB (2026-09-25, user: "rise over the canopy if it looks unpassable
+    below"): after this long without route progress, while trunks rise above the
+    aircraft, climb straight up over them instead of waiting for the stall abort.
+    None = off. The preflight report states this policy and how high it goes
+    (droneplanner finding ``escape_climb_policy``), so it is never a surprise."""
+
+    escape_margin_m: float = 3.0
+    """Height kept above the tallest trunk top within ``escape_radius_m``."""
+
+    escape_radius_m: float = 15.0
+    escape_hold_m: float = 50.0
+    """Route distance flown at the escape height before descending again — past the
+    stand that blocked it. The descent senses at its target height (o4e)."""
+
     stall_timeout_s: float = 90.0
     progress_log_s: float = 5.0
     use_corridor: bool = True
@@ -104,6 +120,46 @@ class StepResult:
     target_up_m: float
     true_gap_m: float
     limit: str = ""
+
+
+@dataclass
+class Escape:
+    """An in-flight climb over a stand the local planner cannot get through."""
+
+    up_m: float | None = None
+    """Believed-frame altitude held while escaping; None = not escaping."""
+
+    release_at_m: float = 0.0
+    """Route arc length at which the escape ends."""
+
+    count: int = 0
+
+
+def route_arc_m(route: list[RoutePoint]) -> list[float]:
+    """Cumulative horizontal distance along the route at each vertex."""
+    out = [0.0]
+    for a, b in itertools.pairwise(route):
+        out.append(out[-1] + math.hypot(b.east_m - a.east_m, b.north_m - a.north_m))
+    return out
+
+
+def escape_altitude(
+    obstacles: ObstacleField, truth: Pose, believed: Pose, *, radius_m: float, margin_m: float
+) -> float | None:
+    """Believed-frame altitude that clears every trunk top within ``radius_m``, or
+    None if nothing nearby rises above the aircraft (then climbing cannot help).
+
+    The simulator knows the trunk tops (the manifest); a real aircraft would take
+    the canopy top from its own sensing or the plan's over-canopy altitude."""
+    tops = [
+        t.top_z
+        for t in obstacles.trunks
+        if math.isfinite(t.top_z)
+        and math.hypot(t.x - truth.east_m, t.y - truth.north_m) <= radius_m
+    ]
+    if not tops or max(tops) + OVERFLY_MARGIN_M <= truth.up_m:
+        return None
+    return believed.up_m + (max(tops) + margin_m - truth.up_m)
 
 
 def window_altitude(route: list[RoutePoint], guidance: CarrotGuidance) -> float:
@@ -174,10 +230,15 @@ def local_step(
     t_s: float,
     drone_radius_m: float = 0.45,
     corridor: Corridor | None = None,
+    escape: Escape | None = None,
 ) -> StepResult:
-    """One control step. Pure apart from the planner's own state."""
+    """One control step. Pure apart from the planner's own state (and ``escape``,
+    which the caller arms and releases)."""
     sensor = truth or believed
+    escaping = escape is not None and escape.up_m is not None
     heading_to = window_altitude(route, guidance)
+    if escape is not None and escape.up_m is not None:
+        heading_to = max(heading_to, escape.up_m)
     # 🔴 Sense at the height the aircraft is GOING to, when that is lower: SITL o4e
     # (2026-09-25) passed over 9 m trunks at 14 m — rightly ignoring them — then
     # descended back under the canopy straight onto one it had never mapped. A
@@ -222,10 +283,15 @@ def local_step(
     )
 
     target_up = window_altitude(route, guidance)
+    if escape is not None and escape.up_m is not None:
+        target_up = max(target_up, escape.up_m)
     err = target_up - believed.up_m
     climb = max(-config.max_descent_ms, min(config.max_climb_ms, err * config.climb_gain))
 
-    if cmd.blocked:
+    # An escape climbs straight up before it moves on: the aircraft is stuck among
+    # trunks, and the only free direction it has shown is up.
+    climbing_out = escaping and believed.up_m < target_up - 1.0
+    if cmd.blocked or climbing_out:
         ve = vn = 0.0
         look = math.atan2(carrot.north_m - believed.north_m, carrot.east_m - believed.east_m)
     else:
@@ -286,6 +352,8 @@ class LocalOffboardResult:
     blocked_steps: int
     elapsed_s: float
     aborted_reason: str | None = None
+    escapes: int = 0
+    """Escape climbs flown (``LocalOffboardConfig.escape_after_s``)."""
 
 
 async def fly_local(
@@ -302,6 +370,8 @@ async def fly_local(
     route = route_to_local(mission)
     guidance = CarrotGuidance(route=route, lookahead_m=config.planner.horizon_m)
     planner = LocalPlanner(config=config.planner)
+    escape = Escape()
+    arc = route_arc_m(route)
     corridor = mission_corridor(mission, route) if config.use_corridor else None
     _log.info(
         "corridor: %s",
@@ -368,6 +438,7 @@ async def fly_local(
                 config=config,
                 t_s=t,
                 corridor=corridor,
+                escape=escape,
             )
             await connector.set_velocity_ned(step.command)
             min_gap = min(min_gap, step.true_gap_m)
@@ -411,6 +482,7 @@ async def fly_local(
                             else None,
                             "idx": step.route_index,
                             "tgt_up": round(step.target_up_m, 2),
+                            "escape": escape.up_m is not None,
                             "blocked": step.blocked,
                             "limit": step.limit,
                             "yaw": round(math.degrees(believed.heading_rad), 1),
@@ -464,6 +536,37 @@ async def fly_local(
                     contacts,
                     rtf,
                 )
+            if escape.up_m is not None and arc[guidance.index] >= escape.release_at_m:
+                escape.up_m = None
+                _log.warning("escape climb released at route %d — descending", guidance.index)
+            if (
+                config.escape_after_s is not None
+                and escape.up_m is None
+                and true_pose is not None
+                and t - last_progress > config.escape_after_s
+            ):
+                alt = escape_altitude(
+                    obstacles,
+                    true_pose,
+                    believed,
+                    radius_m=config.escape_radius_m,
+                    margin_m=config.escape_margin_m,
+                )
+                if alt is not None:
+                    escape.up_m = alt
+                    escape.release_at_m = arc[guidance.index] + config.escape_hold_m
+                    escape.count += 1
+                    last_progress = t
+                    _log.warning(
+                        "ESCAPE CLIMB #%d at route %d: no progress for %.0f s among trunks "
+                        "— climbing from %.1f to %.1f m, holding for %.0f m of route",
+                        escape.count,
+                        guidance.index,
+                        config.escape_after_s,
+                        up,
+                        alt,
+                        config.escape_hold_m,
+                    )
             if t - last_progress > config.stall_timeout_s:
                 aborted = f"no route progress for {config.stall_timeout_s:.0f}s at {guidance.index}"
                 _log.error("local planner: %s", aborted)
@@ -496,4 +599,5 @@ async def fly_local(
         blocked_steps=blocked,
         elapsed_s=time.monotonic() - started,
         aborted_reason=aborted,
+        escapes=escape.count,
     )
