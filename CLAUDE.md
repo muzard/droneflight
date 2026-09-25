@@ -278,7 +278,7 @@ clean on truth. The 1500 m zone decision rests on 400/ha at 2.0 m/s.
 occlusion). ⚠️ 800/ha is outside the envelope, and the canopy-height model puts
 the demo AO's real stands at 520–1290/ha.
 
-## ⬆️ IN-FLIGHT ESCAPE CLIMB (2026-09-25) — flown in SITL, 1/1 clean
+## ⬆️ IN-FLIGHT ESCAPE CLIMB (2026-09-25) — flown in SITL, **4/4 clean**
 `fly-local --escape-after` (default 20 s): blocked among trunks, climb straight up
 to the tallest trunk top within 15 m + 3 m, hold 50 m of route, descend (sensing at
 the target height). Test world `askolam230w`: Askola's measured-zone forest + an
@@ -291,7 +291,9 @@ the target height). Test world `askolam230w`: Askola's measured-zone forest + an
 | x5e | escaped at the wall, then **stalled at height 90 s** (1130 failed plans) — memory still held every trunk mapped from below | drop the memory on reaching the escape height; anything that really reaches it is sensed afresh |
 | **x6e** | — | **reached the goal: 1 escape at route 5 (19.8 → 27.6 m), released at route 12, `b2-score` CLEAN +1.036 m, 0 samples inside a trunk** |
 
-The second seed (x6a) was voided at RTF 0.08 (host busy) — re-fly pending.
+**All four seed sets:** x6e +1.036, x6a +0.848, x6b +0.913, x6g +0.672 m (`b2-score`
+CLEAN, 0 samples inside a trunk), each with exactly 1 escape at route 5 (19.8 → 26-28 m)
+released at route 12, and each reaching the goal. (A first x6a at RTF 0.08 was voided.)
 ⚠️ The escape height comes from the manifest's trunk tops (oracle); a real aircraft
 needs its own canopy-top sensing or the plan's over-canopy altitude. And the
 climb-through-crowns caveat applies: SITL trunks have no crowns.
