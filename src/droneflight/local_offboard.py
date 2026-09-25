@@ -177,6 +177,15 @@ def local_step(
 ) -> StepResult:
     """One control step. Pure apart from the planner's own state."""
     sensor = truth or believed
+    heading_to = window_altitude(route, guidance)
+    # 🔴 Sense at the height the aircraft is GOING to, when that is lower: SITL o4e
+    # (2026-09-25) passed over 9 m trunks at 14 m — rightly ignoring them — then
+    # descended back under the canopy straight onto one it had never mapped. A
+    # level-looking sensor cannot see trunk tops below it; rejoining the trunk
+    # layer needs a look at it first (a real camera pitches down on a descent).
+    sense_z: float | None = None
+    if truth is not None:
+        sense_z = min(truth.up_m, heading_to + (truth.up_m - believed.up_m))
     scan = sense(
         obstacles,
         x=sensor.east_m,
@@ -186,7 +195,7 @@ def local_step(
         n_rays=config.n_rays,
         max_range=config.sensor_range_m,
         # Only simulator truth shares the manifest's world z frame.
-        z=truth.up_m if truth is not None else None,
+        z=sense_z,
     )
     # The scan is body-relative: place it from the BELIEVED pose.
     added = planner.observe(

@@ -383,3 +383,43 @@ def test_memory_is_cleared_where_the_scan_sees_through_it() -> None:
     kept = set(mem.points())
     assert ghost not in kept
     assert {trunk, behind, far, beside} <= kept
+
+
+def test_descending_back_under_the_canopy_maps_the_trunks_first() -> None:
+    """🔴 SITL o4e (2026-09-25): flying over 9 m trunks at 14 m the oracle rightly
+    ignored them, then the plan descended and the aircraft came down onto one it
+    had never mapped. It must sense at the height it is descending TO."""
+    from droneflight.local_offboard import LocalOffboardConfig, Pose, local_step
+    from droneflight.model import FlightMission, Waypoint
+    from droneflight.offboard import CarrotGuidance, RoutePoint
+    from droneflight.perception import ObstacleField, Trunk
+
+    field = ObstacleField(trunks=(Trunk(4.0, 0.0, 0.15, top_z=9.0),))
+    pose = Pose(east_m=0.0, north_m=0.0, up_m=14.0, heading_rad=0.0, t_s=0.0)
+    mission = FlightMission(
+        name="t",
+        home_lat=60.0,
+        home_lon=25.0,
+        cruise_speed_ms=1.0,
+        waypoints=(Waypoint(lat=60.0, lon=25.0, alt_agl_m=14.0),),
+    )
+
+    def mapped(route_up: float) -> int:
+        route = [RoutePoint(float(x), 0.0, route_up) for x in (0, 10, 20, 30)]
+        planner = LocalPlanner()
+        local_step(
+            believed=pose,
+            velocity_en=(0.0, 0.0),
+            truth=pose,
+            obstacles=field,
+            planner=planner,
+            guidance=CarrotGuidance(route=route, lookahead_m=5.0),
+            route=route,
+            mission=mission,
+            config=LocalOffboardConfig(),
+            t_s=0.0,
+        )
+        return len(planner.memory)
+
+    assert mapped(14.0) == 0  # level over the trunk: rightly not an obstacle
+    assert mapped(6.0) > 0  # descending to 6 m: the trunk is seen before it is reached
