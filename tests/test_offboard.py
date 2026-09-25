@@ -285,3 +285,17 @@ async def test_a_short_route_is_rejected_rather_than_flown_ambiguously() -> None
     mission = _mission(n=1)
     with pytest.raises(ValueError, match="at least two points"):
         await fly_corridor(_FakeConnector((0.0, 0.0, 12.0)), mission, ObstacleField(), _config())
+
+
+def test_guidance_reports_distance_along_the_route() -> None:
+    """The escape climb watches along-route distance, not the vertex index: at 0.5 m/s
+    a 25 m leg shows no index progress for 50 s (SITL x4e false escape at launch)."""
+    from droneflight.local_offboard import route_arc_m
+
+    route = [RoutePoint(0.0, 0.0, 10.0), RoutePoint(25.0, 0.0, 10.0), RoutePoint(50.0, 0.0, 10.0)]
+    g = CarrotGuidance(route=route, lookahead_m=5.0)
+    arc = route_arc_m(route)
+    g.advance(10.0, 0.0)
+    assert g.index == 0 and abs(g.along_m(arc) - 10.0) < 1e-9
+    g.advance(30.0, 1.0)
+    assert g.index == 1 and abs(g.along_m(arc) - 30.0) < 1e-9

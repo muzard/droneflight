@@ -135,6 +135,10 @@ class Escape:
     count: int = 0
 
 
+ESCAPE_PROGRESS_M = 1.0
+"""Along-route gain that counts as progress for the escape trigger."""
+
+
 def route_arc_m(route: list[RoutePoint]) -> list[float]:
     """Cumulative horizontal distance along the route at each vertex."""
     out = [0.0]
@@ -372,6 +376,7 @@ async def fly_local(
     planner = LocalPlanner(config=config.planner)
     escape = Escape()
     arc = route_arc_m(route)
+    best_along, last_along_progress = 0.0, 0.0
     corridor = mission_corridor(mission, route) if config.use_corridor else None
     _log.info(
         "corridor: %s",
@@ -510,6 +515,12 @@ async def fly_local(
                 )
             if guidance.index > best_index:
                 best_index, last_progress = guidance.index, t
+            # 🔴 The escape watches DISTANCE along the route, not the vertex index: at
+            # 0.5 m/s a 25 m leg takes 50 s, and the first SITL try (x4e) climbed out
+            # 20 s after take-off at route 0 while flying normally.
+            along = guidance.along_m(arc)
+            if along > best_along + ESCAPE_PROGRESS_M:
+                best_along, last_along_progress = along, t
             if now - last_log >= config.progress_log_s:
                 rtf = (t - last_t) / max(now - last_log, 1e-6)
                 last_log, last_t = now, t
@@ -543,7 +554,7 @@ async def fly_local(
                 config.escape_after_s is not None
                 and escape.up_m is None
                 and true_pose is not None
-                and t - last_progress > config.escape_after_s
+                and t - last_along_progress > config.escape_after_s
             ):
                 alt = escape_altitude(
                     obstacles,
@@ -556,7 +567,7 @@ async def fly_local(
                     escape.up_m = alt
                     escape.release_at_m = arc[guidance.index] + config.escape_hold_m
                     escape.count += 1
-                    last_progress = t
+                    last_progress = last_along_progress = t
                     _log.warning(
                         "ESCAPE CLIMB #%d at route %d: no progress for %.0f s among trunks "
                         "— climbing from %.1f to %.1f m, holding for %.0f m of route",

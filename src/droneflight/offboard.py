@@ -238,6 +238,8 @@ class CarrotGuidance:
     lookahead_m: float
     index: int = 0
     carrot_is_last: bool = False
+    segment_t: float = 0.0
+    """Projected position along the current leg (0 at ``route[index]``, 1 at the next)."""
 
     def advance(self, east_m: float, north_m: float) -> RoutePoint:
         """Update progress from the current position and return the carrot."""
@@ -246,8 +248,14 @@ class CarrotGuidance:
             t, distance = _project_onto_segment(east_m, north_m, self.route[i], self.route[i + 1])
             if distance < best_d:
                 best_i, best_t, best_d = i, t, distance
-        self.index = best_i
+        self.index, self.segment_t = best_i, best_t
         return self._point_ahead(best_i, best_t)
+
+    def along_m(self, arc_m: list[float]) -> float:
+        """Distance along the route of the projected position (``arc_m`` = cumulative)."""
+        if self.index >= len(arc_m) - 1:
+            return arc_m[-1]
+        return arc_m[self.index] + self.segment_t * (arc_m[self.index + 1] - arc_m[self.index])
 
     def _point_ahead(self, index: int, t: float) -> RoutePoint:
         """Walk ``lookahead_m`` forward along the path from the projected position."""
