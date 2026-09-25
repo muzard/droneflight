@@ -278,6 +278,17 @@ clean on truth. The 1500 m zone decision rests on 400/ha at 2.0 m/s.
 occlusion). ⚠️ 800/ha is outside the envelope, and the canopy-height model puts
 the demo AO's real stands at 520–1290/ha.
 
+## 🧵 TETHER ON OVER-CANOPY LEGS (2026-09-25)
+Flying over the canopy puts cruise legs at 25-35 m AGL (canopy + clearance), where
+the fiber's free-falling span is longer: the straight-leg ceiling is **warn 5.6 /
+break 8.2 m/s at 28 m** (7.5 / 10.9 at 12 m). `tether-check --trajectory
+<planner trajectory.geojson>` now scores every leg at its own AGL. Askola plans
+(600 m zone; measured zone with the over-canopy fallback): **2 legs above warn, 0
+above break** — 6.0 m/s at 32-33 m AGL = 77 % of the break speed, ~46 % of break
+tension (drag ~v³). Accepted; a planner speed cap at high AGL is the lever if bench
+data says otherwise. And where the fiber lands matters more than its tension there:
+over closed canopy it settles on the crowns (droneplanner `cable_on_crowns`).
+
 ## 🧵 TETHER AT FULL SPEED AND UNDER THE CANOPY (2026-09-24)
 User: *"Now that full-speed flight is in use, remember to check and simulate the
 tether drag."* The 1500 m zone means 6 m/s over open ground and weaving flight
