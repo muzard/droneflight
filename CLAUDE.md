@@ -246,7 +246,11 @@ Fitted against Gazebo truth on six `fly-local` records (`sim-logs/mvp_local`):
   believed position integrates e). At 0.15 m/s it produces braking-type contacts
   (400/ha at 3 m/s: 2/4 seeds) — **the first harness to reproduce a SITL contact
   class** — and the smear stall below. It is somewhat pessimistic (grazes −0.01 m
-  on 200/ha at 3 m/s, which SITL flew 4/4 clean).
+  on 200/ha at 3 m/s, which SITL flew 4/4 clean) — and in DENSE forest badly so:
+  **calibrated 2026-09-26 on Askola's ~1000/ha stand at 1.0 m/s, which SITL flew 4/4
+  clean: with σ 0.15 the harness blocks for 1928 s of 2000 and grazes 28 times;
+  without it, clean (+0.44 m).** So a velocity-error harness failure at ≥ 1000/ha
+  means nothing; use it for braking contacts at moderate density only.
 * **`predict_velocity_error_ms`** (opt-in, PR #3): margin grows with look-ahead
   time. **Uncapped it stalled SITL 2/2** (v3e 400/ha 3 m/s, v4a 200/ha 4 m/s — 0
   contacts, stopped 0.97 m from a trunk for good); growth now capped at 1 s, and
