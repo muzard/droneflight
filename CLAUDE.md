@@ -326,6 +326,17 @@ in four there relies on the escape. Planner anchors unchanged (bar: >0.15 m air 
 every seed set) for 1.0 at 1200; 1500/ha at 0.5 is 4/4 (h5g re-flown after a run at RTF
 0.11 with the host loaded was voided) → planner 1200/ha anchor 0.4 → 0.5.
 
+**Why the dead ends? Not measurable from the old record (2026-09-26, PR #9).** In h1g every
+replan returned *no path* for 20 s. Replayed offline against the TRUE trunks shifted into
+the odometry frame — plus symmetric smear up to σ 0.5 m, plus a two-offset memory
+mimicking the 1.1 m of navigation drift in those 13 s, plus windows up to 25 m — the
+planner found a path every time. Remembered trunks near the aircraft sat 0.4-0.9 m from
+where they now were, and memory held 1027 points against ~190 real trunks within 30 m,
+but the record kept only the nearest few. So `fly_local` now dumps the **whole memory and
+the corridor on the first step of each blockage** (`mem_dump`), and
+`tools/replay_blocked.py` re-runs `plan_local` on exactly that, plus the variants a fix
+would change (no corridor / wider window / merged memory).
+
 ## 🧵 TETHER ON OVER-CANOPY LEGS (2026-09-25)
 Flying over the canopy puts cruise legs at 25-35 m AGL (canopy + clearance), where
 the fiber's free-falling span is longer: the straight-leg ceiling is **warn 5.6 /
