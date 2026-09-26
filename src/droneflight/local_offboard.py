@@ -492,6 +492,7 @@ async def fly_local(
     last_progress = 0.0
     best_index = -1
     steps = contacts = blocked = 0
+    was_blocked = False
     min_gap = math.inf
     in_contact = False
     sim_t0: float | None = None
@@ -560,10 +561,28 @@ async def fly_local(
                 )
             in_contact = step.true_gap_m < 0.0
             blocked += int(step.blocked)
+            # The first step of a blockage dumps the planner's WHOLE memory and the
+            # corridor, so the dead end replays exactly offline
+            # (tools/replay_blocked.py). SITL h1g, 2026-09-26: replayed against the
+            # true trunks — with smear, with a two-offset memory, with wider windows —
+            # the planner always found a path; only the real memory can say why not.
+            dump: dict[str, object] = {}
+            if step.blocked and not was_blocked:
+                dump = {
+                    "mem_dump": [
+                        [round(mx, 2), round(my, 2)] for mx, my in planner.memory.points()
+                    ],
+                    "corridor": [
+                        [round(cx, 2), round(cy, 2), round(cw, 2)]
+                        for (cx, cy), cw in (corridor or [])
+                    ],
+                }
+            was_blocked = step.blocked
             if out is not None:
                 out.write(
                     json.dumps(
-                        {
+                        dump
+                        | {
                             "t": round(t, 3),
                             "est": [round(east, 3), round(north, 3), round(up, 3)],
                             "true": (

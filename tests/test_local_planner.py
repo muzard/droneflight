@@ -610,3 +610,78 @@ def test_harness_vertical_mode_escapes_over_an_impassable_wall() -> None:
     assert r.strikes == 0
     assert r.escapes == 1
     assert r.max_up_m >= 12.0 + 3.0 - 0.5  # over the wall's tops with the margin
+
+
+def test_fly_local_dumps_the_whole_memory_when_a_blockage_starts(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """2026-09-26: SITL h1g blocked for 20 s, yet offline the planner always found a
+    path against the true trunks — only its real memory can say why. The first step of
+    every blockage now writes the whole memory and the corridor to the record
+    (tools/replay_blocked.py replays it)."""
+    import asyncio
+    import json
+
+    from droneflight.local_offboard import LocalOffboardConfig, Pose, fly_local
+
+    base = _line_mission(90.0)
+    mission = base.model_copy(
+        update={
+            "cruise_speed_ms": 1.0,
+            "waypoints": tuple(w.model_copy(update={"alt_agl_m": 6.0}) for w in base.waypoints),
+        }
+    )
+    wall = tuple(
+        Trunk(40.0 + 0.5 * row, 1.0 * k + 0.5 * row, 0.15, top_z=12.0)
+        for row in (0, 1)
+        for k in range(-25, 26)
+    )
+
+    class FakeVehicle:
+        """Kinematic stand-in for PX4 offboard: position integrates the command."""
+
+        def __init__(self) -> None:
+            self.x = self.y = 0.0
+            self.z = 6.0
+            self.v = (0.0, 0.0, 0.0)
+            self.t = 0.0
+
+        async def start_offboard(self) -> None:
+            return None
+
+        async def stop_offboard(self) -> None:
+            return None
+
+        async def set_velocity_ned(self, command) -> None:  # type: ignore[no-untyped-def]
+            self.v = (command.east_ms, command.north_ms, -command.down_ms)
+
+        async def telemetry_full(self):  # type: ignore[no-untyped-def]
+            while True:
+                self.t += 0.1
+                self.x += self.v[0] * 0.1
+                self.y += self.v[1] * 0.1
+                self.z += self.v[2] * 0.1
+                yield self.x, self.y, self.z, 90.0, self.v[0], self.v[1]
+
+        def truth(self) -> Pose:
+            return Pose(self.x, self.y, self.z, 0.0, t_s=self.t)
+
+    vehicle = FakeVehicle()
+    record = tmp_path / "flight.jsonl"
+    asyncio.run(
+        fly_local(
+            vehicle,
+            mission,
+            ObstacleField(trunks=wall),
+            LocalOffboardConfig(),
+            truth=vehicle.truth,
+            record=record,
+            max_steps=700,
+        )
+    )
+    rows = [json.loads(line) for line in record.read_text().splitlines()]
+    dumps = [r for r in rows if "mem_dump" in r]
+    assert dumps, "the wall must block the planner at least once"
+    first_blocked = next(r for r in rows if r["blocked"])
+    assert "mem_dump" in first_blocked  # dumped on the FIRST blocked step
+    assert len(dumps[0]["mem_dump"]) == dumps[0]["mem"]  # the whole memory
+    later = [r for r in rows if r["blocked"] and r is not first_blocked]
+    assert later and "mem_dump" not in later[0]  # once per blockage, not every step
