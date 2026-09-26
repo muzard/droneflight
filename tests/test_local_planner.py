@@ -578,6 +578,57 @@ def test_escape_state_machine_triggers_drops_memory_and_releases() -> None:
     assert esc.up_m is None and esc.count == 1
 
 
+def test_a_detour_with_a_path_is_not_a_dead_end() -> None:
+    """SITL h5e (1500/ha, 0.5 m/s, 2026-09-26) escaped with 0 blocked steps: it was
+    flying a 12.7 m detour, and 20 s at 0.5 m/s is only 10 m. With a path, the escape
+    now waits for escape_detour_m of track without progress — or the backstop."""
+    from droneflight.local_offboard import ESCAPE_BACKSTOP, Escape, LocalOffboardConfig, Pose
+    from droneflight.perception import ObstacleField, Trunk
+
+    field = ObstacleField(trunks=(Trunk(2.0, 0.0, 0.15, top_z=15.0),))
+    cfg = LocalOffboardConfig()
+    arc = [0.0, 25.0, 50.0]
+
+    def run(track_per_s: float, until_s: float) -> float | None:
+        """Circle at ``track_per_s`` with a path and no route progress; return the
+        time the escape starts, or None."""
+        esc, planner = Escape(), LocalPlanner()
+        planner.path = [(0.0, 0.0), (1.0, 1.0)]  # it HAS a path
+        t, angle = 0.0, 0.0
+        while t <= until_s:
+            r = 5.0
+            angle += track_per_s * 0.5 / r
+            pose = Pose(r * math.cos(angle), r * math.sin(angle), 6.0, 0.0)
+            _, started = esc.update(
+                t_s=t,
+                along_m=0.5,
+                index=0,
+                arc_m=arc,
+                believed=pose,
+                truth=pose,
+                obstacles=field,
+                planner=planner,
+                config=cfg,
+            )
+            if started:
+                return t
+            t += 0.5
+        return None
+
+    assert cfg.escape_after_s is not None
+    # 0.5 m/s: 30 m of detour takes 60 s = the backstop; either way, not at 20 s.
+    slow = run(0.5, 200.0)
+    assert slow is not None and slow >= 59.0
+    # 2 m/s: 30 m of detour after 15 s, so it escapes as soon as 20 s have passed.
+    fast = run(2.0, 200.0)
+    assert fast is not None and 20.0 < fast <= 21.0
+    # Barely moving with a path (dithering): the backstop still gets it out.
+    dither = run(0.05, 200.0)
+    assert dither is not None and dither == pytest.approx(
+        ESCAPE_BACKSTOP * cfg.escape_after_s, abs=1.0
+    )
+
+
 def test_harness_vertical_mode_escapes_over_an_impassable_wall() -> None:
     """The harness with altitude (2026-09-26) runs the same escape state machine as
     fly_local: a wall of 12 m trunks 1 m apart across the route is impassable at

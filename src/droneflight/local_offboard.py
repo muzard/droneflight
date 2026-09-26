@@ -93,6 +93,14 @@ class LocalOffboardConfig:
     """Route distance flown at the escape height before descending again — past the
     stand that blocked it. The descent senses at its target height (o4e)."""
 
+    escape_detour_m: float = 30.0
+    """A stall only means STUCK when the planner has no path. With a path, the
+    aircraft is detouring, and escapes only after this much track without route
+    progress (or ``ESCAPE_BACKSTOP`` x ``escape_after_s``, whatever it is doing).
+    🔴 SITL h5e (1500/ha, 0.5 m/s, 2026-09-26) escaped with 0 blocked steps: 20 s at
+    0.5 m/s is 10 m of travel, and it was flying a legitimate 12.7 m detour round a
+    clump — up over the canopy, concealment lost, for nothing."""
+
     stall_timeout_s: float = 90.0
     progress_log_s: float = 5.0
     use_corridor: bool = True
@@ -142,6 +150,9 @@ class Escape:
 
     best_along_m: float = 0.0
     last_progress_t: float = 0.0
+    track_since_progress_m: float = 0.0
+    """Believed track flown since the last route progress (the detour length)."""
+    last_pos: tuple[float, float] | None = None
 
     def update(
         self,
@@ -162,8 +173,13 @@ class Escape:
         logs: list[str] = []
         # 🔴 Progress is DISTANCE along the route, not the vertex index: at 0.5 m/s a
         # 25 m leg takes 50 s, and SITL x4e escaped 20 s after take-off at route 0.
+        here = (believed.east_m, believed.north_m)
+        if self.last_pos is not None:
+            self.track_since_progress_m += math.dist(self.last_pos, here)
+        self.last_pos = here
         if along_m > self.best_along_m + ESCAPE_PROGRESS_M:
             self.best_along_m, self.last_progress_t = along_m, t_s
+            self.track_since_progress_m = 0.0
         if self.up_m is not None and not self.at_height and believed.up_m >= self.up_m - 1.0:
             # 🔴 SITL x5e: escaped, then stalled at height 90 s (1130 failed plans) —
             # memory held every trunk mapped from below. At the escape height those
@@ -176,12 +192,15 @@ class Escape:
             self.up_m = None
             logs.append(f"escape climb released at route {index} — descending")
         started = False
-        if (
-            config.escape_after_s is not None
-            and self.up_m is None
-            and truth is not None
-            and t_s - self.last_progress_t > config.escape_after_s
-        ):
+        stalled_s = t_s - self.last_progress_t
+        stuck = config.escape_after_s is not None and (
+            (
+                stalled_s > config.escape_after_s
+                and (planner.path is None or self.track_since_progress_m >= config.escape_detour_m)
+            )
+            or stalled_s > ESCAPE_BACKSTOP * config.escape_after_s
+        )
+        if stuck and self.up_m is None and truth is not None and config.escape_after_s is not None:
             alt = escape_altitude(
                 obstacles,
                 truth,
@@ -193,11 +212,19 @@ class Escape:
                 self.up_m, self.at_height = alt, False
                 self.release_at_m = arc_m[index] + config.escape_hold_m
                 self.count += 1
+                why = (
+                    "no path"
+                    if planner.path is None
+                    else f"{self.track_since_progress_m:.0f} m of detour"
+                )
                 self.last_progress_t = t_s
+                self.track_since_progress_m = 0.0
                 started = True
                 logs.append(
                     f"ESCAPE CLIMB #{self.count} at route {index}: no progress for "
-                    f"{config.escape_after_s:.0f} s among trunks — climbing from "
+                    f"{stalled_s:.0f} s among trunks "
+                    f"({why})"
+                    " — climbing from "
                     f"{believed.up_m:.1f} to {alt:.1f} m, holding for "
                     f"{config.escape_hold_m:.0f} m of route"
                 )
@@ -206,6 +233,10 @@ class Escape:
 
 ESCAPE_PROGRESS_M = 1.0
 """Along-route gain that counts as progress for the escape trigger."""
+
+ESCAPE_BACKSTOP = 3.0
+"""With a path and a short detour, escape anyway after this many ``escape_after_s``:
+a planner that keeps a path but cannot fly it (dithering) must not stall forever."""
 
 
 def route_arc_m(route: list[RoutePoint]) -> list[float]:

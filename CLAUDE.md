@@ -331,11 +331,19 @@ replan returned *no path* for 20 s. Replayed offline against the TRUE trunks shi
 the odometry frame — plus symmetric smear up to σ 0.5 m, plus a two-offset memory
 mimicking the 1.1 m of navigation drift in those 13 s, plus windows up to 25 m — the
 planner found a path every time. Remembered trunks near the aircraft sat 0.4-0.9 m from
-where they now were, and memory held 1027 points against ~190 real trunks within 30 m,
-but the record kept only the nearest few. So `fly_local` now dumps the **whole memory and
+where they now were, but the record kept only the nearest few (memory holds sensor
+*surface returns*, ~6 per trunk — 1100-1500 points in every dense run, blocked or not). So `fly_local` now dumps the **whole memory and
 the corridor on the first step of each blockage** (`mem_dump`), and
 `tools/replay_blocked.py` re-runs `plan_local` on exactly that, plus the variants a fix
 would change (no corridor / wider window / merged memory).
+
+🔴 **And h5e was not a dead end at all.** It escaped with **0 blocked steps**: it had a
+path and was flying a 12.7 m detour at 0.5 m/s, and "20 s without route progress" is only
+10 m at that speed. **Genuine dead ends above 1000/ha: 1 in 8 traverses (h1g), not 1 in
+4 at both densities** — 1500/ha had none. Fixed: a stall only counts as stuck when the
+planner has **no path**; with one, the escape waits for `escape_detour_m` (30 m) of track
+without progress, and a backstop (3 × `escape_after_s`) still catches a planner that
+dithers. Unflown — the h1r re-fly queue is the test.
 
 ## 🧵 TETHER ON OVER-CANOPY LEGS (2026-09-25)
 Flying over the canopy puts cruise legs at 25-35 m AGL (canopy + clearance), where
