@@ -310,6 +310,21 @@ mirrors it). A 7 s unit test now pins "escape over a wall, reach the goal clean"
 needs its own canopy-top sensing or the plan's over-canopy altitude. And the
 climb-through-crowns caveat applies: SITL trunks have no crowns.
 
+**The escape fires on its own in dense natural forest (2026-09-26).** No wall — just
+Poisson stands on the MVP route, GPS-denied, four seed sets each:
+
+| world | speed | `b2-score` | air (surface − 0.45 m) | escapes |
+|---|---|---|---|---|
+| `forest_mvp1200n` (1200/ha) | 1.0 m/s | 4/4 CLEAN | +0.33 / +0.50 / +0.48 / **+0.07** | **1 in 4** (h1g, route 52) |
+| `forest_mvp1500n` (1500/ha) | 0.5 m/s | 3/3 valid CLEAN | +0.52 / +0.78 / +0.58 | **1 in 3** (h5e, route 40) |
+
+Each escape followed the local planner's speed cap going to 0 (no gap it could thread)
+and was cleared by the climb, 20 s later, with 0 contacts; h1g's thin +0.07 m was on the
+approach to that dead end, at 0.95 m/s and normal flight height. At ~1000/ha: 0 escapes
+in 4. So **passability, not speed, fails first past ~1000 stems/ha**, and one traverse
+in four there relies on the escape. Planner anchors unchanged (bar: >0.15 m air on
+every seed set). h5g voided (RTF 0.11, game running on the host) — re-fly pending.
+
 ## 🧵 TETHER ON OVER-CANOPY LEGS (2026-09-25)
 Flying over the canopy puts cruise legs at 25-35 m AGL (canopy + clearance), where
 the fiber's free-falling span is longer: the straight-leg ceiling is **warn 5.6 /
