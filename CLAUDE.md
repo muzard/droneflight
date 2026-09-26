@@ -294,6 +294,14 @@ the target height). Test world `askolam230w`: Askola's measured-zone forest + an
 **All four seed sets:** x6e +1.036, x6a +0.848, x6b +0.913, x6g +0.672 m (`b2-score`
 CLEAN, 0 samples inside a trunk), each with exactly 1 escape at route 5 (19.8 → 26-28 m)
 released at route 12, and each reaching the goal. (A first x6a at RTF 0.08 was voided.)
+**The offline harness now has altitude** (`reactive.fly_with_local_planner(vertical=
+LocalOffboardConfig())`) and runs the same `Escape` state machine as `fly_local`. It
+reproduces the walled-world escape offline (1 escape to 26.2 m, clean — SITL 26.2-27.6 m)
+and flies the over-canopy Askola plan clean on two seeds, in ~1.5 min instead of ~25.
+It found a third defect at once: the planner stops ~21 m short of a blockage it can see,
+so in the open in front of an impassable stand no trunk was within the 15 m escape
+radius and the escape never fired → **`escape_radius_m` 30 m** (the planner's report
+mirrors it). A 7 s unit test now pins "escape over a wall, reach the goal clean".
 ⚠️ The escape height comes from the manifest's trunk tops (oracle); a real aircraft
 needs its own canopy-top sensing or the plan's over-canopy altitude. And the
 climb-through-crowns caveat applies: SITL trunks have no crowns.
