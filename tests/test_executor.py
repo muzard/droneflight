@@ -161,3 +161,21 @@ async def test_derived_timeout_is_used_when_config_leaves_it_unset() -> None:
     conn = FakeConnector()
     result = await fly_mission(conn, _mission(4), FlightConfig())
     assert result.completed  # no spurious abort with the default (auto) timeout
+
+
+@pytest.mark.parametrize("policy", [True, False])
+def test_the_plans_leg_speed_is_a_ceiling_the_policy_cannot_raise(policy: bool) -> None:
+    """The forest speed cap from the .plan (DO_CHANGE_SPEED) must reach the vehicle
+    whether or not the tether policy runs, and the policy may only lower it."""
+    m = _mission(4)
+    slow = m.model_copy(
+        update={
+            "waypoints": tuple(
+                w.model_copy(update={"speed_ms": 3.0 if i == 1 else None})
+                for i, w in enumerate(m.waypoints)
+            )
+        }
+    )
+    items = prepare_items(slow, FlightConfig(speed_policy_enabled=policy))
+    assert items[1].speed_ms <= 3.0
+    assert items[0].speed_ms > 3.0

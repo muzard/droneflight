@@ -99,6 +99,60 @@ class MavsdkOffboardConnector:
             )
             await asyncio.sleep(self._period_s)
 
+    async def telemetry_full(
+        self,
+    ) -> AsyncIterator[tuple[float, float, float, float, float, float]]:
+        """``(east, north, up, yaw_deg, v_east, v_north)`` — the local planner's feed.
+
+        ``up`` is altitude relative to HOME (the plan's frame), not local NED z.
+
+        Velocity lets it plan from where momentum is carrying the aircraft
+        (`local_planner.LocalPlanner._plan_committed`).
+
+        ⚠️ The streams are drained by background tasks that keep only the LATEST
+        sample. Reading a persistent gRPC stream at 10 Hz while PX4 publishes
+        faster lets it queue, and the planner would then be steering on a
+        position seconds old — invisible in the numbers, fatal among trunks.
+        """
+        latest: dict[str, object] = {}
+
+        async def drain(name: str, stream: AsyncIterator[object]) -> None:
+            async for sample in stream:
+                latest[name] = sample
+
+        tasks = [
+            asyncio.create_task(drain("pv", self._drone.telemetry.position_velocity_ned())),
+            asyncio.create_task(drain("att", self._drone.telemetry.attitude_euler())),
+            asyncio.create_task(drain("pos", self._drone.telemetry.position())),
+        ]
+        try:
+            loop = asyncio.get_running_loop()
+            while not {"pv", "att", "pos"} <= latest.keys():
+                await asyncio.sleep(0.02)
+            next_t = loop.time()
+            while True:
+                pv = latest["pv"]
+                att = latest["att"]
+                pos = latest["pos"]
+                yield (
+                    pv.position.east_m,  # type: ignore[attr-defined]
+                    pv.position.north_m,  # type: ignore[attr-defined]
+                    # 🔴 NOT -down_m. With external vision EKF2's local z sat
+                    # 124.6 m below truth — exactly home AMSL, the origin the EV
+                    # bridge sets — so the first GPS-denied fly-local climbed
+                    # through 43 m chasing a 12 m target before it was aborted.
+                    # The plan's altitudes are relative to home; so is this.
+                    pos.relative_altitude_m,  # type: ignore[attr-defined]
+                    att.yaw_deg,  # type: ignore[attr-defined]
+                    pv.velocity.east_m_s,  # type: ignore[attr-defined]
+                    pv.velocity.north_m_s,  # type: ignore[attr-defined]
+                )
+                next_t += self._period_s
+                await asyncio.sleep(max(0.0, next_t - loop.time()))
+        finally:
+            for task in tasks:
+                task.cancel()
+
     async def stop_offboard(self) -> None:
         with contextlib.suppress(Exception):
             await self._drone.offboard.stop()

@@ -50,3 +50,12 @@ def test_malformed_rows_name_the_line(tmp_path: Path) -> None:
     bad = "east_m,north_m,base_z_m,radius_m,height_m\n1.0,2.0,3.0,notanumber,5.0\n"
     with pytest.raises(TrunkManifestError, match=":2 is malformed"):
         load_trunk_manifest(_write(tmp_path, bad))
+
+
+def test_the_field_carries_each_trunks_crown_top(tmp_path: Path) -> None:
+    """So a sensor flying over the canopy sees past it (perception.OVERFLY_MARGIN_M)."""
+    manifest = load_trunk_manifest(_write(tmp_path, _CSV))
+    field = manifest.obstacle_field()
+    assert [t.top_z for t in field.trunks] == [
+        manifest.top_z_m(i) for i in range(len(manifest.trunks))
+    ]

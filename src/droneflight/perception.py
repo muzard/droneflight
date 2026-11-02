@@ -25,6 +25,15 @@ class Trunk:
     x: float
     y: float
     radius: float = 0.15
+    top_z: float = math.inf
+    """World z of the crown top. A sensor or airframe above it (by
+    ``OVERFLY_MARGIN_M``) cannot see or touch it — which is what lets a plan fly
+    OVER a stand (droneplanner ``over_canopy_when_unpassable``) without the 2D
+    oracle dodging trunks far beneath it. ``inf`` = infinitely tall (the old model)."""
+
+
+OVERFLY_MARGIN_M = 0.5
+"""Height above a trunk's top at which the airframe is clear of it."""
 
 
 @dataclass
@@ -57,14 +66,18 @@ class ObstacleField:
                 out.extend(self._index.get((i, j), ()))
         return out
 
-    def clearance(self, x: float, y: float) -> float:
-        """Distance from (x, y) to the nearest trunk *surface* (negative if inside)."""
-        near = self._nearby(x, y, self.cell_size_m)
+    def clearance(self, x: float, y: float, z: float | None = None) -> float:
+        """Distance from (x, y) to the nearest trunk *surface* (negative if inside).
+
+        With ``z`` (world), trunks whose top the airframe is above are ignored."""
+        near = [t for t in self._nearby(x, y, self.cell_size_m) if _reaches(t, z)]
         if not near:
             return math.inf
         return min(math.hypot(x - t.x, y - t.y) - t.radius for t in near)
 
-    def ray_range(self, ox: float, oy: float, bearing: float, max_range: float) -> float:
+    def ray_range(
+        self, ox: float, oy: float, bearing: float, max_range: float, z: float | None = None
+    ) -> float:
         """Distance to the first trunk hit along ``bearing`` from (ox, oy).
 
         Returns ``max_range`` if nothing is hit within range. Accounts for trunk
@@ -73,6 +86,8 @@ class ObstacleField:
         dx, dy = math.cos(bearing), math.sin(bearing)
         best = max_range
         for t in self._nearby(ox, oy, max_range + 0.5):
+            if not _reaches(t, z):
+                continue
             fx, fy = ox - t.x, oy - t.y
             # |O + s*D - C|^2 = r^2  ->  s^2 + 2 b s + c = 0  (D is unit)
             b = fx * dx + fy * dy
@@ -110,11 +125,20 @@ def sense(
     fov_rad: float,
     n_rays: int,
     max_range: float,
+    z: float | None = None,
 ) -> DepthScan:
-    """Cast ``n_rays`` across the FOV centred on ``heading`` and return the scan."""
+    """Cast ``n_rays`` across the FOV centred on ``heading`` and return the scan.
+
+    ``z`` (world) is the sensor's height: a horizontal scan does not see trunks
+    whose tops are below it."""
     n_rays = max(2, n_rays)
     bearings = [(-fov_rad / 2.0) + fov_rad * i / (n_rays - 1) for i in range(n_rays)]
-    ranges = tuple(field.ray_range(x, y, heading + rel, max_range) for rel in bearings)
+    ranges = tuple(field.ray_range(x, y, heading + rel, max_range, z) for rel in bearings)
     return DepthScan(
         bearings_rel=tuple(bearings), ranges=ranges, max_range=max_range, fov_rad=fov_rad
     )
+
+
+def _reaches(t: Trunk, z: float | None) -> bool:
+    """Does trunk ``t`` rise to height ``z`` (within the overfly margin)?"""
+    return z is None or t.top_z + OVERFLY_MARGIN_M > z

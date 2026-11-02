@@ -155,3 +155,28 @@ def flown_deflection_deg(
         return 0.0
     deg = math.degrees(accel * coupling_length_m / (speed_ms * speed_ms))
     return min(deg, 180.0)
+
+
+# --------------------------------------------------------------------------- #
+# Offboard VELOCITY response — what `fly-local`'s setpoints actually produce
+# --------------------------------------------------------------------------- #
+
+OFFBOARD_DELAY_S = 0.3
+"""Dead time from a velocity setpoint leaving the planner to the airframe acting
+on it: telemetry age + MAVSDK + PX4's control loop, all at the planner's 10 Hz."""
+
+OFFBOARD_TAU_S = 0.4
+"""First-order lag of the velocity response after the dead time."""
+
+OFFBOARD_MAX_ACCEL_MS2 = 3.0
+"""``MPC_ACC_HOR`` — the response saturates here."""
+# MEASURED 2026-09-24 from the four `fly-local` SITL records in
+# sim-logs/mvp_local (gps1, denied3, d400n, tether1; 3225 forest windows): replay
+# each window's recorded setpoints through `v' = (cmd(t - delay) - v) / tau`,
+# clamped at 3 m/s^2, and compare with the recorded velocity 1 s later. Best fit
+# 0.3 s / 0.4 s: velocity error mean 0.07 m/s (p95 0.25), position error mean
+# 0.05 m (p95 0.18). Held out on fix2 (GPS-denied, different code): 0.045 / 0.17 m.
+# The jerk-limited model the planner and harness used before — PX4's AUTO-mode
+# trajectory generator, the right model for mission mode — scored 0.17 / 0.40 m,
+# and a GPS-denied SITL flight hit a trunk its prediction had passed as clear:
+# offboard velocity setpoints do not go through that generator.

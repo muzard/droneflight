@@ -99,12 +99,17 @@ def prepare_items(mission: FlightMission, config: FlightConfig) -> list[MissionI
     if not config.speed_policy_enabled:
         return [
             MissionItem(
-                lat=w.lat, lon=w.lon, alt_agl_m=w.alt_agl_m, speed_ms=mission.cruise_speed_ms
+                lat=w.lat, lon=w.lon, alt_agl_m=w.alt_agl_m, speed_ms=mission.leg_speed_ms(i)
             )
-            for w in mission.waypoints
+            for i, w in enumerate(mission.waypoints)
         ]
     policy = replace(config.speed, cruise_speed_ms=mission.cruise_speed_ms)
-    return apply_speed_policy(mission, policy)
+    # The planner's per-leg speed (forest stem density) is a ceiling the tether
+    # policy may only lower — never raise back to cruise.
+    return [
+        item.model_copy(update={"speed_ms": min(item.speed_ms, mission.leg_speed_ms(i))})
+        for i, item in enumerate(apply_speed_policy(mission, policy))
+    ]
 
 
 async def fly_mission(

@@ -536,7 +536,7 @@ def test_tether_check_reports_policy_validation(
     out = capsys.readouterr().out
     assert rc in (0, 1)
     assert "tether v0" in out
-    assert "no policy (flat cruise)" in out
+    assert "no policy (plan speeds)" in out
     assert "speed policy" in out
 
 
@@ -659,3 +659,23 @@ def test_tether_plugin_check_reports_a_break(
 
 def test_tether_plugin_check_missing_log(tmp_path: Path) -> None:
     assert app(["tether-plugin-check", "--log", str(tmp_path / "nope.csv")]) == 2
+
+
+def test_tether_check_scores_each_leg_at_its_own_agl(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Over-canopy climbs fly cruise at 25-35 m AGL, where the free-falling span is
+    longer and the ceiling lower than at the fixed --agl 12 (2026-09-25)."""
+    plan = tmp_path / "m.plan"
+    _write_plan(plan)  # 2 waypoints at 6.0 m/s
+
+    def run(agl: float) -> str:
+        traj = tmp_path / "t.geojson"
+        traj.write_text(
+            json.dumps({"type": "Feature", "geometry": {"coordinates": [[0, 0, agl], [0, 1, agl]]}})
+        )
+        app(["tether-check", "--plan", str(plan), "--trajectory", str(traj)])
+        return capsys.readouterr().out
+
+    assert "0 leg(s) above warn" in run(10.0)
+    assert "1 leg(s) above warn" in run(35.0)  # warn ~5.2 m/s at 35 m, plan 6.0

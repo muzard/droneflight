@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import csv
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from droneflight.perception import ObstacleField, Trunk
@@ -65,8 +65,10 @@ class ForestManifest:
     )
 
     def obstacle_field(self, cell_size_m: float = 10.0) -> ObstacleField:
-        """The indexed field ``perception.sense()`` queries."""
-        return ObstacleField(trunks=self.trunks, cell_size_m=cell_size_m)
+        """The indexed field ``perception.sense()`` queries — each trunk with its
+        crown-top height, so a sensor flying over the canopy sees past it."""
+        trunks = tuple(replace(t, top_z=self.top_z_m(i)) for i, t in enumerate(self.trunks))
+        return ObstacleField(trunks=trunks, cell_size_m=cell_size_m)
 
     def top_z_m(self, index: int) -> float:
         """World z of a trunk's crown."""

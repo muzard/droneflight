@@ -8,6 +8,7 @@ clusters that otherwise smear a turn to ~0°.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -87,11 +88,13 @@ def test_squares_with_multiplication_not_pow_for_cpp_parity() -> None:
     a speed from that flight where pow != mul.
     """
     v = 4.989233542214098
-    assert v**2 != v * v  # the whole reason this test exists
     c = TetherConfig()
     k = 0.5 * c.air_density_kg_m3 * c.drag_coefficient * c.fiber_diameter_m * c.airborne_span_m
     assert drag_tension_n(c, v) == k * (v * v)  # multiply, bit-exact
-    assert drag_tension_n(c, v) != k * v**2  # not the pow() value
+    # pow() and multiply disagree for this value on macOS's libm but agree on
+    # glibc (CI), so the "not pow" half can only be checked where they differ.
+    if v**2 != v * v:
+        assert drag_tension_n(c, v) != k * v**2  # not the pow() value
 
 
 def test_total_tension_is_the_sum() -> None:
@@ -321,3 +324,75 @@ def test_plugin_log_records_a_disabled_control_arm(tmp_path: Path) -> None:
     path = tmp_path / "t.csv"
     path.write_text(_plugin_csv([_cruise_row(0.0, 6.0)], enabled=0))
     assert not parse_plugin_log(path).enabled
+
+
+def test_the_plans_leg_speeds_are_what_gets_scored() -> None:
+    """The ``.plan`` carries DO_CHANGE_SPEED since 2026-09-23 (3 m/s in forest,
+    6 m/s in the open). Scoring every vertex at cruise ignored it; a vertex whose
+    legs are both slow must be scored slow, and one next to a fast leg fast."""
+    coords = [(46.90, 15.0), (46.9009, 15.0), (46.9018, 15.0), (46.9027, 15.0)]
+    speeds = [3.0, 3.0, 6.0, None]
+    m = FlightMission(
+        name="t",
+        home_lat=coords[0][0],
+        home_lon=coords[0][1],
+        cruise_speed_ms=6.0,
+        waypoints=tuple(
+            Waypoint(lat=la, lon=lo, alt_agl_m=30.0, speed_ms=v)
+            for (la, lo), v in zip(coords, speeds, strict=True)
+        ),
+    )
+    loads = analyse_tether(m, TetherConfig(), policy=None, px4_corner_prior=False).loads
+    assert [load.speed_ms for load in loads] == [3.0, 3.0, 6.0, 6.0]
+    capped = analyse_tether(
+        m, TetherConfig(), policy=SpeedPolicy(cruise_speed_ms=6.0), px4_corner_prior=False
+    )
+    assert capped.loads[1].speed_ms == 3.0
+
+
+def test_a_straight_track_past_trunks_has_no_span_contacts() -> None:
+    from droneflight.perception import Trunk
+    from droneflight.tether import airborne_span_contacts
+
+    track = [(float(x), 0.0) for x in range(0, 100)]
+    trunks = (Trunk(50.0, 1.0, 0.15), Trunk(70.0, -1.2, 0.15))
+    assert airborne_span_contacts(track, trunks, 20.0).trunks == ()
+
+
+def test_the_span_cuts_the_corner_the_aircraft_flew_round() -> None:
+    """Round a trunk on a dogleg: the aircraft clears it, a long span crosses it."""
+    from droneflight.perception import Trunk
+    from droneflight.tether import airborne_span_contacts
+
+    # East 30 m, then north 30 m; a trunk just inside the corner.
+    track = [(float(x), 0.0) for x in range(31)] + [(30.0, float(y)) for y in range(1, 31)]
+    trunks = (Trunk(28.0, 2.0, 0.3),)
+    assert airborne_span_contacts(track, trunks, 2.0).trunks == ()
+    long_span = airborne_span_contacts(track, trunks, 10.0)
+    assert long_span.trunks == (0,)
+    assert long_span.per_km > 0.0
+
+
+def test_free_fall_lag_scales_with_height_and_speed() -> None:
+    from droneflight.tether import free_fall_touchdown_lag_m
+
+    cfg = TetherConfig()
+    base = free_fall_touchdown_lag_m(9.0, 3.0, cfg)
+    assert 8.0 < base < 20.0  # ~1.9 m/s terminal fall -> ~14 m
+    assert free_fall_touchdown_lag_m(9.0, 1.5, cfg) == pytest.approx(base / 2)
+    assert free_fall_touchdown_lag_m(18.0, 3.0, cfg) == pytest.approx(base * 2)
+
+
+def test_a_free_falling_span_lowers_the_speed_ceiling() -> None:
+    """At 12 m AGL the free-fall span is ~40 m at 6 m/s — the default — and grows
+    with speed, so the ceiling sits well under the fixed-span one."""
+    from droneflight.tether import free_fall_span_m, speed_ceiling_ms
+
+    cfg = TetherConfig()
+    assert 35.0 < free_fall_span_m(12.0, 6.0, cfg) < 45.0
+    fixed = math.sqrt(
+        (cfg.break_tension_n - cfg.back_tension_n) / drag_tension_n(cfg, 1.0)
+    )  # fixed 40 m span, v^2 drag
+    ceiling = speed_ceiling_ms(12.0, cfg)
+    assert 6.0 < ceiling < fixed
+    assert speed_ceiling_ms(24.0, cfg) < ceiling  # higher = longer span = slower

@@ -179,7 +179,7 @@ def _tether_check(args: argparse.Namespace) -> int:
     closely with the prior on — acceptance §3 measured that null in flight.
     """
     from droneflight.speed_policy import SpeedPolicy
-    from droneflight.tether import TetherConfig, analyse_tether
+    from droneflight.tether import TetherConfig, analyse_tether, speed_ceiling_ms
 
     try:
         mission = load_qgc_plan(args.plan)
@@ -203,7 +203,7 @@ def _tether_check(args: argparse.Namespace) -> int:
         f"{config.back_tension_n:.1f} N, cruise {mission.cruise_speed_ms:.1f} m/s"
         f"{'' if prior else '  [PX4 corner prior OFF — uncalibrated]'}"
     )
-    for label, rep in (("no policy (flat cruise)", no_policy), ("speed policy", with_policy)):
+    for label, rep in (("no policy (plan speeds)", no_policy), ("speed policy", with_policy)):
         peak = rep.peak
         assert peak is not None  # a loaded mission always has >=1 waypoint
         verdict = (
@@ -225,6 +225,46 @@ def _tether_check(args: argparse.Namespace) -> int:
             "  → both arms survive: PX4 decelerates into corners on its own, so the "
             "policy is not what keeps the fiber intact here (acceptance §3, sim-logs/4.7)."
         )
+    if args.trajectory is not None:
+        # Per leg, at the leg's own height: over-canopy climbs fly cruise at 25-30 m
+        # AGL, where the free-falling span is longer and the ceiling lower than at
+        # the fixed --agl (2026-09-25: 5.6 m/s warn at 28 m vs a 6.0 m/s plan).
+        coords = json.loads(args.trajectory.read_text())["geometry"]["coordinates"]
+        if len(coords) != len(mission.waypoints):
+            print(
+                f"error: {args.trajectory} has {len(coords)} vertices, the plan "
+                f"{len(mission.waypoints)} — not the same route",
+                file=sys.stderr,
+            )
+            return 2
+        over_warn = over_break = 0
+        worst: tuple[float, int, float, float] | None = None
+        for i in range(len(coords) - 1):
+            agl = max(float(coords[i][2]), float(coords[i + 1][2]))
+            v = mission.leg_speed_ms(i)
+            w = speed_ceiling_ms(agl, config, config.warn_fraction)
+            b = speed_ceiling_ms(agl, config)
+            over_warn += int(v > w)
+            over_break += int(v > b)
+            margin = v / b
+            if worst is None or margin > worst[0]:
+                worst = (margin, i, agl, v)
+        assert worst is not None
+        print(
+            f"  per-leg ceiling at each leg's AGL: {over_warn} leg(s) above warn, "
+            f"{over_break} above break; tightest wp{worst[1]} at {worst[2]:.0f} m AGL, "
+            f"{worst[3]:.1f} m/s = {100 * worst[0]:.0f} % of the break speed"
+        )
+        if over_break:
+            return 1
+    fastest = max(mission.leg_speed_ms(i) for i in range(len(mission.waypoints)))
+    warn = speed_ceiling_ms(args.agl, config, config.warn_fraction)
+    snap = speed_ceiling_ms(args.agl, config)
+    print(
+        f"  straight-leg ceiling at {args.agl:.0f} m AGL if the span free-falls "
+        f"(drag ~v^3): warn {warn:.1f} m/s, break {snap:.1f} m/s — plan's fastest leg "
+        f"{fastest:.1f} m/s{'  ⚠️ ABOVE WARN' if fastest > warn else ''}"
+    )
     return 0 if with_policy.within_limit else 1
 
 
@@ -724,6 +764,7 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
         corridor_tolerance_m=args.corridor,
         timestamp_mode=args.timestamp,
         max_duration_s=args.duration,
+        publish_velocity=getattr(args, "publish_velocity", True),
     )
     try:
         with contextlib.ExitStack() as stack:
@@ -855,6 +896,8 @@ def read_groundtruth_track(
 
     NED -> ENU: east = y, north = x, up = -z.
     """
+    if not ulog_path.is_file():
+        raise OSError("no such file")
     from pyulog import ULog  # optional analysis dependency
 
     log = ULog(str(ulog_path), ["vehicle_local_position_groundtruth"])
@@ -888,6 +931,9 @@ def _b2_score(args: argparse.Namespace) -> int:
         t, east, north, up, ve, vn = read_groundtruth_track(args.ulog)
     except (OSError, ValueError, KeyError) as exc:
         print(f"ERROR: cannot read {args.ulog}: {exc}")
+        return 2
+    except ImportError:
+        print("ERROR: reading a ULog needs pyulog: pip install 'droneflight[analysis]'")
         return 2
 
     report = score_track(
@@ -992,6 +1038,104 @@ def _fly_corridor(args: argparse.Namespace) -> int:  # pragma: no cover - needs 
     return 0 if result.reached_goal else 1
 
 
+def _fly_local(args: argparse.Namespace) -> int:  # pragma: no cover - needs a live autopilot
+    """Fly a .plan offboard with the onboard local planner (2026-09-23 MVP)."""
+    from droneflight.ev_bridge import GazeboTruthSource, wait_for_truth_topic
+    from droneflight.local_offboard import LocalOffboardConfig, Pose, fly_local
+    from droneflight.local_planner import LocalPlannerConfig
+    from droneflight.mavsdk_offboard import MavsdkOffboardConnector
+    from droneflight.trunk_manifest import TrunkManifestError, load_trunk_manifest
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        mission = load_qgc_plan(args.plan)
+        manifest = load_trunk_manifest(args.trunks)
+    except (PlanLoadError, TrunkManifestError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    speeds = sorted({round(mission.leg_speed_ms(i), 2) for i in range(len(mission.waypoints))})
+    print(
+        f"plan: {len(mission.waypoints)} waypoints, leg speeds {speeds} m/s; "
+        f"forest: {len(manifest.trunks)} trunks from {args.trunks}"
+    )
+    overrides: dict[str, float] = {}
+    for item in args.planner_set or []:
+        key, _, value = item.partition("=")
+        if key not in LocalPlannerConfig.__dataclass_fields__ or not value:
+            print(
+                f"error: --planner-set {item!r}: not a LocalPlannerConfig field=value",
+                file=sys.stderr,
+            )
+            return 2
+        overrides[key] = float(value)
+    if overrides:
+        print(f"planner overrides: {overrides}")
+    config = LocalOffboardConfig(
+        planner=LocalPlannerConfig(cruise_speed_ms=max(speeds), **overrides),  # type: ignore[arg-type]
+        fov_deg=args.fov,
+        n_rays=int(args.fov) + 1,
+        sensor_range_m=args.sensor_range,
+        stall_timeout_s=args.stall_timeout,
+        max_speed_override_ms=args.max_speed,
+        escape_after_s=args.escape_after if args.escape_after > 0 else None,
+    )
+    obstacles = manifest.obstacle_field()
+    connector = MavsdkOffboardConnector(control_hz=args.control_hz)
+    latest: dict[str, Pose] = {}
+
+    async def pump_truth() -> None:
+        topic = await asyncio.to_thread(
+            wait_for_truth_topic, world=args.world, model=args.model, timeout_s=30.0
+        )
+        print(f"truth: {topic.topic} ({topic.kind})")
+        async for sample in GazeboTruthSource(topic).stream():
+            # t_s = SIMULATOR time: the planner must run on the vehicle's clock
+            # (Gazebo fell to 0.34x real time with 3125 trunks; see local_offboard).
+            latest["pose"] = Pose(
+                sample.east_m, sample.north_m, sample.up_m, sample.euler_enu()[2], t_s=sample.t_s
+            )
+
+    async def run() -> object:
+        truth_task = None
+        if args.truth == "gazebo":
+            truth_task = asyncio.create_task(pump_truth())
+            for _ in range(300):
+                if "pose" in latest or truth_task.done():
+                    break
+                await asyncio.sleep(0.1)
+            if "pose" not in latest:
+                if truth_task.done() and truth_task.exception() is not None:
+                    raise RuntimeError(f"truth source failed: {truth_task.exception()}")
+                raise RuntimeError("no ground truth from Gazebo after 30 s")
+        await connector.connect(args.url, ready_timeout_s=120.0)
+        await connector.arm()
+        await connector.takeoff(args.takeoff_alt)
+        try:
+            return await fly_local(
+                connector,
+                mission,
+                obstacles,
+                config,
+                truth=(lambda: latest.get("pose")) if truth_task is not None else None,
+                record=args.record,
+            )
+        finally:
+            await connector.stop_offboard()
+            if truth_task is not None:
+                # Await the cancellation so the gz subprocess is closed while the
+                # loop is still alive (else: "Event loop is closed" at exit).
+                truth_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await truth_task
+            await connector.disconnect()
+
+    result = asyncio.run(run())
+    print(result)
+    ok = getattr(result, "reached_goal", False) and getattr(result, "contacts", 1) == 0
+    print("VERDICT (oracle — confirm with b2-score):", "CLEAN" if ok else "NOT CLEAN")
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The full CLI grammar.
 
@@ -1033,6 +1177,13 @@ def build_parser() -> argparse.ArgumentParser:
         "tether-check", help="Validate the speed policy against the v0 payout-tension model."
     )
     t.add_argument("--plan", type=Path, required=True)
+    t.add_argument(
+        "--trajectory",
+        type=Path,
+        default=None,
+        help="droneplanner trajectory.geojson for the same route: check every leg's "
+        "straight-line ceiling at its own AGL (z), not at the fixed --agl.",
+    )
     t.add_argument("--break-tension", type=float, default=2.0, help="Fiber break tension (N).")
     t.add_argument("--back-tension", type=float, default=0.5, help="Spool back-tension (N).")
     t.add_argument("--min-speed", type=float, default=1.0, help="Speed-policy floor (m/s).")
@@ -1047,6 +1198,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Score at the commanded speed instead of PX4's measured corner speed. "
             "Reproduces pre-2026-07-26 numbers; over-predicts the flown corner load 7-18x."
         ),
+    )
+    t.add_argument(
+        "--agl",
+        type=float,
+        default=12.0,
+        help="Height the fiber falls from on open legs, for the speed ceiling (m).",
     )
     t.set_defaults(func=_tether_check)
 
@@ -1115,9 +1272,19 @@ def build_parser() -> argparse.ArgumentParser:
     eb.add_argument(
         "--fix-ramp",
         type=float,
-        default=10.0,
+        default=30.0,
         help="Metres over which an accepted fix is bled into the published pose "
-        "(0 = instant, which EKF2 rejects as an outlier).",
+        "(0 = instant, which EKF2 rejects as an outlier). 30 since 2026-09-24: at "
+        "10 m a 4-5 m fix moved the estimate at ~1.4 m/s, EKF2's velocity took up "
+        "part of it, and GPS-denied local-planner flights grazed trunks (s3b); "
+        "the same seeds at 30 m flew clean with the same nav error (s3c).",
+    )
+    eb.add_argument(
+        "--publish-velocity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also send the VIO velocity (VISION_SPEED_ESTIMATE); set EKF2_EV_CTRL 15 "
+        "to fuse it. Without it a VTRN fix drags EKF2's velocity estimate.",
     )
     eb.add_argument("--forest-frac", type=float, default=0.4)
     eb.add_argument("--stale-frac", type=float, default=0.1)
@@ -1209,6 +1376,57 @@ def build_parser() -> argparse.ArgumentParser:
         "The control arm for the in-loop speed-policy test (RUNBOOK §4.7).",
     )
     f.set_defaults(func=_fly)
+
+    fl = sub.add_parser(
+        "fly-local",
+        help="Fly a .plan offboard with the onboard LOCAL PLANNER (remembers trunks, plans "
+        "through gaps) — the 2026-09-23 replacement for fly-corridor's reactive layer.",
+    )
+    fl.add_argument("--plan", type=Path, required=True)
+    fl.add_argument(
+        "--trunks",
+        type=Path,
+        required=True,
+        help="The trunk manifest the Gazebo world was built from (oracle depth sensor).",
+    )
+    fl.add_argument("--url", default="udpin://0.0.0.0:14540")
+    fl.add_argument("--control-hz", type=float, default=10.0)
+    fl.add_argument("--sensor-range", type=float, default=30.0)
+    fl.add_argument("--fov", type=float, default=90.0)
+    fl.add_argument("--takeoff-alt", type=float, default=10.0)
+    fl.add_argument("--stall-timeout", type=float, default=90.0)
+    fl.add_argument(
+        "--max-speed", type=float, default=None, help="Cap every leg (m/s), below the plan."
+    )
+    fl.add_argument(
+        "--truth",
+        choices=("gazebo", "none"),
+        default="gazebo",
+        help="Where the oracle sensor's pose comes from. 'gazebo' (default) = simulator "
+        "truth, required GPS-denied: PX4's estimate is deliberately wrong there, and a "
+        "camera sees the real trees from the real aircraft. 'none' = PX4's estimate "
+        "(GPS-aided runs only). Must run on the sim host (needs `gz`).",
+    )
+    fl.add_argument("--world", default="forest_mvp")
+    fl.add_argument("--model", default="x500_0")
+    fl.add_argument(
+        "--record", type=Path, default=None, help="Per-step JSONL (truth, estimate, commands)."
+    )
+    fl.add_argument(
+        "--escape-after",
+        type=float,
+        default=20.0,
+        help="Seconds without route progress among trunks before an ESCAPE CLIMB over "
+        "them (0 = off; the stall abort still applies).",
+    )
+    fl.add_argument(
+        "--planner-set",
+        action="append",
+        metavar="FIELD=VALUE",
+        help="Override a numeric LocalPlannerConfig field for an A/B flight, e.g. "
+        "predict_velocity_error_ms=0.25 (repeatable).",
+    )
+    fl.set_defaults(func=_fly_local)
 
     fc = sub.add_parser(
         "fly-corridor",

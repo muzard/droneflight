@@ -17,6 +17,8 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `perception.py` | forward depth sensing (rays → nearest-trunk range; stereo or lidar slice) |
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter. 🔴 **FLOWN 2026-07-28 and it COLLIDES — 19 strikes at 50 stems/ha, 37 at 107.** `react_distance_m=6.0` gives 0.66 m of lateral offset against 1.10 m needed (0.60×) — geometrically cannot miss. The earlier "hovers at ≥100 stems/ha" limit was a *kinematic-harness artifact* and is wrong: in flight it blocks 0.17 % of steps and hits trees instead. See TEST-PLAN B2 |
 | `offboard.py` + `mavsdk_offboard.py` | **corridor executor** — carrot guidance (projection onto the polyline, so a detour cannot leave it chasing a passed vertex), avoidance in the loop, altitude commanded by us not interpolated by PX4 (what A2 says a corridor needs). Logs progress every 5 s and aborts after 90 s without route progress — a silent loop got killed by hand once, mistaken for a hang. `droneflight fly-corridor` |
+| `local_planner.py` | **the onboard local planner (2026-09-23)** — remembers every trunk the depth sensor returns (odometry frame), A* through the gaps with a clearance cost, speed from curvature/sight/gap/dynamic feasibility. Replaces reactive `avoid()`; **0 strikes GPS-denied in SITL**. See the section below |
+| `local_offboard.py` | the live executor for it — truth-pose sensing, believed-pose planning, home-relative altitude with a datum check, per-leg speed from the `.plan`. `droneflight fly-local` |
 | `maneuver.py` | **the reaction-distance budget** — how far ahead an obstacle must be seen for the airframe to actually miss it, from the flown speed and PX4's `MPC_ACC_HOR`/`MPC_JERK_AUTO` (jerk-limited, so *not* ½at²). `react_distance_m` is now **derived from this, not a constant**; also `required_rays`, the angular-sampling companion. Built after B2 flew the constant into 19–37 tree strikes |
 | `trunk_manifest.py` | loads the trunk CSV the Gazebo world was built from, so perception senses what physics will hit |
 | `strikes.py` | **did the flight hit anything?** Scores a flown track against its trunk manifest by *dynamic signature* (a >2 g transient at a trunk it is vertically level with), not by proximity. `droneflight b2-score`. Threshold calibrated against the tree-free B1 control, which never exceeds 0.50 g |
@@ -51,7 +53,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 271 tests, ~96% cov
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 337 tests
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -76,6 +78,419 @@ ruff check . && ruff format --check . && mypy --strict src && pytest -q # 271 te
   inject *confident-but-wrong* fixes — the innovation gate is the only defence,
   and it weakens as drift grows. `nav.py`'s idealised path is kept as the
   optimistic baseline for the A/B.
+
+## 🟢 ONBOARD LOCAL PLANNER (2026-09-23) — avoidance without a prior map
+`local_planner.py` (the planner), `reactive.fly_with_local_planner` (harness),
+`local_offboard.py` + `droneflight fly-local` (live). **Why:** the user ruled out
+lidar ("assume no lidar unless absolutely necessary"), which removes the prior
+stem map the 0-strike 2026-09-14 flight depended on, and reactive avoidance is
+dead in flight (N2). So the aircraft now does the stem routing itself: it
+**remembers** every trunk its depth sensor has returned, **plans** an A* path
+through the gaps with a clearance cost, and **replans** every 0.4 s.
+
+**Offline, same harness and manifests that gave reactive avoidance 27 strikes:**
+
+| case | strikes | min gap | mean speed |
+|---|---|---|---|
+| dense 107/ha, whole 5.2 km route, 6 m/s | **0** | +0.81 m | 5.9 m/s |
+| sparse 50/ha, 6 m/s | 0 | +1.31 m | 6.0 |
+| dense, 2 % drift **no fixes** (3 seeds) | 0 | ≥ +0.67 m | 5.8 |
+| random 200/ha — 3.0 / 6.0 m/s | 0 / 1 per 1.2 km | +0.92 m | — |
+| random 400/ha — 2.0 / 3.0 / 6.0 m/s | 0 / 0 (+0.05 m) / 2 | +0.55 m | — |
+| random 800/ha — 2, 3, 6 m/s | **stalls or strikes at all** | — | — |
+| **MVP route + MVP forest (200/ha)**, truth | **0** | +0.43 m | 4.8 (18.1 min) |
+| MVP, 2 % drift + VTRN fixes (4 seeds) | **0** | +0.06 … +0.96 m | 4.6 |
+| MVP, VTRN fixes bled in over 10 m like the bridge (4 seeds) | **0** | +0.31 … +0.59 m | 4.8 |
+
+That envelope is now the planner's speed model
+(`droneplanner/fields/stem_density.ONBOARD_PLANNING_ENVELOPE`).
+
+**Every limit in it exists because of a specific strike, and the order matters:**
+1. **Strict hard margin, relaxed only to escape.** A* forbids cells inside
+   0.35 m of air gap except within 1.5 m of the aircraft.
+2. **String-pull without giving back clearance.** The raw 8-connected path made the
+   commanded speed flicker 2.8↔6.0 m/s per replan; the airframe averaged "fast".
+3. **Brake FOR the turn** (`v² ≤ v_turn² + 2as`). The first rule let it reach a 45°
+   bend at cruise and swing into a known trunk at 4.7 m/s.
+4. **Commit to momentum** — replan from where 0.4 s of velocity carries it. A late
+   south→north side-switch 4.5 m from a trunk at 5.5 m/s was unflyable.
+5. **Dynamic feasibility** — each (path, speed) candidate is flown 2.5 s forward
+   under PX4's `MPC_ACC_HOR`/`MPC_JERK_AUTO`; slower or the previous path win if
+   the fresh one would pass too close. At 800/ha a 70° replan a metre from a trunk
+   hit it at 2 m/s **with the trunk mapped to 0.2 m** — a clear path is not a
+   followable one. This took 400/ha 11 → 2 strikes at 6 m/s.
+6. **Sight limit** — never faster than can stop before the path's swept width
+   leaves *observed* space. Occlusion made trunks appear too close to stop for.
+
+🔑 **GPS-denied property, and the correction trap.** Scans are swept from the TRUE
+pose and placed from the BELIEVED pose, so slow drift moves trunks and aircraft
+together — avoidance is immune to it (0 strikes with 100 m of unfixed drift). But
+a **VTRN fix** moves the aircraft in the believed frame without moving the
+remembered trunks, and the EV bridge bleeds a fix in over ~10 m, so no step looks
+like a jump. `observe()` therefore predicts each position from velocity and shifts
+the whole map by the unexplained part — memory lives in the continuous odometry
+frame, as a real VIO stack would hold it.
+
+**IN THE LOOP (PX4 SITL + Gazebo, forest_mvp 200/ha, RUNBOOK §4.14):**
+
+| flight | `b2-score` strikes | min air gap | time |
+|---|---|---|---|
+| GPS-aided | **0** | +0.54 m | 21.5 min |
+| **GPS-denied** (EV + VTRN, nav error up to **11.8 m**) | **0** | +0.33 m | 18.6 min |
+
+Harness predicted 0 strikes / +0.43 m / 18.1 min — the right answer this time, and
+the first time the harness has been confirmed in the loop for an avoidance layer.
+
+🐛 **Three defects the loop found that the harness could not:**
+1. **EV altitude datum** — `position_velocity_ned` z sat 124.6 m (home AMSL) below
+   truth under external vision. Now `relative_altitude_m`, plus a refuse-to-fly
+   check (>25 m disagreement at offboard start).
+2. **Clearing observed space on every correction** — bled-in VTRN fixes made every
+   step a correction; the sight limit then crawled at 0.8 m/s in open ground. The
+   grid now shifts by an accumulated offset.
+3. **The correction detector missed slow bleeds** — at a 0.05 m/step threshold a
+   fix under ~1.7 m was never detected. Threshold is now **0**: any displacement
+   velocity does not explain *is* an estimate correction. (Harness, 6 seeds at
+   400/ha GPS-denied: 0.05 → 2 grazes, 0 → 1; 200/ha 4/4 clean.)
+The harness now bleeds fixes in like the bridge (`fix_ramp_m`), which is what
+exposed 2 and 3 offline.
+
+🔴 **2026-09-24: the loop found four more defects, and the model behind them.**
+Chasing the envelope past 400/ha, then two GPS-denied SITL contacts:
+
+| # | found by | defect | fix |
+|---|---|---|---|
+| 4 | harness, 500-600/ha grazes | feasibility predicted from zero acceleration | (superseded by 6) |
+| 5 | harness, 800/ha: stationary 700 s | fixed 2.5 m pursuit chord cuts every bend by the same amount at any speed, so nothing was predicted clear and "stop" won forever | lookahead = 1.2 s of travel (0.8-2.5 m) + a creep candidate |
+| 6 | **SITL fix2**: contact, −0.17 m | the prediction model was PX4's AUTO-mode jerk generator; **offboard velocity setpoints bypass it** | measured response: **0.3 s dead time + 0.4 s lag** (`px4_profile.OFFBOARD_*`, fitted on 3225 SITL windows, 1 s position error 0.05 m mean / 0.18 p95; the jerk model 0.17 / 0.40). Predictor flies the setpoints already in flight; margin 0.15 → 0.30; harness plant = same model, drawn per seed from inside the fit |
+| 7 | **SITL fix3 + fix4**: contact at the SAME trunk | heading at a trunk at 2.9 m/s from 1.6 m when stopping takes ~2 m; replans kept going round it, then reversed | **momentum limit** `v ≤ (room along current velocity − margin) / (delay + lag)`; a moving candidate must also leave a clean stop after one replan |
+
+Replay of the SITL records (the planner stepped through the flown inputs)
+showed the **map was right every time** (trunk within 0.0-0.15 m) — the failures
+were all prediction/dynamics, the same class as [[px4-vs-offline-models]].
+Ruled out by measurement: telemetry staleness (est vs truth lag slope ≈ 0.00 s),
+the tether plugin (fix4 tether off, same spot), CPU starvation (fix4 on a quiet
+host). ⚠️ **The harness never reproduced 6 or 7** — 16/16 GPS-denied seeds clean
+before and after, even with 10.5 m nav error. SITL is the arbiter for this class.
+
+| SITL, GPS-denied, forest_mvp 200/ha | code | `b2-score` |
+|---|---|---|
+| denied3 (09-24 night) | pre-fixes | 0 strikes, +0.78 m |
+| fix2 | + accel seed + lookahead | **contact −0.17 m** (tether on) |
+| fix3 | + measured response model | **contact −0.23 m** (tether on) |
+| fix4 | same as fix3 | **2 contacts** (tether off, quiet host) |
+| **fix5** | + momentum limit + stop-after | **0 strikes, +0.676 m, 18.6 min** — +0.47 m at the fix3/4 trunk |
+| mvp2 | fix5 code, forest legs at the harness's **5.0 m/s** | **1 strike** (waypoint 71) |
+| mvp3 | + stopping distance with saturated braking | **1 strike** (waypoint 54) |
+
+**Then a seed sweep on the final stack** (`sim-logs/mvp_local/s*`, `q2f`; RUNBOOK
+§4.14): the EV noise is seeded, so each run is one draw. Two more stack changes
+came out of it — **fixes are bled over 30 m, not 10** (at 10 m a 4-5 m fix moved
+the estimate ~1.4 m/s and EKF2's velocity took part of it: same seeds 2/3 at 3 m/s
+grazed twice at 10 m, clean at 30 m with the same nav error), and the bridge now
+also publishes the **VIO velocity** (`EKF2_EV_CTRL 15`; measured no effect on the
+contacts, kept because it is what the sensor provides). Results, 200/ha GPS-denied:
+
+| speed | clean (seed set) | contact (seed set) |
+|---|---|---|
+| 4 m/s | 0/1 | 2/3 (at 10 m and at 30 m bleed) |
+| 3 m/s | 0/1, 2/3, 6/7 | **4/5, twice** |
+| **2 m/s** | **4/5 — +1.05 m of air** | — |
+| 400/ha, 2 m/s | 4/5, +0.34 m | — |
+
+Every struck trunk had been in the sensor's view from ~30 m, 6-12 s before
+contact, nearly dead ahead — not sensing. So the `fly-local` record now logs what
+the planner believed (path, feasibility candidates, memory within 5 m), and the
+next reproduction of seed set 4/5 (r3e) showed exactly what happened: **the path
+cleared the trunk by 0.9-1.4 m, the aircraft tracked it to 0.02 m, the map was
+right to 0.1 m — and the momentum limit braked 3 → 0.8 m/s mid-curve.** Braking
+and turning share `MPC_ACC_HOR`; the aircraft slid 0.72 m off its own path into
+the trunk, and every candidate on offer was slower. 🔧 **Steer, don't brake**:
+when every slower candidate fails, the feasibility check also tries the current
+speed along the path. Then, four seed sets per case:
+
+| after "steer, don't brake" | clean | contact |
+|---|---|---|
+| **200/ha, 3 m/s** | **4/4** (+0.63-0.87 m surface) | — |
+| 200/ha, 4 m/s | 4/5 | 0/1 |
+| 400/ha, 3 m/s | — | 4/5 (2) |
+
+**Planning anchors: 200/ha → 3.0 m/s, 400/ha → 2.0 m/s.** (400/ha at 2 m/s was
+flown clean on seed set 4/5 before this fix; its four-seed re-validation was cut
+short by host CPU contention — pending.)
+
+🔑 **The harness envelope is optimistic above ~2 m/s — SITL is the arbiter.** With
+all fixes the harness flies 200/ha at 5 m/s and 400/ha at 4 m/s clean over 4 seeds
+(`tools/envelope_sweep.py`); SITL hit a trunk at 5 m/s at 200/ha in both tries. At
+5 m/s PX4 shed speed at ~1.4 m/s² against the 3 demanded, and the aircraft curved
+onto a trunk that had sat just off its velocity ray. So the planner now prices on
+a **SITL-anchored** envelope (`droneplanner/fields/stem_density.py`): 200 → 3.0 and
+400 → 2.0 as flown over four seed sets, the rest discounted by the measured ratio. Raising an anchor
+takes a SITL flight, ~20 min each.
+
+Also fixed: the **EV bridge exited on one refused publish** (MAVSDK NO_SYSTEM
+after a heartbeat timeout under a starved VM, fix2) and left EKF2 with no aiding
+— the estimate ran 181 m off. It now counts and rides failures out.
+
+🔴 **2026-09-25: the estimate's VELOCITY is wrong GPS-denied — and slow flight smears the map.**
+Fitted against Gazebo truth on six `fly-local` records (`sim-logs/mvp_local`):
+
+* **Braking is not the dynamics.** With GPS the offboard model predicts braking with
+  ~0 bias (1166 windows); GPS-denied the aircraft ran **0.63 m further per second
+  of braking** than predicted. The estimated velocity is off by 0.15-0.31 m/s per
+  axis (1/e ≈ 3 s, p95 |e| 0.53-0.88) against ~0.1 GPS-aided — an error, not a lag
+  (best-fit lag 0.00 s). It is mostly **consistent**: it correlates 0.73-0.79 with
+  the rate the position estimate drifts, i.e. EKF position integrates it.
+* **Harness now models it** (`reactive.fly_with_local_planner(velocity_error=
+  nav.VelocityErrorConfig)`: planner sees true + e, plant tracks setpoint − e,
+  believed position integrates e). At 0.15 m/s it produces braking-type contacts
+  (400/ha at 3 m/s: 2/4 seeds) — **the first harness to reproduce a SITL contact
+  class** — and the smear stall below. It is somewhat pessimistic (grazes −0.01 m
+  on 200/ha at 3 m/s, which SITL flew 4/4 clean) — and in DENSE forest badly so:
+  **calibrated 2026-09-26 on Askola's ~1000/ha stand at 1.0 m/s, which SITL flew 4/4
+  clean: with σ 0.15 the harness blocks for 1928 s of 2000 and grazes 28 times;
+  without it, clean (+0.44 m).** So a velocity-error harness failure at ≥ 1000/ha
+  means nothing; use it for braking contacts at moderate density only.
+* **`predict_velocity_error_ms`** (opt-in, PR #3): margin grows with look-ahead
+  time. **Uncapped it stalled SITL 2/2** (v3e 400/ha 3 m/s, v4a 200/ha 4 m/s — 0
+  contacts, stopped 0.97 m from a trunk for good); growth now capped at 1 s, and
+  capped it **still stalled 1/2** (w3e, wp 83) with the other at +0.04 m (w3a).
+  **Decision: stays 0 (off).** It trades contacts for stalls, not for a clean
+  envelope.
+* **Memory smear — the measured-density stall.** Askola measured zone (~1000
+  stems/ha, 1.5 m median spacing, 0.5 m/s): **m3e, m3a and c3e all stopped for
+  good at waypoint 4**, 0 contacts, nearest real trunk 2.5 m away. Consistent drift
+  (1-3 cm/s) is never detected as a correction, and at 0.5 m/s the aircraft sits
+  among the same trunks for minutes — each trunk was laid down 1-3 m apart, memory
+  reached 2200-2700 points, every gap closed. **Fix: `clear_range_m`** — delete
+  remembered points the current scan sees through (in the cone, ≤ 8 m where a 1°
+  fan cannot miss a 0.16 m trunk, nearest ray and both neighbours past it by
+  0.3 m); occluded/out-of-cone points stay. **k3e (same plan, same seeds as m3e):
+  reached the goal, 0 strikes, +1.014 m, forest stretch at 0.49 m/s.** 21.4 min
+  armed against 17.5 planned — unexplained, the forest stretch itself was on pace.
+
+🧪 **B4 sensor ladder (`tools/sensor_ladder.py`, 2026-09-24) — the oracle is not
+load-bearing.** MVP forest, 200/ha, 3 m/s, GPS-denied, 2 seeds per rung: **0 strikes
+at every rung** — range noise 0.1/0.3/0.6 m at 10 m (growing with range), 30 % and
+60 % dropped returns, max range 15 m and 8 m, and a stereo-like combination (0.3 m
+@ 10 m, 30 % dropout, 15 m). The only failure: 0.6 m noise **stalled** one seed
+(noise smeared the map shut) — the safe direction. Untested: phantom returns and
+systematically missed trunks; and only at 200/ha / 3 m/s.
+⚠️ **400 stems/ha is MARGINAL GPS-denied** — 1 graze (−0.016 m) in 6 harness seeds,
+clean on truth. The 1500 m zone decision rests on 400/ha at 2.0 m/s.
+⚠️ **Still oracle** (`perception.sense`: perfect ranges, no noise/dropout, but real
+occlusion). ⚠️ 800/ha is outside the envelope, and the canopy-height model puts
+the demo AO's real stands at 520–1290/ha.
+
+## ⬆️ IN-FLIGHT ESCAPE CLIMB (2026-09-25) — flown in SITL, **4/4 clean**
+`fly-local --escape-after` (default 20 s): blocked among trunks, climb straight up
+to the tallest trunk top within 15 m + 3 m, hold 50 m of route, descend (sensing at
+the target height). Test world `askolam230w`: Askola's measured-zone forest + an
+**unmapped 90 m wall of trunks 1 m apart across the route at 150 m**
+(`droneplanner/tools/add_trunk_wall.py`), plan unchanged. Two defects found on the way:
+
+| run | defect | fix |
+|---|---|---|
+| x4e | **escaped 20 s after take-off at route 0** while flying normally — the trigger watched the vertex index, and a 25 m leg at 0.5 m/s shows no index progress for 50 s | trigger on along-route distance (`CarrotGuidance.along_m`, 1 m gain) |
+| x5e | escaped at the wall, then **stalled at height 90 s** (1130 failed plans) — memory still held every trunk mapped from below | drop the memory on reaching the escape height; anything that really reaches it is sensed afresh |
+| **x6e** | — | **reached the goal: 1 escape at route 5 (19.8 → 27.6 m), released at route 12, `b2-score` CLEAN +1.036 m, 0 samples inside a trunk** |
+
+**All four seed sets:** x6e +1.036, x6a +0.848, x6b +0.913, x6g +0.672 m (`b2-score`
+CLEAN, 0 samples inside a trunk), each with exactly 1 escape at route 5 (19.8 → 26-28 m)
+released at route 12, and each reaching the goal. (A first x6a at RTF 0.08 was voided.)
+**The offline harness now has altitude** (`reactive.fly_with_local_planner(vertical=
+LocalOffboardConfig())`) and runs the same `Escape` state machine as `fly_local`. It
+reproduces the walled-world escape offline (1 escape to 26.2 m, clean — SITL 26.2-27.6 m)
+and flies the over-canopy Askola plan clean on two seeds, in ~1.5 min instead of ~25.
+It found a third defect at once: the planner stops ~21 m short of a blockage it can see,
+so in the open in front of an impassable stand no trunk was within the 15 m escape
+radius and the escape never fired → **`escape_radius_m` 30 m** (the planner's report
+mirrors it). A 7 s unit test now pins "escape over a wall, reach the goal clean".
+⚠️ The escape height comes from the manifest's trunk tops (oracle); a real aircraft
+needs its own canopy-top sensing or the plan's over-canopy altitude. And the
+climb-through-crowns caveat applies: SITL trunks have no crowns.
+
+**The escape fires on its own in dense natural forest (2026-09-26).** No wall — just
+Poisson stands on the MVP route, GPS-denied, four seed sets each:
+
+| world | speed | `b2-score` | air (surface − 0.45 m) | escapes |
+|---|---|---|---|---|
+| `forest_mvp1200n` (1200/ha) | 1.0 m/s | 4/4 CLEAN | +0.33 / +0.50 / +0.48 / **+0.07** | **1 in 4** (h1g, route 52) |
+| `forest_mvp1500n` (1500/ha) | 0.5 m/s | **4/4 CLEAN** | +0.52 / +0.78 / +0.58 / +0.52 | **1 in 4** (h5e, route 40) |
+
+Each escape followed the local planner's speed cap going to 0 (no gap it could thread)
+and was cleared by the climb, 20 s later, with 0 contacts; h1g's thin +0.07 m was on the
+approach to that dead end, at 0.95 m/s and normal flight height. At ~1000/ha: 0 escapes
+in 4. So **passability, not speed, fails first past ~1000 stems/ha**, and one traverse
+in four there relies on the escape. Planner anchors unchanged (bar: >0.15 m air on
+every seed set) for 1.0 at 1200; 1500/ha at 0.5 is 4/4 (h5g re-flown after a run at RTF
+0.11 with the host loaded was voided) → planner 1200/ha anchor 0.4 → 0.5.
+
+**Why the dead ends? Not measurable from the old record (2026-09-26, PR #9).** In h1g every
+replan returned *no path* for 20 s. Replayed offline against the TRUE trunks shifted into
+the odometry frame — plus symmetric smear up to σ 0.5 m, plus a two-offset memory
+mimicking the 1.1 m of navigation drift in those 13 s, plus windows up to 25 m — the
+planner found a path every time. Remembered trunks near the aircraft sat 0.4-0.9 m from
+where they now were, but the record kept only the nearest few (memory holds sensor
+*surface returns*, ~6 per trunk — 1100-1500 points in every dense run, blocked or not). So `fly_local` now dumps the **whole memory and
+the corridor on the first step of each blockage** (`mem_dump`), and
+`tools/replay_blocked.py` re-runs `plan_local` on exactly that, plus the variants a fix
+would change (no corridor / wider window / merged memory).
+
+🔴 **And h5e was not a dead end at all.** It escaped with **0 blocked steps**: it had a
+path and was flying a 12.7 m detour at 0.5 m/s, and "20 s without route progress" is only
+10 m at that speed. **Genuine dead ends above 1000/ha: 1 in 8 traverses (h1g), not 1 in
+4 at both densities** — 1500/ha had none. Fixed: a stall only counts as stuck when the
+planner has **no path**; with one, the escape waits for `escape_detour_m` (30 m) of track
+without progress, and a backstop (3 × `escape_after_s`) still catches a planner that
+dithers. Unflown — the h1r re-fly queue is the test.
+
+## 🧵 TETHER ON OVER-CANOPY LEGS (2026-09-25)
+Flying over the canopy puts cruise legs at 25-35 m AGL (canopy + clearance), where
+the fiber's free-falling span is longer: the straight-leg ceiling is **warn 5.6 /
+break 8.2 m/s at 28 m** (7.5 / 10.9 at 12 m). `tether-check --trajectory
+<planner trajectory.geojson>` now scores every leg at its own AGL. Askola plans
+(600 m zone; measured zone with the over-canopy fallback): **2 legs above warn, 0
+above break** — 6.0 m/s at 32-33 m AGL = 77 % of the break speed, ~46 % of break
+tension (drag ~v³). Accepted; a planner speed cap at high AGL is the lever if bench
+data says otherwise. And where the fiber lands matters more than its tension there:
+over closed canopy it settles on the crowns (droneplanner `cable_on_crowns`).
+
+## 🧵 TETHER AT FULL SPEED AND UNDER THE CANOPY (2026-09-24)
+User: *"Now that full-speed flight is in use, remember to check and simulate the
+tether drag."* The 1500 m zone means 6 m/s over open ground and weaving flight
+among trunks — neither existed when the tether was last flown (§3, a synthetic
+turn course in mission mode).
+
+**1. `tether-check` now scores the plan's own speeds.** It scored every vertex at
+flat cruise and ignored the `.plan`'s `DO_CHANGE_SPEED`; now each vertex takes the
+faster of its two legs, and the plan speed caps the policy arm (as
+`executor.prepare_items` does). MVP plan: **0.78 N peak, 39 % of the 2 N break.**
+
+**2. Drag at full speed is not v² — it is closer to v³.** Paid-out fiber is at rest
+over the ground and falls broadside at ~1.9 m/s (250 µm, 0.069 g/m), so it touches
+down `height / 1.9 × speed` behind the aircraft: **the airborne span grows with
+speed**. At 12 m AGL and 6 m/s that is ~39 m — which is why the model's 40 m
+default is about right today — but it doubles at 12 m/s. `speed_ceiling_ms`:
+
+| fall height | warn (60 % of break) | break | span at 6 m/s |
+|---|---|---|---|
+| 5 m | 11.3 m/s | 14.6 | 16 m |
+| 12 m (open-ground cruise) | **8.4 m/s** | **10.9** | 39 m |
+| 25 m | 6.5 m/s | 8.5 | 82 m |
+
+**Today's 6 m/s is inside it. Do not raise open-ground cruise past ~8 m/s, or fly
+higher, without payout-bench data** — the fixed-span model would have said 14 m/s.
+⚠️ Free fall ignores back-tension (lengthens the span) and rotor downwash
+(shortens it); both un-benched.
+
+**3. Under the canopy the risk is contact, not tension.**
+`tether.airborne_span_contacts` / `tools/fiber_contact.py`: on a flown track, the
+straight span from touchdown to aircraft cuts the corners the aircraft flew round.
+On the three SITL forest flights (true tracks, flown manifests):
+
+| touchdown behind aircraft | 200/ha GPS | 200/ha GPS-denied | 400/ha GPS-denied |
+|---|---|---|---|
+| ≤ 5 m | **0** | **0** | **0** |
+| 10 m | 0 | 2.3 / km | 5.9 / km |
+| 20 m | 9.3 / km | 14.4 / km | 38.9 / km |
+| 40 m | 37 / km | 43 / km | 108 / km |
+
+Free fall from 9 m puts touchdown **7 m behind at 1.5 m/s, 14 m at 3 m/s** — right on
+the knee. 🔑 **This is a payout requirement: below the canopy the fiber must reach
+the ground within ~5 m of the aircraft**, or slow flight is what gets it there.
+Slower forest speeds help the fiber as well as the avoidance. Whether a contact
+snags, abrades or just slides is unmodelled.
+
+**4. FLOWN in the loop — tether ON, full MVP route, ✅ CLEAN** (`sim-logs/mvp_local/tether1_07_11_36.ulg`
++ `tether1.csv` + `tether1.jsonl`, RUNBOOK §4.14 flight 4). forest_mvp 200/ha,
+GPS-aided, `fly-local`, Gazebo tether plugin on (span 40 m). `b2-score`: **0
+strikes, 0 ground impacts, +1.28 m** min trunk-surface clearance; reached the goal
+in 18.2 min. Plugin parity vs `tether.py`: **EXACT**.
+
+| stretch | peak tension | mean | peak turn transient | max speed |
+|---|---|---|---|---|
+| forest, weaving at ≤3 m/s | 0.67 N | 0.57 N | **0.28 N** (p99 0.19) | 4.9 m/s |
+| open ground, full speed | **0.78 N (39 % of break)** | 0.76 N | 0.05 N | 6.1 m/s |
+
+**At full speed the load is drag on the open legs, not turns among the trunks** —
+offboard weaving produces turn transients about the size of §3's mission-mode
+corners (0.315 N). The 0.6 N drag disturbance did not affect avoidance. So the
+tether is within budget at today's speeds; what limits it is (2) the ceiling if
+cruise rises and (3) trunk contact under the canopy — neither of which the
+plugin models (fixed span, no trees).
+
+## ✅ STEM-MAP LOCALISATION BUILT (2026-09-15) — `stem_localizer.py`
+**The gap this closes.** The stem-routed plan flew **330/330 with 0 strikes** —
+but **GPS-aided** (`EKF2_GPS_CTRL=7`, `EKF2_EV_CTRL=0`, fix type 3 throughout),
+and this programme is GPS-denied. The margins make that decisive: the route was
+planned with **1.387 m** of clearance and flew with **0.708 m**, so PX4's own
+tracking consumed **0.679 m** with a near-perfect position estimate. Any
+navigation error lands on top. GPS-denied VTRN holds **11.8 m** on a good seed —
+**~17x too coarse**.
+
+So: match the trunks you can see against the trunks you expected, and the
+disagreement is your pose error. One instrument does routing *and* localisation,
+and it works exactly where optical VTRN starves (the conflict arm declined
+**76.5 %** of fixes for `no_features` — in the forest that is supposed to be
+hiding the aircraft).
+
+**Measured against a known offset (6.0, −4.0) m and 8° of yaw:**
+
+| condition | fixes accepted | mean error | max error | yaw error |
+|---|---|---|---|---|
+| pristine map | 12/12 | **0.034 m** | 0.062 m | 0.04° |
+| 40 % of mapped stems **felled** | 12/12 | 0.025 m | 0.039 m | 0.07° |
+| 60 % felled | 12/12 | 0.050 m | 0.109 m | 0.09° |
+| 80 % felled | **4/12** | 0.043 m | 0.067 m | 0.10° |
+| 100 % **unmapped** stems appear | 12/12 | 0.033 m | 0.067 m | 0.07° |
+| **200 %** unmapped (2/3 of what it sees is not on the map) | 12/12 | 0.032 m | 0.048 m | 0.04° |
+| 50 % felled + 100 % unmapped | 5/12 | 0.019 m | 0.026 m | 0.05° |
+| survey **0.5 m** position error | 11/12 | 0.220 m | 0.429 m | 0.37° |
+| survey **1.5 m** position error | 4/12 | 1.304 m | **1.907 m** | 1.58° |
+
+🟢 **0.03 m against VTRN's 11.8 m — roughly 350x better, and it degrades the right
+way.** Up to 60 % of the map being wrong costs nothing; past that it **declines**
+rather than guessing (80 % felled: 4/12 accepted, and the 4 it accepts are still
+good to 0.067 m). `tools/stem_localizer_sweep.py` reproduces the table.
+
+**Why RANSAC consensus and not least squares.** Per the user (2026-09-15) a
+government survey may *validate* stem mapping but **the drone cannot rely on one in
+flight, because the battlespace is modified and changes**. A large, unknown share
+of the map will be wrong in both directions — felled stems missing, unmapped ones
+present. Least-squares and nearest-neighbour fitting are dragged off by exactly
+that; consensus simply does not count it as evidence. Inter-stem *distance* seeds
+the hypotheses because it is invariant to the pose being solved for, which is what
+makes two correspondences enough.
+
+🔴 **The failure mode that matters, and it nearly shipped.** On a map with **1.5 m**
+of position error the matcher first accepted **11/12** fixes with a **20.8 m**
+maximum error — confidently, silently wrong, which is far worse than no fix (dead
+reckoning degrades predictably; a 20 m "fix" steers into a trunk). The defence is
+an **ambiguity test**: keep the best *rival* hypothesis as well as the best one and
+refuse when a materially different alignment explains nearly as much. That took it
+to 4/12 accepted at 1.9 m max.
+🔑 **And `distinct_m` must be several metres, not the match tolerance.** Set to
+1.0 m it compared the best solution against a *noisier copy of itself* — two seed
+pairs describing the same alignment do not agree exactly, since a 4 m baseline
+carrying 0.05 m of sensor noise fixes heading to only ~0.7°, which over a 25 m lever
+arm scatters the translation half a metre. Availability on a **pristine** map fell
+to 7/12 before that was corrected. The rival that matters is an alignment a whole
+stem away — metres.
+
+➡️ **Requirement this establishes: stem-map position accuracy must be ≲0.5 m.**
+At 0.5 m the fix still works (0.22 m mean) but eats a third of the 0.708 m flown
+clearance; at 1.5 m it is unusable *and only partly self-detecting*. The detector
+(`droneplanner/forest/stem_detect.py`) measures **0.017–0.029 m** on synthetic
+scans, so a UAV-lidar map qualifies and **ALS crown-centroid inference (1–2 m) does
+not** — it fails localisation as well as clearance.
+
+⚠️ **Not yet in the loop.** This is scored offline against synthetic stands. It has
+not been wired to `perception.py`, not run against detections from a real scan, and
+not flown — the GPS-denied stem-routed flight is the test it exists for. A regular
+plantation is the hard case (an alignment one row over fits almost as well) and is
+pinned by `test_a_regular_plantation_is_reported_as_AMBIGUOUS`, which asserts it
+**declines**.
 
 ## 🔴 The central finding is now PARTLY FALSIFIED IN THE LOOP (B2, 2026-07-28)
 **"Reactive avoidance reliably dodges obstacles" was measured in a kinematic

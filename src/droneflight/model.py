@@ -27,6 +27,23 @@ class Waypoint(BaseModel):
     alt_agl_m: float = Field(
         description="Altitude above the home/launch point (meters) — MAV_FRAME 3, not terrain AGL."
     )
+    speed_ms: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Planned ground speed for the leg LEAVING this waypoint, from the plan's "
+            "MAV_CMD_DO_CHANGE_SPEED items (MAVSDK's `speed_m_s` has the same "
+            "'after this item' meaning). None = the mission's cruise speed."
+        ),
+    )
+    corridor_half_width_m: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Lateral freedom the planner grants at this waypoint (its A1 concealment "
+            "corridor), from the plan's `droneplanner` block. None = not stated."
+        ),
+    )
 
 
 class FlightMission(BaseModel):
@@ -40,6 +57,14 @@ class FlightMission(BaseModel):
     home_alt_m: float = 0.0
     cruise_speed_ms: float = Field(gt=0)
     waypoints: tuple[Waypoint, ...]
+
+    def leg_speed_ms(self, index: int) -> float:
+        """Planned speed on the leg leaving waypoint ``index`` (cruise if unstated)."""
+        if 0 <= index < len(self.waypoints):
+            v = self.waypoints[index].speed_ms
+            if v is not None:
+                return v
+        return self.cruise_speed_ms
 
 
 class MissionItem(BaseModel):

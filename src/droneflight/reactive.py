@@ -34,16 +34,23 @@ collision cannot be compared against a flight that had 37.
 
 from __future__ import annotations
 
+import collections
 import itertools
 import math
 import random
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from droneflight.avoidance import AvoidanceCommand, AvoidanceConfig, avoid
+from droneflight.local_planner import LocalPlanner, LocalPlannerConfig, PlannerCommand
+
+if TYPE_CHECKING:
+    from droneflight.local_offboard import LocalOffboardConfig
 from droneflight.maneuver import ManeuverLimits
 from droneflight.model import FlightMission
-from droneflight.nav import DriftConfig, VtrnConfig
+from droneflight.nav import DriftConfig, VelocityErrorConfig, VtrnConfig
 from droneflight.perception import ObstacleField, sense
+from droneflight.px4_profile import OFFBOARD_DELAY_S, OFFBOARD_TAU_S
 
 _EARTH_R = 6_371_000.0
 
@@ -374,3 +381,475 @@ def _result(
         endpoint_offset_m=endpoint_offset,
         path=tuple(path),
     )
+
+
+@dataclass(frozen=True)
+class StrikeEvent:
+    """One contact, with what the planner knew about that trunk at the time."""
+
+    t_s: float
+    east_m: float
+    north_m: float
+    speed_ms: float
+    trunk_in_memory: bool
+    """Had the sensor ever returned a point on the struck trunk? False means it
+    was hit *unseen* (outside the FOV or occluded) — a sensing failure; True
+    means it was known and the path or the tracking failed to clear it."""
+
+    commanded_speed_ms: float
+    gap_ahead_m: float
+
+
+@dataclass(frozen=True)
+class LocalFlightResult:
+    """What a local-planner run did, scored against the TRUE trunks and route."""
+
+    reached_goal: bool
+    strikes: int
+    min_clearance_m: float
+    """Closest true airframe-to-trunk-surface gap over the flight."""
+
+    flight_time_s: float
+    path_length_m: float
+    max_cross_track_m: float
+    """Worst true distance from the planned route — corridor keeping."""
+
+    replans: int
+    plan_failures: int
+    blocked_s: float
+    memory_resets: int
+    max_nav_error_m: float
+    path: tuple[tuple[float, float], ...]
+    strike_log: tuple[StrikeEvent, ...] = ()
+    escapes: int = 0
+    """In-flight escape climbs flown (vertical mode only)."""
+
+    max_up_m: float = 0.0
+    """Highest altitude reached (vertical mode; plan frame, home-relative)."""
+
+    @property
+    def clean(self) -> bool:
+        return self.reached_goal and self.strikes == 0
+
+    @property
+    def mean_speed_ms(self) -> float:
+        return self.path_length_m / self.flight_time_s if self.flight_time_s > 0 else 0.0
+
+
+def _distance_to_route(p: tuple[float, float], route: list[tuple[float, float]]) -> float:
+    best = math.inf
+    for a, b in itertools.pairwise(route):
+        abx, aby = b[0] - a[0], b[1] - a[1]
+        denom = abx * abx + aby * aby
+        t = 0.0 if denom == 0.0 else ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / denom
+        t = max(0.0, min(1.0, t))
+        best = min(best, math.hypot(p[0] - a[0] - abx * t, p[1] - a[1] - aby * t))
+    return best
+
+
+def fly_with_local_planner(
+    mission: FlightMission,
+    obstacles: ObstacleField,
+    planner_config: LocalPlannerConfig | None = None,
+    config: ForestFlightConfig | None = None,
+    *,
+    drift: DriftConfig | None = None,
+    vtrn: VtrnConfig | None = None,
+    start_m: float = 0.0,
+    stop_m: float | None = None,
+    max_time_s: float = 7200.0,
+    fix_ramp_m: float = 0.0,
+    use_corridor: bool = True,
+    plant_seed: int | None = None,
+    control_hz: float = 10.0,
+    velocity_error: VelocityErrorConfig | None = None,
+    vertical: LocalOffboardConfig | None = None,
+) -> LocalFlightResult:
+    """Fly ``mission`` through ``obstacles`` with the onboard local planner.
+
+    Same dynamics and contact model as :func:`fly_through_forest` (velocity slewed
+    under PX4's accel/jerk limits; a contact is counted and slid along, not
+    aborted), so strike counts compare directly with the reactive numbers on
+    record. Differences, all deliberate:
+
+    * the sensor is swept from the **true** pose but its returns are placed in the
+      map from the **believed** pose — exactly what a real aircraft does, and the
+      property that should make this immune to slow navigation drift;
+    * progress is by projection onto the route (`offboard.CarrotGuidance`), the
+      same guidance the live offboard executor uses, not waypoint capture;
+    * ``start_m``/``stop_m`` fly only a slice of the route, because only the
+      concealed opening is in the forest;
+    * ``velocity_error`` makes the ESTIMATED velocity wrong (`nav.VelocityErrorConfig`):
+      the planner predicts from true + error, and the plant tracks setpoint - error,
+      because PX4 closes its velocity loop on the estimate — so the aircraft really
+      moves off the velocity it believes it has — and the believed position
+      integrates the same error. GPS-denied SITL has this; without
+      it the harness has no way to show a braking-in-a-curve contact;
+    * ``vertical`` (a ``local_offboard.LocalOffboardConfig``) adds ALTITUDE: the plan's
+      heights, a first-order climb/descent response, the executor's altitude window
+      (climb early, but a big climb out of the canopy only AT its vertex, in place),
+      sensing at min(current, target) height, height-aware contacts and the SAME
+      escape-climb state machine ``fly_local`` runs (``local_offboard.Escape``). The
+      2D harness could test none of the 2026-09-25 vertical behaviour offline;
+    * ``fix_ramp_m`` bleeds each VTRN fix in over that many metres of travel, as
+      the live EV bridge does (``ev-bridge --fix-ramp``, default 30 m since 2026-09-24). 0 = an
+      instantaneous jump — which is what hid the "clear observed space on every
+      correction" defect offline until SITL found it.
+    """
+    from droneflight.offboard import CarrotGuidance, RoutePoint
+
+    config = config or ForestFlightConfig()
+    planner = LocalPlanner(config=planner_config or LocalPlannerConfig())
+    pcfg = planner.config
+    lat0, lon0 = mission.home_lat, mission.home_lon
+    full = [_to_local(w.lat, w.lon, lat0, lon0) for w in mission.waypoints]
+    route = _slice_polyline(full, start_m, stop_m)
+    # The plan's per-leg speed (DO_CHANGE_SPEED), mapped onto the sliced route by
+    # arc length so start_m/stop_m slices keep the right speeds.
+    leg_speeds = _sliced_leg_speeds(full, route, mission)
+    alts = [0.0] * len(route)
+    if vertical is not None:
+        full_up = [w.alt_agl_m for w in mission.waypoints]
+
+        def nearest(p: tuple[float, float]) -> int:
+            return min(range(len(full)), key=lambda k: math.dist(full[k], p))
+
+        alts = [full_up[nearest(p)] for p in route]
+    guidance = CarrotGuidance(
+        route=[
+            RoutePoint(east_m=x, north_m=y, up_m=u) for (x, y), u in zip(route, alts, strict=True)
+        ],
+        lookahead_m=pcfg.horizon_m,
+    )
+    corridor = _sliced_corridor(full, route, mission) if use_corridor else None
+
+    pos = route[0]
+    heading = _heading_of(route[0], route[1])
+    fov = math.radians(config.fov_deg)
+    max_turn = math.radians(config.max_turn_rate_dps) * config.dt_s
+    rd = config.avoidance.drone_radius_m
+    dt = config.dt_s
+
+    rng = random.Random(drift.seed) if drift else None
+    drift_heading = rng.uniform(0.0, 2.0 * math.pi) if rng else 0.0
+    err_x = err_y = 0.0
+    dist_since_fix = 0.0
+    max_err = 0.0
+    pend_x = pend_y = 0.0
+    bleed_per_m = 0.0
+
+    path = [pos]
+    vel = (0.0, 0.0)
+    acc = (0.0, 0.0)
+    # The airframe's response. ``plant_seed`` draws it from inside the fit's
+    # uncertainty (px4_profile.OFFBOARD_*) so the planner's own prediction — which
+    # assumes the nominal values — is never exactly right, as in the loop. With a
+    # perfect match the harness could not show a prediction-error strike at all.
+    delay_s, tau_s = OFFBOARD_DELAY_S, OFFBOARD_TAU_S
+    if plant_seed is not None:
+        prng = random.Random(plant_seed)
+        delay_s, tau_s = prng.uniform(0.2, 0.4), prng.uniform(0.3, 0.55)
+    ve = velocity_error
+    vrng = random.Random(ve.seed) if ve else None
+    ve_x = ve_y = 0.0
+    ve_keep = math.exp(-dt / ve.tau_s) if ve else 1.0
+    ve_kick = (ve.sigma_ms * math.sqrt(1.0 - ve_keep * ve_keep)) if ve else 0.0
+    # Setpoints sent but not yet acted on; the aircraft starts at rest.
+    in_flight: collections.deque[tuple[float, float]] = collections.deque(
+        [(0.0, 0.0)] * max(0, round(delay_s / dt))
+    )
+    strikes = 0
+    min_gap = math.inf
+    max_xt = 0.0
+    blocked_s = 0.0
+    release_steps = max(1, int(config.contact_release_s / dt))
+    steps_clear = release_steps
+    reached = False
+    t = 0.0
+    goal = route[-1]
+    events: list[StrikeEvent] = []
+
+    # The live executor runs at ~10 Hz and holds each setpoint in between; at the
+    # harness's 20 Hz step the planner used to react twice as often as it can.
+    control_every = max(1, round(1.0 / (control_hz * dt))) if control_hz > 0 else 1
+    step_n = 0
+    cmd: PlannerCommand | None = None
+    # Vertical state (only used when ``vertical`` is given).
+    from droneflight.local_offboard import (
+        CLIMB_IN_PLACE_M,
+        Escape,
+        Pose,
+        route_arc_m,
+        window_altitude,
+    )
+
+    z = alts[0]
+    vz = 0.0
+    max_up = z
+    escape = Escape()
+    arc = route_arc_m(guidance.route)
+    fastest_leg = max(leg_speeds) if leg_speeds else 0.0
+
+    def under_canopy(i: int) -> bool:
+        return i >= 1 and leg_speeds[min(i - 1, len(leg_speeds) - 1)] < fastest_leg - 1e-6
+
+    target_up = z
+    sense_z: float | None = None
+    while t < max_time_s:
+        t += dt
+        if vrng is not None:
+            ve_x = ve_x * ve_keep + ve_kick * vrng.gauss(0.0, 1.0)
+            ve_y = ve_y * ve_keep + ve_kick * vrng.gauss(0.0, 1.0)
+        believed_vel = (vel[0] + ve_x, vel[1] + ve_y)
+        # The estimator integrates its own velocity: GPS-denied SITL, the velocity
+        # error correlates 0.73-0.79 with the rate the position estimate drifts
+        # off truth, so the believed frame moves WITH the error (as odometry drift
+        # does) — only a ~0.05-0.1 m/s residual is inconsistent. Leaving position
+        # untouched made the harness strike trunks SITL flew clean past.
+        err_x += ve_x * dt
+        err_y += ve_y * dt
+        est = (pos[0] + err_x, pos[1] + err_y)
+        carrot = guidance.advance(*est)
+        if cmd is None or step_n % control_every == 0:
+            if vertical is not None:
+                target_up = window_altitude(guidance.route, guidance, under_canopy)
+                if escape.up_m is not None:
+                    target_up = max(target_up, escape.up_m)
+                sense_z = min(z, target_up)
+                here = Pose(est[0], est[1], z, heading)
+                _logs, _started = escape.update(
+                    t_s=t,
+                    along_m=guidance.along_m(arc),
+                    index=guidance.index,
+                    arc_m=arc,
+                    believed=here,
+                    truth=Pose(pos[0], pos[1], z, heading),
+                    obstacles=obstacles,
+                    planner=planner,
+                    config=vertical,
+                )
+            if vertical is not None:
+                scan = sense(
+                    obstacles,
+                    pos[0],
+                    pos[1],
+                    heading,
+                    fov,
+                    config.n_rays,
+                    config.sensor_range_m,
+                    z=sense_z,
+                )
+            else:  # 2D call: tools/sensor_ladder.py swaps in a 2D-signature sense()
+                scan = sense(
+                    obstacles, pos[0], pos[1], heading, fov, config.n_rays, config.sensor_range_m
+                )
+            added = planner.observe(scan, est[0], est[1], heading, velocity=believed_vel, t_s=t)
+            cmd = planner.command(
+                est[0],
+                est[1],
+                (carrot.east_m, carrot.north_m),
+                t,
+                added,
+                velocity=believed_vel,
+                max_speed_ms=leg_speeds[min(guidance.index, len(leg_speeds) - 1)],
+                corridor=corridor,
+            )
+        step_n += 1
+        if cmd.blocked:
+            blocked_s += dt
+            want = (0.0, 0.0)
+            # Hovering: turn toward the goal to look for a way through.
+            desired = math.atan2(carrot.north_m - est[1], carrot.east_m - est[0])
+        else:
+            want = (cmd.vx, cmd.vy)
+            desired = math.atan2(cmd.vy, cmd.vx)
+        if vertical is not None:
+            # Same rule as local_offboard.local_step: an escape, or a big climb out of
+            # the canopy, is flown in place before moving on.
+            escaping = escape.up_m is not None and z < target_up - 1.0
+            big_climb = target_up - z > CLIMB_IN_PLACE_M and under_canopy(guidance.index + 1)
+            if escaping or big_climb:
+                want = (0.0, 0.0)
+            vz_cmd = max(
+                -vertical.max_descent_ms,
+                min(vertical.max_climb_ms, (target_up - z) * vertical.climb_gain),
+            )
+            vz += (vz_cmd - vz) / tau_s * dt
+            z += vz * dt
+            max_up = max(max_up, z)
+        # The sensor looks where the aircraft is going (yaw follows the command).
+        heading = _wrap(heading + max(-max_turn, min(max_turn, _wrap(desired - heading))))
+
+        # The measured OFFBOARD response (px4_profile): the setpoint takes effect
+        # after a dead time, then through a first-order lag. Not the AUTO-mode
+        # jerk-limited generator `fly_through_forest` uses — offboard velocity
+        # setpoints bypass it, and that model mispredicted SITL 1 s ahead by 0.4 m.
+        in_flight.append(want)
+        applied = in_flight.popleft()
+        # PX4 drives its ESTIMATE to the setpoint, so truth settles at setpoint - error.
+        acc = _clamp_norm(
+            ((applied[0] - ve_x - vel[0]) / tau_s, (applied[1] - ve_y - vel[1]) / tau_s),
+            config.limits.max_accel_ms2,
+        )
+        vel = (vel[0] + acc[0] * dt, vel[1] + acc[1] * dt)
+        prev = pos
+        pos = (pos[0] + vel[0] * dt, pos[1] + vel[1] * dt)
+        moved = math.hypot(pos[0] - prev[0], pos[1] - prev[1])
+        path.append(pos)
+
+        if drift and rng and moved > 0.0:
+            drift_heading += rng.gauss(0.0, math.radians(drift.wander_deg_per_100m) * moved / 100.0)
+            err_x += drift.rate * moved * math.cos(drift_heading)
+            err_y += drift.rate * moved * math.sin(drift_heading)
+            dist_since_fix += moved
+            if vtrn and dist_since_fix >= vtrn.fix_interval_m:
+                mag = math.hypot(err_x, err_y)
+                if mag > vtrn.residual_error_m:
+                    scale = vtrn.residual_error_m / mag
+                    if fix_ramp_m > 0.0:
+                        pend_x, pend_y = err_x * (scale - 1.0), err_y * (scale - 1.0)
+                        bleed_per_m = math.hypot(pend_x, pend_y) / fix_ramp_m
+                    else:
+                        err_x *= scale
+                        err_y *= scale
+                dist_since_fix = 0.0
+            pend = math.hypot(pend_x, pend_y)
+            if pend > 0.0:
+                step = min(pend, bleed_per_m * moved)
+                err_x += pend_x / pend * step
+                err_y += pend_y / pend * step
+                pend_x -= pend_x / pend * step
+                pend_y -= pend_y / pend * step
+            max_err = max(max_err, math.hypot(err_x, err_y))
+
+        gap = obstacles.clearance(pos[0], pos[1], z if vertical is not None else None) - rd
+        min_gap = min(min_gap, gap)
+        if gap < 0.0:
+            if steps_clear >= release_steps:
+                strikes += 1
+                events.append(
+                    _strike_event(
+                        t, pos, vel, obstacles, planner, (err_x, err_y), cmd.speed_ms, cmd
+                    )
+                )
+            steps_clear = 0
+            nx, ny = _surface_normal(obstacles, pos)
+            pos = (pos[0] + nx * (-gap + _CONTACT_EPS_M), pos[1] + ny * (-gap + _CONTACT_EPS_M))
+            path[-1] = pos
+            into = vel[0] * nx + vel[1] * ny
+            if into < 0.0:
+                vel = (vel[0] - into * nx, vel[1] - into * ny)
+            into_a = acc[0] * nx + acc[1] * ny
+            if into_a < 0.0:
+                acc = (acc[0] - into_a * nx, acc[1] - into_a * ny)
+        else:
+            steps_clear += 1
+
+        if int(t / dt) % 20 == 0:
+            max_xt = max(max_xt, _distance_to_route(pos, route))
+        if guidance.finished and math.dist(est, goal) <= config.capture_radius_m:
+            reached = True
+            break
+
+    length = sum(math.dist(a, b) for a, b in itertools.pairwise(path))
+    return LocalFlightResult(
+        reached_goal=reached,
+        strikes=strikes,
+        min_clearance_m=min_gap,
+        flight_time_s=t,
+        path_length_m=length,
+        max_cross_track_m=max_xt,
+        replans=planner.replans,
+        plan_failures=planner.failures,
+        blocked_s=blocked_s,
+        memory_resets=planner.memory_resets,
+        max_nav_error_m=max_err,
+        path=tuple(path),
+        strike_log=tuple(events),
+        escapes=escape.count,
+        max_up_m=max_up,
+    )
+
+
+def _strike_event(
+    t: float,
+    pos: tuple[float, float],
+    vel: tuple[float, float],
+    obstacles: ObstacleField,
+    planner: LocalPlanner,
+    err: tuple[float, float],
+    commanded: float,
+    cmd: PlannerCommand,
+) -> StrikeEvent:
+    near = min(
+        obstacles._nearby(pos[0], pos[1], 2.0) or obstacles.trunks,
+        key=lambda tr: math.hypot(tr.x - pos[0], tr.y - pos[1]),
+    )
+    # Memory is in the believed frame: shift the true trunk by the nav error.
+    cx, cy = near.x + err[0], near.y + err[1]
+    seen = any(
+        math.hypot(px - cx, py - cy) < near.radius + 0.35 for px, py in planner.memory.points()
+    )
+    return StrikeEvent(
+        t_s=t,
+        east_m=pos[0],
+        north_m=pos[1],
+        speed_ms=math.hypot(*vel),
+        trunk_in_memory=seen,
+        commanded_speed_ms=commanded,
+        gap_ahead_m=cmd.min_gap_ahead_m,
+    )
+
+
+def _sliced_leg_speeds(
+    full: list[tuple[float, float]], route: list[tuple[float, float]], mission: FlightMission
+) -> list[float]:
+    """Planned speed for each leg of ``route`` (a slice of ``full``).
+
+    A slice keeps the original vertices between its cut points, so each sliced
+    vertex (the cut points included) takes the leg speed of the nearest original
+    vertex — exact for interior vertices, and the containing leg's at the cuts
+    whenever the cut is nearer its start than its end.
+    """
+    out = []
+    for p in route[:-1]:
+        k = min(range(len(full)), key=lambda i: math.dist(full[i], p))
+        out.append(mission.leg_speed_ms(k))
+    return out or [mission.cruise_speed_ms]
+
+
+def _sliced_corridor(
+    full: list[tuple[float, float]], route: list[tuple[float, float]], mission: FlightMission
+) -> list[tuple[tuple[float, float], float]] | None:
+    """The plan's corridor widths on the sliced route (nearest original vertex)."""
+    widths = [w.corridor_half_width_m for w in mission.waypoints]
+    if any(w is None for w in widths):
+        return None
+    out = []
+    for p in route:
+        k = min(range(len(full)), key=lambda i: math.dist(full[i], p))
+        out.append((p, float(widths[k] or 0.0)))
+    return out
+
+
+def _heading_of(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.atan2(b[1] - a[1], b[0] - a[0])
+
+
+def _slice_polyline(
+    pts: list[tuple[float, float]], start_m: float, stop_m: float | None
+) -> list[tuple[float, float]]:
+    """The part of a polyline between two arc lengths (interpolated at the cuts)."""
+    cum = [0.0]
+    for a, b in itertools.pairwise(pts):
+        cum.append(cum[-1] + math.dist(a, b))
+    stop = cum[-1] if stop_m is None else min(stop_m, cum[-1])
+    start = max(0.0, min(start_m, stop))
+
+    def at(s: float) -> tuple[float, float]:
+        x, y, _, _ = _point_tangent(pts, cum, s)
+        return x, y
+
+    inner = [p for p, c in zip(pts, cum, strict=True) if start < c < stop]
+    out = [at(start), *inner, at(stop)]
+    return out if len(out) >= 2 else [pts[0], pts[-1]]
