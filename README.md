@@ -2,14 +2,27 @@
 
 Online **flight stack** for the autonomous fiber-laying drone — the subsystem
 that *executes* the offline planner's route on a PX4 autopilot. It consumes the
-`droneplanner` `.plan` (the integration boundary), applies a **tether-safe speed
+[`droneplanner`](https://github.com/muzard/droneplanner) `.plan` (the integration boundary), applies a **tether-safe speed
 policy** and a **covert sensor-mode policy**, and drives PX4 over MAVLink/MAVSDK
 for GPS-denied, low-altitude flight.
 
-This is the hardware-dependent subsystem from `../Technology-Selection.md` §3–4.
+This is the hardware-dependent subsystem from the program's (unpublished) technology-selection design note, §3–4.
 Live runs target **PX4 SITL + Gazebo Harmonic** (see [RUNBOOK.md](RUNBOOK.md));
 the orchestration/policy logic is unit-tested against a fake autopilot so it is
 verifiable without hardware.
+
+## Results (simulation)
+
+- **The MVP mission, flown GPS-denied** (RUNBOOK §4.14, 2026-09-24). The route is [droneplanner](https://github.com/muzard/droneplanner)'s 1500 m concealment route through a 200 stems/ha Gazebo forest. The aircraft used the onboard local planner with no prior stem map. Result: **0 tree strikes, 0 ground impacts, 18.6 min**, with injected navigation error up to 11.8 m.
+- **At the edge of the envelope, 400 stems/ha** (a forest-only cut of the first 1.76 km, GPS-denied): 0 strikes, 12.7 min.
+- **External-vision GPS-denied navigation into PX4 EKF2:** the 3-arm acceptance test passed on 2026-07-22.
+
+**Limits:**
+- Obstacle depth sensing is an oracle fed from the world's trunk positions.
+- GPS-denied navigation is Gazebo ground truth plus injected VIO-style error, not a real estimator.
+- The forests are synthetic.
+- Real onboard perception is not built yet.
+- Each flight is a single noise draw (RUNBOOK §4.14), and the 400 stems/ha case is marginal: the offline harness grazed a trunk in 1 of 6 GPS-denied seeds.
 
 ## Status — F1 (bridge + policies + perception/avoidance + nav emulation)
 
@@ -83,7 +96,7 @@ tool. Fidelity comes later from PX4 SITL + Gazebo (RUNBOOK).
 ## Bounding drift from optical data — and where it can't (`correction.py`)
 
 Bounded navigation above means **VTRN**: matching the downward camera to a
-pre-loaded georeferenced basemap to reset drift (Technology-Selection §2.1 — "the
+pre-loaded georeferenced basemap to reset drift (the unpublished technology-selection note, §2.1 — "the
 single most important architectural decision in the whole system"). `nav.py`
 originally modelled that as an *idealised reset* — every 500 m, error teleports
 back to ~2 m. `correction.py` replaces that with a **data-driven** corrector: it
