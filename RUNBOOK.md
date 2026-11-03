@@ -293,7 +293,7 @@ Two things that save real pain:
 - **Run PX4 inside `tmux`** (`sudo apt install tmux`) so a dropped SSH session
   doesn't kill the sim mid-flight. Two panes: `run_sitl.sh` in one, `fly` in the other.
 - **Mount the droneflight folder from the Mac** (UTM/Parallels shared folder, or
-  `multipass mount ~/Claude/Projects/DroneAutomation/droneflight px4:/home/ubuntu/droneflight`)
+  `multipass mount <droneflight> px4:/home/ubuntu/droneflight`)
   and create the venv **inside the guest filesystem**, pointing at the mount:
 
   ```bash
@@ -1395,7 +1395,7 @@ The tell is `b2-score`'s `min AGL (from trunk bases)`: it read **30.15 / 29.85 /
 **Check that number first on every arm.** Re-`scp` the plan before flying:
 
 ```bash
-scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/out_demo/mission.plan <vm>:~/drone/plans/canopy.plan
+scp <droneplanner>/out_demo/mission.plan <vm>:~/drone/plans/canopy.plan
 ```
 
 ```bash
@@ -1506,19 +1506,19 @@ not a single point.
   where the DEM will live *on the VM*, so it stays a VM path.)
 
 ```bash
-cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && . ../.venv/bin/activate && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
+cd <droneplanner> && . ../.venv/bin/activate && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
 ```
 
 Sparse arm — the density the layer *should* handle:
 
 ```bash
-droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 50 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_sparse_dem.tif --out worlds/forest_sparse.sdf
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 50 --dem-path <vm-home>/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_sparse_dem.tif --out worlds/forest_sparse.sdf
 ```
 
 Dense arm — the density it should *fail* at:
 
 ```bash
-droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 400 --max-stems 2500 --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_dense_dem.tif --out worlds/forest_dense.sdf
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --stems-per-ha 400 --max-stems 2500 --dem-path <vm-home>/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_dense_dem.tif --out worlds/forest_dense.sdf
 ```
 
 Record the reported `stems/ha` and `median nearest-neighbour` for each — those,
@@ -1536,11 +1536,11 @@ not the flag, are what was flown.
   where the DEM will live *on the VM*, so it stays a VM path.)
 
 ```bash
-cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && . ../.venv/bin/activate && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
+cd <droneplanner> && . ../.venv/bin/activate && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
 ```
 
 ```bash
-droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_forest_dem.tif --out worlds/planner_forest.sdf
+droneplanner gz-world --dtm demo_ao/dtm.tif --plan out_demo/mission.plan --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif --dem-path <vm-home>/drone/PX4-Autopilot/Tools/simulation/gz/worlds/planner_forest_dem.tif --out worlds/planner_forest.sdf
 ```
 
 Read the reported line before going further — it is the experiment's dose:
@@ -1553,11 +1553,11 @@ can succeed — that is a legitimate experiment, but say which one you ran.
 #### 2 — ship the worlds, DEMs and manifests to the VM
 
 ```bash
-scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/forest_*.sdf /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/forest_*_dem.tif arttudrone@192.168.132.129:~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
+scp <droneplanner>/worlds/forest_*.sdf <droneplanner>/worlds/forest_*_dem.tif arttudrone@192.168.132.129:~/drone/PX4-Autopilot/Tools/simulation/gz/worlds/
 ```
 
 ```bash
-scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/worlds/forest_*_trunks.csv arttudrone@192.168.132.129:~/drone/plans/
+scp <droneplanner>/worlds/forest_*_trunks.csv arttudrone@192.168.132.129:~/drone/plans/
 ```
 
 Sync the code — `offboard.py`, `mavsdk_offboard.py` and `trunk_manifest.py` are
@@ -1671,7 +1671,7 @@ droneplanner plan --mission demo_ao/mission_mvp.yaml --out out/mvp
 droneplanner gz-world --dtm demo_ao/dtm.tif --plan out/mvp/mission.plan \
   --base-world ../sim-logs/default.sdf --forest-dsm demo_ao/dsm.tif \
   --stems-per-ha 200 --forest-radius 1500 \
-  --dem-path /home/arttudrone/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_mvp_dem.tif \
+  --dem-path <vm-home>/drone/PX4-Autopilot/Tools/simulation/gz/worlds/forest_mvp_dem.tif \
   --out worlds/forest_mvp.sdf
 rsync -a --delete --exclude __pycache__ ../droneflight/src/ <vm>:droneflight-dev/src/
 scp worlds/forest_mvp.sdf worlds/forest_mvp_dem.tif <vm>:drone/PX4-Autopilot/Tools/simulation/gz/worlds/
@@ -2112,11 +2112,11 @@ The CFIT model and `arrival.py` both depend on the answer.
 **1 — sync and stage the plan** (the `.plan` is gitignored; `scp` it):
 
 ```bash
-cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
+cd <droneplanner> && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
 ```
 
 ```bash
-scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/out_demo/mission.plan <vm>:~/drone/plans/canopy.plan
+scp <droneplanner>/out_demo/mission.plan <vm>:~/drone/plans/canopy.plan
 ```
 
 On the VM, `git pull` **both** repos (new: `droneflight/src/droneflight/arrival.py`,
@@ -2258,7 +2258,7 @@ different phenomenon; conflating them nearly produced a spurious result here.
 the `.plan` does not ride git):
 
 ```bash
-cd /Users/arttu/Claude/Projects/DroneAutomation/droneplanner && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
+cd <droneplanner> && droneplanner plan --mission demo_ao/mission.yaml --out out_demo/
 ```
 
 Confirm before copying — `report.json` must show `clearance_violations: 0` and
@@ -2269,7 +2269,7 @@ safe legs; do not fly it (see the v1 failure above).
 **2 — copy it over:**
 
 ```bash
-scp /Users/arttu/Claude/Projects/DroneAutomation/droneplanner/out_demo/mission.plan <vm>:~/drone/plans/terrain_fixed.plan
+scp <droneplanner>/out_demo/mission.plan <vm>:~/drone/plans/terrain_fixed.plan
 ```
 
 **3 — check the world is the FIXED one before you fly it** (§1.6: the stale
@@ -2454,7 +2454,7 @@ tmux list-panes -a                                            # find the id, e.g
 tmux capture-pane -t px4:0.0 -p -S -5000 > ~/logs/px4-console.log
 
 # on the Mac — DroneAutomation/sim-logs/ sits outside both git repos
-DROP=/Users/arttu/Claude/Projects/DroneAutomation/sim-logs
+DROP=<workspace>/sim-logs
 scp <vm>:'~/logs/*.log' $DROP/
 scp <vm>:'~/drone/PX4-Autopilot/build/px4_sitl_default/rootfs/log/<date>/*.ulg' $DROP/
 ```
