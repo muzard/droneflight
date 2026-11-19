@@ -1,0 +1,49 @@
+# PX4 EKF2 parameters for GNSS-AS-AN-UNTRUSTED-INPUT runs (RUNBOOK §3g).
+# Format: <vehicle_id> <component_id> <name> <value> <type>  (type 6 = int32, 9 = float)
+#
+# Apply ON TOP OF gps_denied_ekf2.params + sitl_bringup.params, last, so these win:
+#     droneflight px4-params --file configs/px4/gps_denied_ekf2.params \
+#                            --file configs/px4/sitl_bringup.params \
+#                            --file configs/px4/gnss_gated_ekf2.params
+# and paste the `param set` lines into pxh, then `reboot`.
+#
+# Pairs with `droneflight ev-bridge --no-vtrn --gnss gated|ungated`: the bridge
+# publishes external vision (VIO, no map fixes) AND a synthetic GNSS receiver as
+# MAVLink GPS_INPUT, the latter only while its VIO-consistency monitor trusts it.
+# ⚠️ Every value below was chosen from documentation, not yet flown. The things
+# most likely to need changing on the first run are marked UNVERIFIED.
+
+# --- Only OUR receiver ---------------------------------------------------------
+# Gazebo SITL simulates its own GNSS (the sensor_gps_sim module). It is honest and
+# would be blended with the bridge's, so the spoofer could never win. 0 = off.
+# UNVERIFIED: the name is PX4 v1.14+'s; `param show SENS_EN_GPSSIM` must exist.
+# If it does not, check `listener sensor_gps` shows ONE device (the GPS_INPUT one).
+1	1	SENS_EN_GPSSIM	0	6
+
+# --- Fuse GNSS: horizontal position (1) + 3D velocity (4) = 5 -------------------
+# Not altitude (2): height stays on vision (EKF2_HGT_REF 3), as in every EV arm.
+# The bridge's spoofer is Doppler-consistent, so velocity fusion is no defence.
+1	1	EKF2_GPS_CTRL	5	6
+
+# --- Pre-flight GNSS quality checks --------------------------------------------
+# Default 245 also runs the horizontal/vertical drift and horizontal speed checks
+# (bits 5, 6, 7). The bridge's noise is WHITE at 1.5 m per 0.2 s sample, which a
+# parked vehicle reads as metres per second of "drift" — a real receiver's error
+# is time-correlated and passes. Keep satellites (1), EPH (4), speed accuracy (16):
+# 1 + 4 + 16 = 21. For bring-up you can also run the bridge with --gnss-sigma 0.5.
+1	1	EKF2_GPS_CHECK	21	6
+
+# --- Measurement model -----------------------------------------------------------
+# GPS_INPUT is stamped on receipt and the bridge adds no latency; the default
+# 110 ms delay would fuse every fix 0.11 s in the past (0.7 m at 6 m/s).
+1	1	EKF2_GPS_DELAY	0	9
+# Observation noise to match the bridge's per-axis sigma (default 0.5 m).
+1	1	EKF2_GPS_P_NOISE	1.5	9
+
+# --- Vision stays on ---------------------------------------------------------------
+# Position + velocity + yaw. With GNSS active, EKF2's ev_pos control is meant to
+# fuse EV position against an estimated EV bias (so VIO drift is absorbed, not
+# fought). UNVERIFIED in this stack: watch `estimator_ev_pos_bias` (or its
+# equivalent in your build) and `estimator_aid_src_ev_pos` innovations — see
+# RUNBOOK §3g "What to watch".
+1	1	EKF2_EV_CTRL	15	6

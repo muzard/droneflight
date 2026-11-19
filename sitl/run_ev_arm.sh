@@ -25,11 +25,19 @@
 #                          the position-loss FAILSAFE, which is the untested path)
 #           yaw          + 1.0 deg/100 m heading drift (~7.7 deg by the end)
 #
+#   GNSS-gate arms (RUNBOOK §3g, unflown — VIO without map fixes + a synthetic
+#   GNSS receiver fed to EKF2 as GPS_INPUT; needs gnss_gated_ekf2.params). Their
+#   control is the flown `novtrn` arm (103 m):
+#     arm = gnss-honest   honest GNSS through the gate
+#           gnss-fast     0.5 m/m carry-off from 1 km, gated   (caught in ~35 m)
+#           gnss-gap      0.03 m/m carry-off from 1 km, gated  (never caught)
+#           gnss-open     0.1 m/m carry-off from 1 km, UNGATED (EKF2 follows it)
+#
 # Then, in another pane, once this prints `est-pub` lines:
 #   droneflight fly --plan <mission.plan> --url udpin://0.0.0.0:14540
 set -euo pipefail
 
-USAGE="usage: run_ev_arm.sh <vtrn|novtrn|conflict|dropout|dropout-long|yaw> <mission.plan> [record-dir]"
+USAGE="usage: run_ev_arm.sh <vtrn|novtrn|conflict|dropout|dropout-long|yaw|gnss-honest|gnss-fast|gnss-gap|gnss-open> <mission.plan> [record-dir]"
 ARM="${1:?$USAGE}"
 PLAN="${2:?$USAGE}"
 OUTDIR="${3:-$HOME/logs}"
@@ -48,6 +56,10 @@ case "$ARM" in
     ARGS=("${BASEMAP[@]}" --dropout-interval 500 --dropout-duration 6) ;;
   yaw)
     ARGS=("${BASEMAP[@]}" --yaw-drift 1.0) ;;
+  gnss-honest) ARGS=(--no-vtrn --gnss gated) ;;
+  gnss-fast)   ARGS=(--no-vtrn --gnss gated --spoof-pull 0.5 --spoof-onset 1000) ;;
+  gnss-gap)    ARGS=(--no-vtrn --gnss gated --spoof-pull 0.03 --spoof-onset 1000) ;;
+  gnss-open)   ARGS=(--no-vtrn --gnss ungated --spoof-pull 0.1 --spoof-onset 1000) ;;
   *) echo "error: unknown arm '$ARM'" >&2; echo "$USAGE" >&2; exit 2 ;;
 esac
 

@@ -1116,6 +1116,84 @@ droneflight fly --plan ~/drone/plans/ev_test.plan --url udpin://0.0.0.0:14540 \
   `--dropout-duration 10` gap should still descend. If nothing ever fails safe,
   `NOAID_TOUT` is too high.
 
+## 3g. GNSS as an untrusted input — EKF2 behind the consistency gate (unflown, 2026-11-19)
+
+**Question.** GPS-denied flight throws GNSS away everywhere. Keeping it as an
+*untrusted* input — fused only while it agrees with VIO — bounds the error at
+GNSS noise where GNSS is honest. Offline (`droneflight.gnss_spoof`,
+`tools/gnss_spoof_sweep.py`) that holds, except in a gap: a carry-off spoofer
+dragging between the true VIO drift (2 %) and the monitor's bound (3 %) is never
+caught and reaches ~1.2-1.7x the VIO-only error. These arms test the part the
+offline model cannot: **what EKF2 does with two horizontal sources, and with the
+hand-over when the gate closes.**
+
+**Mechanism (`droneflight.gnss_gate`).** The bridge synthesises a receiver —
+Gazebo truth + carry-off spoof + 1.5 m white noise, 5 Hz, Doppler-consistent — and
+sends it as MAVLink `GPS_INPUT` **only while** its VIO-consistency monitor trusts
+it. On an alarm the stream stops for good; EKF2 times GNSS out onto vision. The
+gate sits in front of EKF2 because EKF2's own innovation gate is exactly what
+carry-off is designed to pass. VTRN fixes must be off (`--no-vtrn`): a fix moves
+odometry by metres and reads as spoofing — the bridge refuses the combination.
+
+### Parameters
+
+```bash
+droneflight px4-params --file configs/px4/gps_denied_ekf2.params \
+                       --file configs/px4/sitl_bringup.params \
+                       --file configs/px4/gnss_gated_ekf2.params
+```
+
+Paste, `reboot`, re-add the endpoint, then verify one at a time:
+`EKF2_GPS_CTRL` → **5**, `EKF2_EV_CTRL` → **15**, `SENS_EN_GPSSIM` → **0**,
+`EKF2_GPS_CHECK` → **21**. ⚠️ If `SENS_EN_GPSSIM` does not exist in your PX4,
+the simulator's own honest GNSS is still on and will be blended with ours — check
+`listener sensor_gps` shows one device, or the spoof arms are void.
+
+### Arms — same plan as §3c (`ev_test.plan`, 5.13 km, 6 m/s), seeds pinned
+
+```bash
+./sitl/run_ev_arm.sh gnss-honest ~/drone/plans/ev_test.plan ~/logs/gnss
+# then: droneflight fly --plan ~/drone/plans/ev_test.plan --url udpin://0.0.0.0:14540
+```
+
+Predicted by `tools/gnss_gate_predict.py` (same classes, same seeds: drift 0, GNSS
+4). The gate's alarm distance is **loop-independent** — the monitor sees GNSS
+minus VIO, both truth plus distance-driven error — so the flight must reproduce
+it; the estimate error is the gate's own (GNSS while open, then VIO anchored at
+the alarm point) and EKF2's should sit near it.
+
+| arm | flags | gate closes | predicted error (worst / end) | control |
+|---|---|---|---|---|
+| `gnss-honest` | gated, no spoof | never | ~6.7 m raw-fix worst / ~1 m end (EKF2 should smooth) | `novtrn` flew **103 m** |
+| `gnss-fast` | gated, 0.5 m/m from 1 km | **35 m after onset** | 92 / 92 m (≈ VIO from 1 km) | — |
+| `gnss-gap` | gated, 0.03 m/m from 1 km | **never** | **126 / 124 m** (1.2x VIO-only) | — |
+| `gnss-open` | UNGATED, 0.1 m/m from 1 km | (would close 473 m after onset) | up to **~410 m** if EKF2 follows | gated 0.1 would end ~102 m |
+
+⚠️ `gnss-open` drags the true vehicle ~400 m off the route by design; there is no
+geofence in SITL, but watch for it running off the terrain/world edge.
+
+### What to watch
+
+1. **The bridge's last line**, `gnss gate: N fixes sent, M withheld; gate closed X m
+   after spoof onset` — must match the table. A different X means the seeds or the
+   distance flown differ, not EKF2.
+2. **Does EKF2 fuse both?** ULog `estimator_status_flags`: `cs_gps` and
+   `cs_ev_pos` both 1 while the gate is open. If `cs_ev_pos` drops when GNSS
+   starts, EKF2 is treating them as competing sources and the arm tests the wrong
+   architecture — try `EKF2_EV_CTRL 14` (EV velocity + yaw, no EV position) while
+   GNSS is trusted and note it.
+3. **The hand-over** (`gnss-fast`, at ~1035 m): `cs_gps` → 0 within ~1 s of the
+   alarm. Then either EKF2 **holds** its GNSS-aligned position and continues on EV
+   deltas (≈ the predicted 92 m), or it **resets** to raw EV (truth + VIO drift,
+   ≈ the `novtrn` arm's 103 m). Both are bounded; which one PX4 does is the
+   finding. A jump in `vehicle_local_position.xy_reset_counter` marks a reset.
+4. **Score the true track** with `ev-report` (MISSION phase), and EKF2's error as
+   `est` vs `truth` in the JSONL.
+
+⚠️ Positions-only monitor, white GNSS noise, straight-line VIO drift (see the
+`DriftWalker` note in CLAUDE.md — at bridge step sizes it does not wander, which
+makes the true VIO rate a constant 2 % and the 1 % margin to the bound exact).
+
 ## 4. Custom tether model (required build item)
 
 No standard sim models a **trailing fiber** (Technology-Selection §4.2), so v0

@@ -1,7 +1,7 @@
 """How far can a GNSS spoofer drag the estimate past a VIO-consistency monitor?
 
     python tools/gnss_spoof_sweep.py              # 5 km route, onset at 1 km, 20 seeds
-    python tools/gnss_spoof_sweep.py --vio-rate 0.03 --seeds 50
+    python tools/gnss_spoof_sweep.py --no-rewind  # what EKF2 behind the gate is left with
 
 See ``droneflight.gnss_spoof`` for the model and its limits.
 """
@@ -21,12 +21,20 @@ def main() -> None:
     ap.add_argument("--route", type=float, default=5000.0)
     ap.add_argument("--onset", type=float, default=1000.0)
     ap.add_argument("--seeds", type=int, default=20)
+    ap.add_argument(
+        "--no-rewind",
+        action="store_true",
+        help="Fall back from the alarm point, not the window start: an EKF2 that fused "
+        "the spoofed fix until the gate closed cannot be wound back (RUNBOOK 3g).",
+    )
     args = ap.parse_args()
+    rewind = not args.no_rewind
     mon = MonitorConfig()
     honest = [simulate_spoof(args.route, None, mon, seed=s) for s in range(args.seeds)]
     print(
         f"monitor: windows {mon.windows_m} m, VIO bound {mon.vio_rate:.0%}/m, "
-        f"noise allowance {mon.k_noise:g} sigma of {mon.gnss_sigma_m} m"
+        f"noise allowance {mon.k_noise:g} sigma of {mon.gnss_sigma_m} m, "
+        f"fallback from the {'window start' if rewind else 'alarm point'}"
     )
     print(
         f"honest GNSS: {sum(r.false_alarm for r in honest)}/{len(honest)} false alarms, "
@@ -38,7 +46,11 @@ def main() -> None:
         f"{'worst err':>10} {'end err':>8} {'VIO only':>9}"
     )
     for r in sweep_pull_rates(
-        tuple(x for x in RATES if x > 0), route_m=args.route, onset_m=args.onset, seeds=args.seeds
+        tuple(x for x in RATES if x > 0),
+        route_m=args.route,
+        onset_m=args.onset,
+        seeds=args.seeds,
+        rewind=rewind,
     ):
         after = "-" if math.isinf(r.median_detect_after_m) else f"{r.median_detect_after_m:.0f} m"
         print(

@@ -88,6 +88,82 @@ class MonitorConfig:
     at 4 sigma half the honest 5 km runs false-alarmed."""
 
 
+class ConsistencyMonitor:
+    """The online GNSS-vs-VIO consistency test (the gate in front of EKF2).
+
+    Feed it, every ``step_m`` or so of flight, the along-route distance, the GNSS
+    position and the VIO (odometry) position in one local metric frame. While it
+    trusts GNSS the estimate is GNSS; once it alarms it latches untrusted and the
+    estimate is VIO plus a fixed offset:
+
+    * ``rewind=True`` — the GNSS-VIO offset at the start of the window that fired,
+      the last point the test still vouches for (what the offline sweep reports);
+    * ``rewind=False`` — the offset at the alarm itself. That is what an EKF2 that
+      has been *fusing* the spoofed fix until the gate closed is left with: it
+      cannot be wound back, so the drag accrued inside the window stays.
+
+    ⚠️ ``vio`` must be raw odometry. A VTRN fix moves it by metres in one step and
+    breaks the ``|Δvio| <= rate * span`` premise; it would read as spoofing.
+    """
+
+    def __init__(self, config: MonitorConfig | None = None, *, rewind: bool = True) -> None:
+        self.config = config or MonitorConfig()
+        self.rewind = rewind
+        self.trusted = True
+        self.alarm_at_m = math.inf
+        self.samples = 0
+        self._hist: deque[tuple[float, float, float]] = deque()
+        self._longest = max(self.config.windows_m)
+        self._noise = self.config.k_noise * self.config.gnss_sigma_m * math.sqrt(2.0)
+        self._ref = (0.0, 0.0)
+
+    def update(
+        self, distance_m: float, gnss: tuple[float, float], vio: tuple[float, float]
+    ) -> bool:
+        """Test one sample; return True only on the step the alarm fires."""
+        if not self.trusted:
+            return False
+        cfg = self.config
+        d = distance_m
+        self.samples += 1
+        o = (gnss[0] - vio[0], gnss[1] - vio[1])
+        hist = self._hist
+        hist.append((d, o[0], o[1]))
+        while hist and d - hist[0][0] > self._longest:
+            hist.popleft()
+        for w in cfg.windows_m:
+            d0, ox, oy = next(h for h in hist if d - h[0] <= w)
+            span = d - d0
+            if span < 0.5 * w:
+                continue
+            change = math.hypot(o[0] - ox, o[1] - oy)
+            if change > cfg.k_rate * cfg.vio_rate * span + self._noise:
+                self.trusted = False
+                self.alarm_at_m = d
+                self._ref = (ox, oy) if self.rewind else o
+                return True
+        return False
+
+    def estimate(self, gnss: tuple[float, float], vio: tuple[float, float]) -> tuple[float, float]:
+        """The gated position: GNSS while trusted, anchored VIO after the alarm."""
+        if self.trusted:
+            return gnss
+        return (vio[0] + self._ref[0], vio[1] + self._ref[1])
+
+
+def spoof_offset(attack: SpoofAttack | None, distance_m: float) -> tuple[float, float]:
+    """The false offset a carry-off spoofer has dragged in by ``distance_m``.
+
+    ``bearing_deg`` is measured in the caller's frame (relative to the route in
+    :func:`simulate_spoof`; a compass bearing in the EV bridge).
+    """
+    if attack is None or distance_m <= attack.onset_m:
+        return (0.0, 0.0)
+    mag = attack.pull_rate * (distance_m - attack.onset_m)
+    b = math.radians(attack.bearing_deg)
+    return (mag * math.cos(b), mag * math.sin(b))
+
+
 @dataclass(frozen=True)
 class SpoofRun:
     detected: bool
@@ -110,77 +186,42 @@ def simulate_spoof(
     vio_rate: float = 0.02,
     vio_wander_deg_per_100m: float = 20.0,
     seed: int = 0,
+    rewind: bool = True,
 ) -> SpoofRun:
     """Fly ``route_m``; return how the gated GNSS estimate fared.
 
     ``vio_rate`` is the TRUE drift of this run; ``monitor.vio_rate`` is the bound
     the monitor assumes. Keeping them separate is the point: the monitor is only
-    as good as its bound on VIO.
+    as good as its bound on VIO. ``rewind`` — see :class:`ConsistencyMonitor`.
+    Truth is the origin, so every position here is also an error.
     """
     cfg = monitor or MonitorConfig()
+    mon = ConsistencyMonitor(cfg, rewind=rewind)
     rng = random.Random(seed)
     heading = rng.uniform(0.0, 2.0 * math.pi)
     vio = [0.0, 0.0]  # VIO error vector
     n = max(1, int(route_m / step_m))
-    hist: deque[tuple[float, float, float]] = deque()
-    trusted = True
-    est_err_at_alarm = (0.0, 0.0)
-    vio_at_alarm = (0.0, 0.0)
     detected_at = math.inf
     false_alarm = False
     max_err = 0.0
     err = (0.0, 0.0)
-    longest = max(cfg.windows_m)
-    thresh_noise = cfg.k_noise * cfg.gnss_sigma_m * math.sqrt(2.0)
     for i in range(1, n + 1):
         d = i * step_m
         heading += rng.gauss(0.0, math.radians(vio_wander_deg_per_100m) * step_m / 100.0)
         vio[0] += vio_rate * step_m * math.cos(heading)
         vio[1] += vio_rate * step_m * math.sin(heading)
-        spoof = (0.0, 0.0)
-        if attack is not None and d > attack.onset_m:
-            mag = attack.pull_rate * (d - attack.onset_m)
-            b = math.radians(attack.bearing_deg)
-            spoof = (mag * math.cos(b), mag * math.sin(b))
+        spoof = spoof_offset(attack, d)
         gn = (
             spoof[0] + rng.gauss(0.0, cfg.gnss_sigma_m),
             spoof[1] + rng.gauss(0.0, cfg.gnss_sigma_m),
         )
-        if trusted:
-            o = (gn[0] - vio[0], gn[1] - vio[1])
-            hist.append((d, o[0], o[1]))
-            while hist and d - hist[0][0] > longest:
-                hist.popleft()
-            for w in cfg.windows_m:
-                d0, ox, oy = next(h for h in hist if d - h[0] <= w)
-                span = d - d0
-                if span < 0.5 * w:
-                    continue
-                change = math.hypot(o[0] - ox, o[1] - oy)
-                if change > cfg.k_rate * cfg.vio_rate * span + thresh_noise:
-                    trusted = False
-                    if attack is None or d <= attack.onset_m:
-                        false_alarm = True
-                    else:
-                        detected_at = d - attack.onset_m
-                    # Fall back to VIO from the start of the window that fired:
-                    # the GNSS error there is the offset plus the VIO error then.
-                    est_err_at_alarm = (ox + vio[0], oy + vio[1])
-                    vio_at_alarm = (vio[0], vio[1])
-                    break
-            err = (
-                gn
-                if trusted
-                else (
-                    est_err_at_alarm[0] + vio[0] - vio_at_alarm[0],
-                    est_err_at_alarm[1] + vio[1] - vio_at_alarm[1],
-                )
-            )
-        else:
-            err = (
-                est_err_at_alarm[0] + vio[0] - vio_at_alarm[0],
-                est_err_at_alarm[1] + vio[1] - vio_at_alarm[1],
-            )
+        v = (vio[0], vio[1])
+        if mon.update(d, gn, v):
+            if attack is None or d <= attack.onset_m:
+                false_alarm = True
+            else:
+                detected_at = d - attack.onset_m
+        err = mon.estimate(gn, v)
         max_err = max(max_err, math.hypot(*err))
     return SpoofRun(
         detected=math.isfinite(detected_at),
@@ -210,12 +251,19 @@ def sweep_pull_rates(
     onset_m: float = 1000.0,
     seeds: int = 20,
     monitor: MonitorConfig | None = None,
+    rewind: bool = True,
 ) -> list[PullRateResult]:
     """Monte-Carlo each carry-off rate over ``seeds`` VIO/GNSS noise draws."""
     out = []
     for rate in pull_rates:
         runs = [
-            simulate_spoof(route_m, SpoofAttack(onset_m=onset_m, pull_rate=rate), monitor, seed=s)
+            simulate_spoof(
+                route_m,
+                SpoofAttack(onset_m=onset_m, pull_rate=rate),
+                monitor,
+                seed=s,
+                rewind=rewind,
+            )
             for s in range(seeds)
         ]
         hits = [r.detect_after_m for r in runs if r.detected]

@@ -33,6 +33,13 @@ from droneflight.ev_bridge import (
     plan_track_enu,
 )
 from droneflight.executor import fly_mission, prepare_items
+from droneflight.gnss_gate import (
+    GnssGate,
+    GnssGateConfig,
+    GnssPublisher,
+    RecordingGnssPublisher,
+)
+from droneflight.gnss_spoof import MonitorConfig, SpoofAttack
 from droneflight.model import FlightMission
 from droneflight.nav import (
     DriftConfig,
@@ -625,6 +632,20 @@ def _format_bridge_stats(stats: EvBridgeStats) -> list[str]:
         )
     if stats.max_yaw_error_rad:
         lines.append(f"yaw error: max {math.degrees(stats.max_yaw_error_rad):.2f}°")
+    if stats.gnss_published or stats.gnss_withheld:
+        if math.isinf(stats.gnss_alarm_after_onset_m):
+            verdict = "never closed"
+        elif stats.gnss_alarm_after_onset_m < 0.0:
+            verdict = f"FALSE ALARM at t={stats.gnss_alarm_t_s:.0f} s"
+        else:
+            verdict = (
+                f"closed {stats.gnss_alarm_after_onset_m:.0f} m after spoof onset "
+                f"(t={stats.gnss_alarm_t_s:.0f} s)"
+            )
+        lines.append(
+            f"gnss gate: {stats.gnss_published} fixes sent, "
+            f"{stats.gnss_withheld} withheld; gate {verdict}"
+        )
     return lines
 
 
@@ -760,6 +781,17 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
         watcher = asyncio.create_task(watch_estimate())
         mode_watcher = asyncio.create_task(watch_mode())
 
+    gnss_gate: GnssGate | None = None
+    gnss_pub: GnssPublisher | None = None
+    if args.gnss != "off":
+        gnss_gate = _build_gnss_gate(args, mission)
+        if args.dry_run:
+            gnss_pub = RecordingGnssPublisher()
+        else:
+            from droneflight.gnss_gate import MavsdkGpsInputPublisher
+
+            gnss_pub = MavsdkGpsInputPublisher(system, args.gnss_sigma)
+
     config = EvBridgeConfig(
         rate_hz=args.rate,
         corridor_tolerance_m=args.corridor,
@@ -786,6 +818,8 @@ async def _run_ev_bridge(  # pragma: no cover - requires sim + autopilot
                 )
                 if args.dropout_interval > 0.0
                 else None,
+                gnss=gnss_gate,
+                gnss_publisher=gnss_pub,
             )
             stats = await bridge.run(
                 GazeboTruthSource(topic, gz_binary=args.gz), publisher, stop=stop
@@ -856,7 +890,44 @@ def _ev_bridge(args: argparse.Namespace) -> int:  # pragma: no cover - requires 
             else "OFF (heading is ground truth)"
         )
     )
+    if args.gnss != "off":
+        print(
+            f"gnss: {args.gnss.upper()} — receiver at {args.gnss_rate:g} Hz, "
+            f"{args.gnss_sigma:g} m noise, seed {args.gnss_seed}; monitor VIO bound "
+            f"{args.monitor_vio_bound * 100:.1f}%; "
+            + (
+                f"carry-off spoofer from {args.spoof_onset:.0f} m, "
+                f"{args.spoof_pull:g} m/m toward {args.spoof_bearing:.0f}°"
+                if args.spoof_pull > 0.0
+                else "honest (no spoofer)"
+            )
+        )
     return asyncio.run(_run_ev_bridge(args, mission, _build_injector(args, mission), topic))
+
+
+def _build_gnss_gate(args: argparse.Namespace, mission: FlightMission) -> GnssGate:
+    """The receiver + consistency gate described by the ``--gnss*`` flags."""
+    if args.vtrn:
+        raise SystemExit("error: --gnss needs raw VIO; add --no-vtrn (see RUNBOOK §3g)")
+    attack = (
+        SpoofAttack(
+            onset_m=args.spoof_onset, pull_rate=args.spoof_pull, bearing_deg=args.spoof_bearing
+        )
+        if args.spoof_pull > 0.0
+        else None
+    )
+    return GnssGate(
+        GnssGateConfig(
+            home_lat=mission.home_lat,
+            home_lon=mission.home_lon,
+            home_alt_m=mission.home_alt_m,
+            attack=attack,
+            monitor=MonitorConfig(vio_rate=args.monitor_vio_bound, gnss_sigma_m=args.gnss_sigma),
+            gated=args.gnss == "gated",
+            rate_hz=args.gnss_rate,
+            seed=args.gnss_seed,
+        )
+    )
 
 
 def _fly(args: argparse.Namespace) -> int:  # pragma: no cover - requires a live autopilot
@@ -1337,6 +1408,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="Seconds to wait for Gazebo to advertise the truth topic before giving up.",
+    )
+    eb.add_argument(
+        "--gnss",
+        choices=("off", "gated", "ungated"),
+        default="off",
+        help="Also feed EKF2 a synthetic GNSS receiver as GPS_INPUT: 'gated' sends it only "
+        "while the VIO-consistency monitor trusts it, 'ungated' always (the control arm). "
+        "Needs configs/px4/gnss_gated_ekf2.params and --no-vtrn (RUNBOOK §3g).",
+    )
+    eb.add_argument("--gnss-rate", type=float, default=5.0, help="Receiver rate (Hz, sim time).")
+    eb.add_argument("--gnss-sigma", type=float, default=1.5, help="GNSS noise per axis (m).")
+    eb.add_argument("--gnss-seed", type=int, default=4, help="GNSS noise seed.")
+    eb.add_argument(
+        "--monitor-vio-bound",
+        type=float,
+        default=0.03,
+        help="Drift-rate bound the monitor assumes for VIO (fraction of distance).",
+    )
+    eb.add_argument(
+        "--spoof-pull", type=float, default=0.0, help="Carry-off drag, m per m flown (0 = honest)."
+    )
+    eb.add_argument("--spoof-onset", type=float, default=1000.0, help="Capture distance (m).")
+    eb.add_argument(
+        "--spoof-bearing", type=float, default=90.0, help="Drag direction, compass degrees."
     )
     eb.add_argument("--dry-run", action="store_true", help="Read truth but do not publish to PX4.")
     eb.add_argument(

@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from droneflight.correction import Fix
+from droneflight.gnss_gate import GnssFix, GnssGate, GnssPublisher
 from droneflight.model import FlightMission
 from droneflight.nav import DropoutModel, ErrorInjector, local_enu
 
@@ -608,6 +609,9 @@ class BridgeSample:
     # from the bridge itself dying, which is the opposite of the thing under test.
     ev_down: bool = False
     yaw_error_rad: float = 0.0
+    # The GNSS fix computed on this sample (gate mode only; None when none was due).
+    gnss: GnssFix | None = None
+    gnss_trusted: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -636,6 +640,18 @@ class BridgeSample:
             doc["ev"] = "down"
         if self.yaw_error_rad:
             doc["yaw_err"] = round(self.yaw_error_rad, 5)
+        if self.gnss is not None:
+            doc["gnss"] = {
+                "e": round(self.gnss.east_m, 3),
+                "n": round(self.gnss.north_m, 3),
+                "spoof": {
+                    "e": round(self.gnss.spoof_en[0], 3),
+                    "n": round(self.gnss.spoof_en[1], 3),
+                },
+                "pub": self.gnss.published,
+            }
+        if self.gnss_trusted is not None:
+            doc["gnss_trusted"] = self.gnss_trusted
         return doc
 
 
@@ -661,6 +677,12 @@ class EvBridgeStats:
     heartbeat timeout). Counted and ridden out, never fatal — see :meth:`EvBridge.run`."""
     max_yaw_error_rad: float = 0.0
     track_enu: list[tuple[float, float]] = field(default_factory=list)
+    gnss_published: int = 0
+    gnss_withheld: int = 0
+    """Fixes computed after the gate closed and never sent (gate mode only)."""
+    gnss_alarm_t_s: float = math.inf
+    gnss_alarm_after_onset_m: float = math.inf
+    """Distance from spoof onset to the gate closing; negative = a false alarm."""
 
     @property
     def fix_availability(self) -> float:
@@ -715,7 +737,17 @@ class EvBridge:
         mode_probe: Callable[[], str | None] | None = None,
         on_sample: Callable[[BridgeSample], None] | None = None,
         dropout: DropoutModel | None = None,
+        gnss: GnssGate | None = None,
+        gnss_publisher: GnssPublisher | None = None,
     ) -> None:
+        if gnss is not None and injector.reference is not None:
+            # A VTRN fix moves odometry by metres in one step; the consistency
+            # monitor would read it as spoofing (or, worse, learn to tolerate it).
+            raise EvBridgeError("the GNSS gate needs raw VIO: run it with --no-vtrn")
+        if gnss is not None and gnss_publisher is None:
+            raise EvBridgeError("a GNSS gate needs a GNSS publisher")
+        self.gnss = gnss
+        self.gnss_publisher = gnss_publisher
         self.injector = injector
         self.config = config or EvBridgeConfig()
         self.recorder = recorder
@@ -783,6 +815,24 @@ class EvBridge:
             stats.final_error_m = err
             stats.track_enu.append((sample.east_m, sample.north_m))
 
+            # The receiver runs on its own cadence, ahead of the vision cadence.
+            gnss_fix: GnssFix | None = None
+            if self.gnss is not None and self.gnss_publisher is not None:
+                gnss_fix = self.gnss.step(
+                    sample.t_s,
+                    (sample.east_m, sample.north_m, sample.up_m),
+                    (sample.east_m + err_e, sample.north_m + err_n),
+                    self.injector.distance_m,
+                    velocity_ned,
+                )
+                if gnss_fix is not None and gnss_fix.published:
+                    try:
+                        await self.gnss_publisher.publish(gnss_fix)
+                        stats.gnss_published += 1
+                    except EvBridgeError as exc:
+                        stats.publish_failures += 1
+                        _log.warning("GNSS publish refused: %s", exc)
+
             if sample.t_s < next_pub_t:
                 continue
             next_pub_t = sample.t_s + interval if next_pub_t == -math.inf else next_pub_t + interval
@@ -830,6 +880,8 @@ class EvBridge:
                 mode=self.mode_probe() if self.mode_probe else None,
                 ev_down=ev_down,
                 yaw_error_rad=yaw_err,
+                gnss=gnss_fix,
+                gnss_trusted=self.gnss.monitor.trusted if self.gnss is not None else None,
             )
             if self.recorder is not None:
                 self.recorder.write(record)
@@ -889,6 +941,10 @@ class EvBridge:
         stats.corrupt_accepted = counts[FixOutcome.ACCEPTED_CORRUPT]
         if self.dropout is not None:
             stats.dropout_events = self.dropout.events
+        if self.gnss is not None:
+            stats.gnss_alarm_t_s = self.gnss.alarm_t_s
+            stats.gnss_alarm_after_onset_m = self.gnss.alarm_after_onset_m
+            stats.gnss_withheld = self.gnss.withheld
 
 
 # --------------------------------------------------------------------------- #
@@ -990,6 +1046,7 @@ def load_track(path: Path) -> list[BridgeSample]:
                 mode=doc.get("mode"),
                 ev_down=doc.get("ev") == "down",
                 yaw_error_rad=float(doc.get("yaw_err", 0.0)),
+                gnss_trusted=doc.get("gnss_trusted"),
             )
         )
     return samples

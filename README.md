@@ -27,7 +27,7 @@ verifiable without hardware.
 - Most envelope anchors rest on four noise-seed sets each (RUNBOOK §4.14). The thinnest pass at 600/ha left +0.03 m of air.
 - Gazebo trunks are bare cylinders: no crowns, no understory. The escape climb reads trunk tops from the world manifest, which a real aircraft would have to sense.
 - Stem-map localisation (`stem_localizer.py`) is scored offline only; it has not been flown.
-- GNSS spoofing detection (`gnss_spoof.py`) is offline only, positions only (no Doppler), straight 2-D route.
+- GNSS spoofing detection (`gnss_spoof.py`) is a positions-only monitor (a Doppler-consistent spoofer is the case modelled). It is wired in front of EKF2 through the EV bridge (`ev-bridge --gnss`, RUNBOOK §3g) but **not flown yet**.
 
 ## Status — F1 (bridge + policies + perception/avoidance + nav emulation)
 
@@ -42,7 +42,7 @@ verifiable without hardware.
 | **In-flight escape climb** (`fly-local --escape-after`) | ✅ climbs over a dead end and descends sensing; flown 4/4 clean |
 | **Reaction budget + PX4 response model** (`maneuver.py`, `px4_profile.py`) | ✅ jerk-limited reaction distance; measured corner prior and offboard 0.3 s + 0.4 s response |
 | **Strike scoring** (`strikes.py`, `droneflight b2-score`) | ✅ tree strikes from a flown ULog by dynamic signature |
-| **GNSS as an untrusted input** (`gnss_spoof.py`) | ✅ offline: carry-off spoofing vs a VIO-consistency monitor (`tools/gnss_spoof_sweep.py`). Honest GNSS: 0 false alarms, ~1.5 m error vs 98 m VIO-only over 5 km; fast carry-off caught in ≤ 80 m; a pull between true VIO drift and the monitor's bound slips through and reaches ~1.7x the VIO-only error. Not wired to EKF2, not flown |
+| **GNSS as an untrusted input** (`gnss_spoof.py`) | ✅ offline: carry-off spoofing vs a VIO-consistency monitor (`tools/gnss_spoof_sweep.py`). Honest GNSS: 0 false alarms, ~1.5 m error vs 98 m VIO-only over 5 km; fast carry-off caught in ≤ 80 m; a pull between true VIO drift and the monitor's bound slips through and reaches ~1.7x the VIO-only error. **EKF2 path built, unflown:** `ev-bridge --no-vtrn --gnss gated` sends a synthetic receiver as `GPS_INPUT` only while the monitor trusts it (`gnss_gate.py`, `configs/px4/gnss_gated_ekf2.params`); `tools/gnss_gate_predict.py` predicts each SITL arm (RUNBOOK §3g) |
 | **Stem-map localisation** (`stem_localizer.py`) | ✅ offline: RANSAC consensus, 0.03 m on a pristine map, declines when the map is ambiguous; not flown |
 | **Closed-loop forest sim** (`reactive.py`) | ✅ flies the route through trees; avoidance ON vs OFF |
 | **GPS-denied nav emulation** (`nav.py`) | ✅ VIO drift + VTRN correction (idealised + fidelity-limited) |
@@ -74,6 +74,7 @@ droneflight b2-score --ulog run.ulg --trunks <world>_trunks.csv           # tree
 # GPS-denied in the loop: stream Gazebo truth + injected error as external vision
 droneflight ev-bridge --plan out/mission.plan --url udpin://0.0.0.0:14541 --record run.jsonl
 droneflight ev-bridge --plan out/mission.plan --no-vtrn             # the dead-reckoning control arm
+droneflight ev-bridge --plan out/mission.plan --no-vtrn --gnss gated --spoof-pull 0.5   # GNSS behind the spoof gate (§3g)
 ```
 
 `validate`, `nav`, `simfly`, `tether-check`, `tether-plugin-check`, and
