@@ -67,3 +67,16 @@ def test_an_alarm_before_onset_is_a_false_alarm() -> None:
     assert run.false_alarm
     assert not run.detected
     assert math.isinf(run.detect_after_m)
+
+
+def test_a_perfect_vio_bound_still_misses_a_pull_along_the_drift() -> None:
+    """The gap is geometric: a pull aligned with the VIO drift cancels in |Δo|."""
+    perfect = MonitorConfig(vio_rate=0.0201)  # true drift is 0.02
+    assert not any(simulate_spoof(5000.0, None, perfect, seed=s).false_alarm for s in range(20))
+    runs = [
+        simulate_spoof(5000.0, SpoofAttack(onset_m=1000.0, pull_rate=0.04), perfect, seed=s)
+        for s in range(20)
+    ]
+    missed = [r for r in runs if not r.detected]
+    assert missed  # some drift headings line up with the pull
+    assert max(r.max_error_m for r in missed) > 1.5 * max(r.vio_only_error_at_end_m for r in runs)

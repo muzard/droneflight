@@ -40,8 +40,14 @@ Honest GNSS bounds the error at its own noise instead of VIO's 98 m, and a
 spoofer slower than true VIO drift does less harm than flying VIO-only. The
 cost is a **gap between the true drift and the monitor's bound**: a carry-off
 in it is caught late or not at all and reaches **~1.7x the VIO-only error**.
-The gap is the uncertainty in the VIO rate, so a tighter, measured bound on
-the real VIO is what closes it.
+A tighter bound does NOT close the gap (re-measured 2026-11-19): with the bound
+at the true 2 % the honest runs still never alarm, yet 0.04 m/m is still missed on
+some seeds and the worst error stays 163 m. The test sees only ``|Δo|``, and a
+pull ALONG the VIO drift direction cancels it: ``|Δo| = (pull - rate) * span``,
+so an aligned pull up to about twice the VIO rate is invisible however good the
+bound. A tighter bound catches more seeds (0.04: 60 % at 3 % -> 80 % at 2.2 %),
+not the worst one. Closing it takes a second, independent position reference
+(VTRN or stem-map fixes), not a better number for the first.
 
 ⚠️ Offline, 2-D, a straight route at constant speed. Not modelled: a spoofer that
 also feeds consistent velocity (Doppler) — this monitor uses positions only,

@@ -54,7 +54,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 385 tests
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 386 tests
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -430,7 +430,12 @@ fall back to VIO from the window start. `tools/gnss_spoof_sweep.py` (5 km, onset
 1 km, true drift 2 %, bound 3 %): **honest 0/100 false alarms, ~1.5 m vs 98 m
 VIO-only**; pull ≥ 0.2 caught in ≤ 80 m; pull ≤ 0.01 never caught but harmless
 (≤ 44 m); **0.03-0.04 is the gap — caught 45-60 %, worst 163 m (~1.7× VIO-only).**
-The gap is the uncertainty in the VIO rate: a measured bound closes it.
+🔴 **Corrected 2026-11-19: a tighter VIO bound does not close the gap.** With
+the bound at the true 2 % (0/50 false alarms) 0.04 m/m is still missed on some
+seeds and the worst stays 163 m: a pull along the VIO drift direction cancels in
+`|Δo|`, so an aligned pull up to ~2× the VIO rate is invisible. A tighter bound
+catches more seeds, not the worst one — that needs an independent second
+reference (VTRN / stem-map fixes).
 🐛 At 4σ noise allowance half the honest runs false-alarmed (the test runs every
 step on two windows) → 6σ. ⚠️ Positions only (a Doppler-consistent spoofer is
 harder), 2-D straight route.
