@@ -53,7 +53,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 337 tests
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 374 tests
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -419,6 +419,20 @@ corners (0.315 N). The 0.6 N drag disturbance did not affect avoidance. So the
 tether is within budget at today's speeds; what limits it is (2) the ceiling if
 cruise rises and (3) trunk contact under the canopy — neither of which the
 plugin models (fixed span, no trees).
+
+## 🛰️ GNSS AS AN UNTRUSTED INPUT (2026-11-19, roadmap P4) — `gnss_spoof.py`
+Offline only. Carry-off spoofer (seamless capture, then drags the fix at
+`pull_rate` m per m flown) vs a monitor on `o = p_gnss − p_vio`: honest GNSS can
+move `o` only at the VIO rate, and `|Δvio| ≤ rate·span` exactly, so alarm when
+`|Δo|` over a 100 m or 1000 m window beats `vio_rate_bound·span + 6σ√2`; then
+fall back to VIO from the window start. `tools/gnss_spoof_sweep.py` (5 km, onset
+1 km, true drift 2 %, bound 3 %): **honest 0/100 false alarms, ~1.5 m vs 98 m
+VIO-only**; pull ≥ 0.2 caught in ≤ 80 m; pull ≤ 0.01 never caught but harmless
+(≤ 44 m); **0.03-0.04 is the gap — caught 45-60 %, worst 163 m (~1.7× VIO-only).**
+The gap is the uncertainty in the VIO rate: a measured bound closes it.
+🐛 At 4σ noise allowance half the honest runs false-alarmed (the test runs every
+step on two windows) → 6σ. ⚠️ Positions only (a Doppler-consistent spoofer is
+harder), 2-D straight route, not wired to EKF2, not flown.
 
 ## ✅ STEM-MAP LOCALISATION BUILT (2026-09-15) — `stem_localizer.py`
 **The gap this closes.** The stem-routed plan flew **330/330 with 0 strikes** —

@@ -66,6 +66,16 @@ class FlightMission(BaseModel):
                 return v
         return self.cruise_speed_ms
 
+    def fastest_leg_speed_ms(self) -> float:
+        """The plan's top speed — what "cruise" means to a speed policy.
+
+        ``cruise_speed_ms`` is the plan-level ``cruiseSpeed``, which the planner
+        sets to the FIRST legs' speed: a plan whose concealed opening runs at
+        0.5 m/s says 0.5 there even though it flies 6.0 m/s over open ground
+        (Askola measured zone, 2026-09-25, where ``tether-check`` raised on a
+        policy minimum above its "cruise")."""
+        return max(self.leg_speed_ms(i) for i in range(len(self.waypoints)))
+
 
 class MissionItem(BaseModel):
     """A waypoint plus its executed speed (after the speed policy)."""
