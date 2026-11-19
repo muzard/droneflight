@@ -16,13 +16,18 @@ verifiable without hardware.
 - **The MVP mission, flown GPS-denied** (RUNBOOK §4.14, 2026-09-24). The route is [droneplanner](https://github.com/muzard/droneplanner)'s 1500 m concealment route through a 200 stems/ha Gazebo forest. The aircraft used the onboard local planner with no prior stem map. Result: **0 tree strikes, 0 ground impacts, 18.6 min**, with injected navigation error up to 11.8 m.
 - **At the edge of the envelope, 400 stems/ha** (a forest-only cut of the first 1.76 km, GPS-denied): 0 strikes, 12.7 min.
 - **External-vision GPS-denied navigation into PX4 EKF2:** the 3-arm acceptance test passed on 2026-07-22.
+- **First real Finnish AO (Askola, MML terrain, 2026-09-25):** droneplanner's measured 300 m zone (~1000 stems/ha, forest legs at 0.5 m/s, 1702 trunks) flown GPS-denied with `fly-local`: **0 strikes on 4/4 seed sets**, 21.2–21.5 min. This needed memory clearing (`clear_range_m`): without it the aircraft stalled 3/3 at waypoint 4 as slow drift smeared the trunk map shut.
+- **Dense natural forest:** 1200/ha at 1.0 m/s and 1500/ha at 0.5 m/s are 4/4 clean GPS-denied. Past ~1000/ha passability fails before speed does, and about one traverse in eight relies on the in-flight escape climb (`--escape-after`), which flew 4/4 clean over an unmapped trunk wall.
 
 **Limits:**
 - Obstacle depth sensing is an oracle fed from the world's trunk positions.
 - GPS-denied navigation is Gazebo ground truth plus injected VIO-style error, not a real estimator.
 - The forests are synthetic.
 - Real onboard perception is not built yet.
-- Each flight is a single noise draw (RUNBOOK §4.14), and the 400 stems/ha case is marginal: the offline harness grazed a trunk in 1 of 6 GPS-denied seeds.
+- Most envelope anchors rest on four noise-seed sets each (RUNBOOK §4.14). The thinnest pass at 600/ha left +0.03 m of air.
+- Gazebo trunks are bare cylinders: no crowns, no understory. The escape climb reads trunk tops from the world manifest, which a real aircraft would have to sense.
+- Stem-map localisation (`stem_localizer.py`) is scored offline only; it has not been flown.
+- GNSS spoofing detection (`gnss_spoof.py`) is a positions-only monitor (a Doppler-consistent spoofer is the case modelled). It is wired in front of EKF2 through the EV bridge (`ev-bridge --gnss`, RUNBOOK §3g) but **not flown yet**.
 
 ## Status — F1 (bridge + policies + perception/avoidance + nav emulation)
 
@@ -32,7 +37,13 @@ verifiable without hardware.
 | Tether-safe speed policy (`speed_policy.py`) | ✅ slows through turns/reversals |
 | Covert sensor-mode policy (`sensors.py`) | ✅ passive-optical / thermal / active-lidar tradeoff |
 | Mission executor + failsafe (`executor.py`) | ✅ tested against a fake connector |
-| **Optical detection + avoidance** (`perception.py`, `avoidance.py`) | ✅ depth sensing + follow-the-gap steering |
+| **Optical detection + avoidance** (`perception.py`, `avoidance.py`) | ⚠️ built, but reactive avoidance **collides in flight** (B2: 19–37 strikes); superseded by the local planner |
+| **Onboard local planner** (`local_planner.py`, `local_offboard.py`, `droneflight fly-local`) | ✅ remembers sensed trunks, A* through the gaps, dynamic-feasibility speed; 0 strikes GPS-denied in SITL from 200 to 1500 stems/ha |
+| **In-flight escape climb** (`fly-local --escape-after`) | ✅ climbs over a dead end and descends sensing; flown 4/4 clean |
+| **Reaction budget + PX4 response model** (`maneuver.py`, `px4_profile.py`) | ✅ jerk-limited reaction distance; measured corner prior and offboard 0.3 s + 0.4 s response |
+| **Strike scoring** (`strikes.py`, `droneflight b2-score`) | ✅ tree strikes from a flown ULog by dynamic signature |
+| **GNSS as an untrusted input** (`gnss_spoof.py`) | ✅ offline: carry-off spoofing vs a VIO-consistency monitor (`tools/gnss_spoof_sweep.py`). Honest GNSS: 0 false alarms, ~1.5 m error vs 98 m VIO-only over 5 km; fast carry-off caught in ≤ 80 m; a pull along the VIO drift direction up to ~2x the drift rate slips through and reaches ~1.7x the VIO-only error — a tighter VIO bound does not fix that; a second independent reference does. **EKF2 path built, unflown:** `ev-bridge --no-vtrn --gnss gated` sends a synthetic receiver as `GPS_INPUT` only while the monitor trusts it (`gnss_gate.py`, `configs/px4/gnss_gated_ekf2.params`); `tools/gnss_gate_predict.py` predicts each SITL arm (RUNBOOK §3g) |
+| **Stem-map localisation** (`stem_localizer.py`) | ✅ offline: RANSAC consensus, 0.03 m on a pristine map, declines when the map is ambiguous; not flown |
 | **Closed-loop forest sim** (`reactive.py`) | ✅ flies the route through trees; avoidance ON vs OFF |
 | **GPS-denied nav emulation** (`nav.py`) | ✅ VIO drift + VTRN correction (idealised + fidelity-limited) |
 | **Optical terrain-relative correction** (`correction.py`) | ✅ data-driven fixes over a spatially varying basemap; confidence + innovation gating |
@@ -40,7 +51,7 @@ verifiable without hardware.
 | **EV dropout + yaw error** (`nav.py`) | ✅ built + **flown** (2026-07-22) — `--dropout-interval`, `--yaw-bias`, `--yaw-drift` (all off by default); neither moved cross-track, both moved EKF2 heading |
 | MAVSDK adapter (`mavsdk_connector.py`) | ⚠️ live path — runs against SITL, not unit-tested |
 | **Tether payout model** (`tether.py`) | ✅ offline v0 — back-tension + airborne-span drag + turn load, validated against a break budget |
-| **Gazebo tether wrench plugin** (`sitl/tether_plugin/`) | ✍️ written + Mac-tested (physics bit-exact vs `tether.py`); **not yet compiled or flown** — needs the Ubuntu sim host |
+| **Gazebo tether wrench plugin** (`sitl/tether_plugin/`) | ✅ compiled and flown; parity with `tether.py` EXACT, disturbance scaling confirmed; flown on the full MVP route at 0.78 N peak (39 % of break) |
 | Real onboard perception (VIO/VTRN/LIO estimator) | later — separate effort |
 
 ## Usage
@@ -57,19 +68,29 @@ droneflight tether-check --plan out/mission.plan                   # payout tens
 droneflight tether-plugin-check --log tether-on.csv                # Gazebo plugin log vs the model (parity gate)
 droneflight ev-report --plan out/mission.plan --record run.jsonl   # corridor stats of a recorded EV run
 droneflight fly      --plan out/mission.plan --url udpin://0.0.0.0:14540    # live: execute on PX4/SITL
+droneflight fly-local --plan out/mission.plan --trunks <world>_trunks.csv  # live: onboard local planner (offboard)
+droneflight b2-score --ulog run.ulg --trunks <world>_trunks.csv           # tree strikes in a flown ULog (needs .[analysis])
 
 # GPS-denied in the loop: stream Gazebo truth + injected error as external vision
 droneflight ev-bridge --plan out/mission.plan --url udpin://0.0.0.0:14541 --record run.jsonl
 droneflight ev-bridge --plan out/mission.plan --no-vtrn             # the dead-reckoning control arm
+droneflight ev-bridge --plan out/mission.plan --no-vtrn --gnss gated --spoof-pull 0.5   # GNSS behind the spoof gate (§3g)
 ```
 
 `validate`, `nav`, `simfly`, `tether-check`, `tether-plugin-check`, and
 `ev-report` are fully offline (kinematic, no
-autopilot); `fly` needs a running PX4 (SITL or hardware) reachable at `--url`, and
+autopilot), as is `b2-score` on a recorded ULog; `fly` and `fly-local` need a running PX4 (SITL or hardware) reachable at `--url`, and
 `ev-bridge` needs Gazebo **and** PX4 — see [RUNBOOK.md](RUNBOOK.md) §3b, which also
 covers the second MAVLink endpoint and the EKF2 global origin.
 
-## Optical detection + avoidance (won't crash into trees)
+## Optical detection + avoidance (the first approach, superseded)
+
+> ⚠️ **This section describes the kinematic-sim result that PX4 SITL later
+> falsified.** Flown in Gazebo with real trunk collisions (TEST-PLAN B2,
+> 2026-07-28), reactive avoidance reached the goal by hitting 19–37 trees: the
+> airframe cannot turn away in the distance it reacts at. The onboard local
+> planner (`local_planner.py`, `fly-local`) replaced it in 2026-09 and is what
+> the results above were flown with. See CLAUDE.md for both.
 
 `perception.py` emulates the forward depth sensor (a passive stereo pair or a
 lidar slice) as rays returning the range to the nearest trunk; `avoidance.py` is
@@ -158,7 +179,8 @@ pytest --cov=droneflight --cov-fail-under=85
 
 ## Scope
 
-This package is flight *execution* + policy. It is **not** the onboard state
-estimator (VIO/VTRN/LIO), obstacle avoidance, or the payout-hardware controller —
-those are separate efforts. No targeting/munitions logic (out of scope, per the
+This package is flight *execution* + policy, plus the onboard local planner for
+obstacle avoidance (fed by an oracle depth sensor in simulation). It is **not**
+the onboard state estimator (VIO/VTRN/LIO), real perception, or the
+payout-hardware controller — those are separate efforts. No targeting/munitions logic (out of scope, per the
 program spec).

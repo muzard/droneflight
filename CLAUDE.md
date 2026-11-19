@@ -18,6 +18,7 @@ SITL + Gazebo on the Ubuntu VM (`RUNBOOK.md`). See `README.md` for usage.
 | `avoidance.py` | follow-the-gap / VFH-lite reactive steering + slow-in-clutter. 🔴 **FLOWN 2026-07-28 and it COLLIDES — 19 strikes at 50 stems/ha, 37 at 107.** `react_distance_m=6.0` gives 0.66 m of lateral offset against 1.10 m needed (0.60×) — geometrically cannot miss. The earlier "hovers at ≥100 stems/ha" limit was a *kinematic-harness artifact* and is wrong: in flight it blocks 0.17 % of steps and hits trees instead. See TEST-PLAN B2 |
 | `offboard.py` + `mavsdk_offboard.py` | **corridor executor** — carrot guidance (projection onto the polyline, so a detour cannot leave it chasing a passed vertex), avoidance in the loop, altitude commanded by us not interpolated by PX4 (what A2 says a corridor needs). Logs progress every 5 s and aborts after 90 s without route progress — a silent loop got killed by hand once, mistaken for a hang. `droneflight fly-corridor` |
 | `local_planner.py` | **the onboard local planner (2026-09-23)** — remembers every trunk the depth sensor returns (odometry frame), A* through the gaps with a clearance cost, speed from curvature/sight/gap/dynamic feasibility. Replaces reactive `avoid()`; **0 strikes GPS-denied in SITL**. See the section below |
+| `gnss_gate.py` | **GNSS behind the spoof gate** — synthetic receiver + `ConsistencyMonitor` in the EV bridge, `GPS_INPUT` to EKF2 only while trusted (`ev-bridge --gnss`, RUNBOOK §3g; unflown) |
 | `local_offboard.py` | the live executor for it — truth-pose sensing, believed-pose planning, home-relative altitude with a datum check, per-leg speed from the `.plan`. `droneflight fly-local` |
 | `maneuver.py` | **the reaction-distance budget** — how far ahead an obstacle must be seen for the airframe to actually miss it, from the flown speed and PX4's `MPC_ACC_HOR`/`MPC_JERK_AUTO` (jerk-limited, so *not* ½at²). `react_distance_m` is now **derived from this, not a constant**; also `required_rays`, the angular-sampling companion. Built after B2 flew the constant into 19–37 tree strikes |
 | `trunk_manifest.py` | loads the trunk CSV the Gazebo world was built from, so perception senses what physics will hit |
@@ -53,7 +54,7 @@ droneflight flatten-plan --plan .../mission.plan --out ev_test.plan      # const
 droneflight ev-report --plan .../mission.plan --record run.jsonl        # corridor stats of a recorded EV run
 droneflight fly      --plan .../mission.plan --url udpin://0.0.0.0:14540         # LIVE — needs PX4 SITL (Ubuntu VM)
 droneflight ev-bridge --plan .../mission.plan --url udpin://0.0.0.0:14541        # LIVE — needs Gazebo + PX4 (RUNBOOK §3b)
-ruff check . && ruff format --check . && mypy --strict src && pytest -q # 337 tests
+ruff check . && ruff format --check . && mypy --strict src && pytest -q # 386 tests
 ```
 `validate`/`nav`/`simfly`/`sitl-env`/`ev-report` are pure offline (run anywhere);
 `fly` needs a live PX4 and `ev-bridge` needs Gazebo **and** PX4.
@@ -419,6 +420,41 @@ corners (0.315 N). The 0.6 N drag disturbance did not affect avoidance. So the
 tether is within budget at today's speeds; what limits it is (2) the ceiling if
 cruise rises and (3) trunk contact under the canopy — neither of which the
 plugin models (fixed span, no trees).
+
+## 🛰️ GNSS AS AN UNTRUSTED INPUT (2026-11-19, roadmap P4) — `gnss_spoof.py`
+Offline only. Carry-off spoofer (seamless capture, then drags the fix at
+`pull_rate` m per m flown) vs a monitor on `o = p_gnss − p_vio`: honest GNSS can
+move `o` only at the VIO rate, and `|Δvio| ≤ rate·span` exactly, so alarm when
+`|Δo|` over a 100 m or 1000 m window beats `vio_rate_bound·span + 6σ√2`; then
+fall back to VIO from the window start. `tools/gnss_spoof_sweep.py` (5 km, onset
+1 km, true drift 2 %, bound 3 %): **honest 0/100 false alarms, ~1.5 m vs 98 m
+VIO-only**; pull ≥ 0.2 caught in ≤ 80 m; pull ≤ 0.01 never caught but harmless
+(≤ 44 m); **0.03-0.04 is the gap — caught 45-60 %, worst 163 m (~1.7× VIO-only).**
+🔴 **Corrected 2026-11-19: a tighter VIO bound does not close the gap.** With
+the bound at the true 2 % (0/50 false alarms) 0.04 m/m is still missed on some
+seeds and the worst stays 163 m: a pull along the VIO drift direction cancels in
+`|Δo|`, so an aligned pull up to ~2× the VIO rate is invisible. A tighter bound
+catches more seeds, not the worst one — that needs an independent second
+reference (VTRN / stem-map fixes).
+🐛 At 4σ noise allowance half the honest runs false-alarmed (the test runs every
+step on two windows) → 6σ. ⚠️ Positions only (a Doppler-consistent spoofer is
+harder), 2-D straight route.
+**EKF2 path (2026-11-19, unflown) — `gnss_gate.py`, RUNBOOK §3g.** The monitor is
+now an online class (`ConsistencyMonitor`; `simulate_spoof` runs on it and the
+sweep is unchanged to the printed digit). `ev-bridge --no-vtrn --gnss gated`
+synthesises a receiver (truth + spoof + 1.5 m white noise, 5 Hz, Doppler-
+consistent spoofer, PX4's own map projection) and sends `GPS_INPUT` **only while
+the monitor trusts it**; `--gnss ungated` is the control. The gate sits in FRONT
+of EKF2 because EKF2's innovation gate is what carry-off is built to pass. VTRN
+is refused with it (a fix reads as spoofing). 🔑 **No rewind in the loop**: EKF2
+has fused the spoof until the gate closes, so the fallback anchors at the alarm,
+not the window start — `gnss_spoof_sweep.py --no-rewind`: fast pulls (0.06-0.1)
+worsen 95 → 121-127 m worst, ≥ 0.2 ≈ VIO-only (97-100 m). Predicted arms
+(`tools/gnss_gate_predict.py`, seeds 0/4, ev_test.plan): honest never closes;
+0.5 m/m closes 35 m after onset; 0.03 never (124 m end, 1.2× VIO-only).
+⚠️ Unverified until flown: `SENS_EN_GPSSIM 0` disables Gazebo's own GNSS;
+EKF2 fuses EV position with a bias while GNSS is active (else try EV_CTRL 14);
+and whether EKF2 holds or resets to raw EV at the hand-over (§3g "What to watch").
 
 ## ✅ STEM-MAP LOCALISATION BUILT (2026-09-15) — `stem_localizer.py`
 **The gap this closes.** The stem-routed plan flew **330/330 with 0 strikes** —
